@@ -1,0 +1,317 @@
+# Orca multi-model role orchestration
+# Source: GPT-5.6 Sol / Opus 4.8 / Grok 4.5 role strengths + Antigravity fallback
+# SSOT for coordinator routing. Project-specific hints live under project_hints.
+
+version: 1
+project: "{{PROJECT_NAME}}"
+worktree: active
+
+roles:
+  coordinator:
+    description: >
+      Decompose work into a DAG, route by role, dispatch, wait on
+      worker_done/escalation, synthesize. Does not implement bulk code.
+    agent: any
+    model: any
+    owns:
+      - task DAG design
+      - decision gates
+      - merge synthesis
+      - escalation handling
+    does_not:
+      - large multi-file implementation (delegate)
+      - bulk ticket grind (delegate)
+
+  architect:
+    handle_title: role-opus-architect
+    agent: claude
+    model: claude-opus-4-8
+    effort: high
+    launch_command: >-
+      claude --model claude-opus-4-8 --dangerously-skip-permissions
+    persona: |
+      You are ROLE=architect on Claude Opus 4.8 for {{PROJECT_NAME}}.
+      Strengths: judgment, honesty, long-horizon coherence, architecture,
+      critical review, push-back on bad plans, high-stakes correctness.
+      Do NOT do bulk low-risk implementation when a Grok/Sol worker exists.
+      Prefer plans, ADRs, review findings, risk callouts, surgical fixes.
+      Reviews: Critical / Major / Minor with evidence, fix suggestion, open questions.
+    owns:
+      - architecture / design
+      - ambiguous requirements
+      - multi-package / multi-service plans
+      - PR / security / privacy / correctness review
+      - long-horizon autonomous work when correctness > cost
+    route_keywords:
+      - architecture
+      - design
+      - plan
+      - review
+      - audit
+      - security
+      - privacy
+      - migration
+      - multi-service
+      - judgment
+      - decision
+
+  executor:
+    handle_title: role-sol-executor
+    agent: codex
+    model: gpt-5.6-sol
+    effort: high
+    launch_command: >-
+      codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox
+    persona: |
+      You are ROLE=executor on GPT-5.6 Sol (Codex) for {{PROJECT_NAME}}.
+      Strengths: terminal/CLI agent loops, hard implementation, persistence,
+      tool coordination, verification, collaborative execution.
+      Execute well-scoped tasks end-to-end. Escalate ambiguity to architect.
+      Default closer: integrate, verify, align with project SSOT.
+    owns:
+      - hard multi-step implementation from an approved plan
+      - terminal-heavy debug / fix loops
+      - tests, typecheck, build verification
+      - PR-sized end-to-end delivery
+    route_keywords:
+      - implement
+      - implement hard
+      - terminal
+      - debug
+      - reproduce
+      - typecheck
+      - build
+      - test
+      - codex
+      - integrate
+      - verify
+      - ultra
+
+  thrifty:
+    handle_title: role-grok-thrifty
+    agent: grok
+    model: grok-4.5
+    effort: default
+    launch_command: >-
+      grok --model grok-4.5 --permission-mode bypassPermissions
+    persona: |
+      You are ROLE=thrifty on Grok 4.5 for {{PROJECT_NAME}}.
+      Strengths: speed, cost, codebase navigation, routine edits, prototypes,
+      research breadth, high-volume small tickets.
+      Prefer small diffs. Escalate design risk upward.
+      External facts need source URL + date before promotion to SSOT.
+    owns:
+      - well-scoped tickets and small diffs
+      - codebase search / navigation / mechanical renames
+      - prototypes and throwaway demos
+      - external research and alternative generation
+      - docs polish, high-volume low-risk codegen
+    route_keywords:
+      - small fix
+      - rename
+      - docs
+      - prototype
+      - research
+      - alternatives
+      - volume
+      - cheap
+      - navigate
+      - map code
+      - explore
+
+  fallback:
+    handle_title: role-agy-fallback
+    agent: antigravity
+    cli: agy
+    model: "Gemini 3.5 Flash (Medium)"
+    effort: medium
+    launch_command: >-
+      agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions
+    persona: |
+      You are ROLE=fallback on Antigravity Gemini 3.5 Flash (Medium).
+      Run only when a primary role hit rate/session limit or model overload.
+      Continue interrupted work with smallest viable progress.
+      Do not re-architect unless required to finish.
+    owns:
+      - continue work when primaries are rate/session limited
+      - low-to-medium complexity fixes while primaries cool down
+    route_keywords:
+      - rate limit
+      - session limit
+      - overloaded
+      - quota
+      - fallback
+      - agy
+      - antigravity
+    triggers_on:
+      - "You've hit your session limit"
+      - "rate limit"
+      - "usage limit"
+      - "overloaded"
+      - "quota exceeded"
+      - "try again later"
+      - "429"
+    notes: |
+      Cross-provider failover is orchestration-level (redispatch ROLE=fallback).
+      Claude --fallback-model only supports Anthropic models.
+
+routing_table:
+  - match: architecture_or_plan
+    when: "New feature design, ambiguous requirements, multi-package impact"
+    primary: architect
+  - match: high_risk_review
+    when: "auth, PII, security, migrations, privacy, high-stakes ship"
+    primary: architect
+    secondary: executor
+  - match: hard_implementation
+    when: "Approved plan, multi-file non-trivial code, tool-heavy debug"
+    primary: executor
+    secondary: thrifty
+  - match: terminal_agent_loop
+    when: "Shell-heavy repro, multi-step CLI workflow"
+    primary: executor
+  - match: small_ticket
+    when: "Clear 1-3 file change, docs polish, rename"
+    primary: thrifty
+  - match: codebase_map
+    when: "Find where X lives (read-only)"
+    primary: thrifty
+  - match: research_or_alternatives
+    when: "External research, competitor/platform alternatives"
+    primary: thrifty
+    secondary: architect
+  - match: prototype
+    when: "Spike / demo / one-shot mock"
+    primary: thrifty
+    secondary: architect
+  - match: verification
+    when: "typecheck, build, test, integrate"
+    primary: executor
+  - match: dual_review
+    when: "High stakes ship gate"
+    primary: architect
+    secondary: executor
+
+dags:
+  feature_plan_execute_review:
+    description: Standard feature delivery
+    steps:
+      - id: plan
+        role: architect
+        deps: []
+        spec_template: |
+          ROLE=architect. Plan only for:
+          {{user_goal}}
+          Follow project AGENTS.md / CLAUDE.md constraints if present.
+          Output: file list, risks, verification commands. No bulk implement unless trivial.
+      - id: implement
+        role: executor
+        deps: [plan]
+        spec_template: |
+          ROLE=executor. Implement ONLY the approved plan:
+          {{plan_result}}
+          Stay in listed files. Run verification. Ask if blocked.
+      - id: review
+        role: architect
+        deps: [implement]
+        spec_template: |
+          ROLE=architect (review-only). Check correctness, project constraints, security.
+          Do NOT edit unless critical one-line fix. Report findings for coordinator.
+
+  small_fix_fast:
+    description: Low-risk quick fix
+    steps:
+      - id: fix
+        role: thrifty
+        deps: []
+        spec_template: |
+          ROLE=thrifty. Minimal fix for:
+          {{user_goal}}
+          Smallest diff. Lightest relevant verification.
+
+  high_risk_change:
+    description: Auth / PII / security / migration
+    steps:
+      - id: plan
+        role: architect
+        deps: []
+      - id: implement
+        role: executor
+        deps: [plan]
+      - id: dual_review
+        role: architect
+        deps: [implement]
+      - id: verify
+        role: executor
+        deps: [dual_review]
+
+  explore_then_build:
+    description: Unknown area
+    steps:
+      - id: map
+        role: thrifty
+        deps: []
+        spec_template: |
+          ROLE=thrifty (read-only). Map {{topic}}. file:line table. No edits.
+      - id: plan
+        role: architect
+        deps: [map]
+      - id: implement
+        role: thrifty
+        deps: [plan]
+
+  research_then_integrate:
+    description: External research into project
+    steps:
+      - id: research
+        role: thrifty
+        deps: []
+      - id: critique
+        role: architect
+        deps: [research]
+      - id: integrate
+        role: executor
+        deps: [critique]
+
+project_hints:
+  # Customize per project after install (paths, always_architect globs, etc.)
+  always_architect: []
+  prefer_executor: []
+  prefer_thrifty: []
+  notes: |
+    Merge constraints from AGENTS.md / CLAUDE.md into seed personas and specs.
+    Model disagreement → project SSOT docs + current code win.
+
+limit_failover:
+  enabled: true
+  target_role: fallback
+  agent: antigravity
+  model: "Gemini 3.5 Flash (Medium)"
+  launch_command: >-
+    agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions
+  detect_patterns:
+    - "session limit"
+    - "rate limit"
+    - "usage limit"
+    - "overloaded"
+    - "quota"
+    - "try again later"
+    - "429"
+  policy: |
+    1. Do not hammer the limited primary
+    2. Create NEW task ROLE=fallback with goal + partial progress
+    3. Dispatch --inject to role-agy-fallback
+    4. Script: ./scripts/orca-fallback-on-limit.sh --from <role> --spec "..."
+  script: ./scripts/orca-fallback-on-limit.sh
+
+lifecycle:
+  supervised_only_when:
+    - user asks to supervise / monitor / wait / coordinate DAG / decision gate
+  worker_done_required: true
+  max_concurrent: 2
+  wait_timeout_ms: 900000
+  circuit_break_after_failures: 3
+  edit_ownership: |
+    One role edits a given file set at a time.
+    Review-only architect must not rewrite executor/thrifty files unless re-dispatched.
+  on_rate_limit: redispatch_to_fallback
