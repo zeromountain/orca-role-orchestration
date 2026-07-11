@@ -4,7 +4,7 @@
 
 **Goal:** Give each Orca role a rich, injectable persona (operating profile + professional-archetype character) that actually reaches the worker, so workers perform better during real task execution.
 
-**Architecture:** Personas live as single-source markdown files under `templates/personas/<role>.md`. Bootstrap seeds each worker terminal with the full persona; dispatch prepends a compact one-line `STANCE` reminder per task; install copies the persona files into `.orca/orchestration/personas/`. All script consumption is plain file read + `grep`/`sed` — no YAML parser, no new dependency. Every consumer degrades gracefully if a persona file is absent (backward compatible with pre-existing installs).
+**Architecture:** Personas live as single-source markdown files under `templates/personas/<role>.md`. Bootstrap seeds each worker terminal with the full persona; dispatch prepends a compact one-line `STANCE` reminder per task; install copies the persona files into `.orca/orchestration/personas/`. Projects that were scaffolded before this feature upgrade in place via `install-to-project.sh --update` (preserves `roles.yaml`, backs up changed files) with an opt-in `--migrate-roles`. All script consumption is plain file read + `grep`/`sed` — no YAML parser, no new dependency. Every consumer degrades gracefully if a persona file is absent (backward compatible with pre-existing installs).
 
 **Tech Stack:** Bash, Python 3 (already used by scripts for JSON), Markdown. Target repo: `orca-role-orchestration` skill package.
 
@@ -17,6 +17,7 @@
 - The `STANCE` contract: every persona file has exactly one line matching `<!-- STANCE: <text> -->` on line 2. Extraction: `grep -m1 'STANCE:' FILE | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//'`.
 - Persona file skeleton sections (stable substrings, all required): `**Who you are.**`, `**Mission.**`, `**Play to these strengths.**`, `**Guard against these failure modes.**`, `**How you decide`, `**Output contract.**`, `**Collaboration protocol.**`, `**Definition of done.**`, `**Never.**`.
 - Do not change the fixed four-role model lineup, launch commands, routing tables, DAGs, or the failover mechanism.
+- Update mode (`--update`) must preserve `roles.yaml` and `handles.json`, refresh managed files (personas, the three `orca-*.sh` scripts, `PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`), and back up any changed managed file to `<file>.bak`. `--migrate-roles` implies `--update`, is opt-in, always writes `roles.yaml.bak` first, and is idempotent.
 - Never commit secrets.
 
 ---
@@ -747,17 +748,479 @@ git commit -m "feat: install persona files into project scaffold"
 
 ---
 
-### Task 6: Documentation
+### Task 6: `--update` mode — refresh managed files, preserve roles.yaml
 
 **Files:**
-- Modify: `SKILL.md` (skill layout: add `personas/` + `check-personas.sh`; note persona injection in Roles section)
-- Modify: `templates/PLAYBOOK.md` (add a `## Personas` section)
-- Modify: `templates/SCRIPTS.md` (note the installed `personas/` dir and `check-personas.sh`)
-- Modify: `README.md` (add persona files to the "This adds:" list)
+- Modify: `scripts/install-to-project.sh` (add `UPDATE`/`BACKUP` globals; `--update` flag + usage; diff-aware `install_file` with `.bak` backup; update guard; preserve `roles.yaml` in update mode)
 
 **Interfaces:**
-- Consumes: the file layout established in Tasks 1–5.
-- Produces: docs that describe where personas live and how they flow. No code depends on this task.
+- Consumes: fresh-install behavior from Task 5; the persona files (Task 1) and refreshed scripts (Tasks 3–4) that update copies.
+- Produces: `install-to-project.sh --update` — refreshes managed files (personas, `orca-*.sh` scripts, `PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`) with `.bak` backups on change, preserves `roles.yaml`/`handles.json`, and requires an existing install. Task 7 adds `--migrate-roles` in the same script and reuses the diff-aware `install_file` + `migrate_roles`.
+
+- [ ] **Step 1: Write the failing test (simulate a pre-feature install, then update)**
+
+Run:
+```bash
+bash -c '
+set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
+SB="$SCR/update-test"; rm -rf "$SB"; mkdir -p "$SB"
+./scripts/install-to-project.sh --project-root "$SB" --project-name up >/dev/null
+# Simulate a stale, pre-feature install:
+rm -rf "$SB/.orca/orchestration/personas"
+printf "\n# STALE_MARKER\n" >> "$SB/scripts/orca-bootstrap-roles.sh"
+printf "\n# SENTINEL_ROLES\n" >> "$SB/.orca/orchestration/roles.yaml"
+# Update in place:
+./scripts/install-to-project.sh --project-root "$SB" --update >/dev/null
+for r in architect executor thrifty fallback coordinator; do
+  [ -f "$SB/.orca/orchestration/personas/$r.md" ] || { echo "FAIL: personas/$r.md not restored"; exit 1; }
+done
+grep -q "persona_body()" "$SB/scripts/orca-bootstrap-roles.sh" || { echo "FAIL: bootstrap not refreshed"; exit 1; }
+grep -q "STALE_MARKER" "$SB/scripts/orca-bootstrap-roles.sh" && { echo "FAIL: stale marker survived"; exit 1; }
+[ -f "$SB/scripts/orca-bootstrap-roles.sh.bak" ] || { echo "FAIL: no .bak for changed script"; exit 1; }
+grep -q "STALE_MARKER" "$SB/scripts/orca-bootstrap-roles.sh.bak" || { echo "FAIL: backup missing old content"; exit 1; }
+grep -q "SENTINEL_ROLES" "$SB/.orca/orchestration/roles.yaml" || { echo "FAIL: roles.yaml not preserved"; exit 1; }
+[ -f "$SB/.orca/orchestration/roles.yaml.bak" ] && { echo "FAIL: roles.yaml must not be backed up"; exit 1; }
+echo "OK: --update refreshes managed files and preserves roles.yaml"
+'
+```
+Expected: FAIL — the second install call aborts with `Unknown: --update` (flag not implemented), so `set -e` stops the script.
+
+- [ ] **Step 2: Add the `UPDATE`/`MIGRATE`/`BACKUP` globals**
+
+Replace this exact block:
+
+```bash
+ROOT=""
+PROJECT_NAME=""
+FORCE=0
+```
+
+with:
+
+```bash
+ROOT=""
+PROJECT_NAME=""
+FORCE=0
+UPDATE=0
+MIGRATE=0
+BACKUP=0
+```
+
+- [ ] **Step 3: Add the `--update` flag and update the usage string**
+
+Replace this exact block:
+
+```bash
+    --project-root) ROOT="${2:?}"; shift 2 ;;
+    --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force]"
+      exit 0
+      ;;
+```
+
+with:
+
+```bash
+    --project-root) ROOT="${2:?}"; shift 2 ;;
+    --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --update) UPDATE=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update]"
+      exit 0
+      ;;
+```
+
+- [ ] **Step 4: Make `install_file` diff-aware with backup**
+
+Replace this exact function:
+
+```bash
+install_file() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "$dst" && "$FORCE" -ne 1 ]]; then
+    echo "  skip existing: $dst (use --force to overwrite)"
+    return
+  fi
+  if [[ "$src" == *.yaml ]] || [[ "$src" == *.md ]]; then
+    python3 - "$src" "$dst" "$PROJECT_NAME" <<'PY'
+import pathlib
+import sys
+
+source, destination, project_name = sys.argv[1:4]
+text = pathlib.Path(source).read_text()
+pathlib.Path(destination).write_text(text.replace("{{PROJECT_NAME}}", project_name))
+PY
+  else
+    cp "$src" "$dst"
+  fi
+  echo "  wrote $dst"
+}
+```
+
+with:
+
+```bash
+install_file() {
+  local src="$1"
+  local dst="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ "$src" == *.yaml ]] || [[ "$src" == *.md ]]; then
+    python3 - "$src" "$tmp" "$PROJECT_NAME" <<'PY'
+import pathlib
+import sys
+
+source, destination, project_name = sys.argv[1:4]
+text = pathlib.Path(source).read_text()
+pathlib.Path(destination).write_text(text.replace("{{PROJECT_NAME}}", project_name))
+PY
+  else
+    cp "$src" "$tmp"
+  fi
+  if [[ -f "$dst" ]]; then
+    if cmp -s "$tmp" "$dst"; then
+      rm -f "$tmp"; echo "  unchanged: $dst"; return
+    fi
+    if [[ "$FORCE" -ne 1 ]]; then
+      rm -f "$tmp"; echo "  skip existing: $dst (use --force or --update)"; return
+    fi
+    if [[ "$BACKUP" -eq 1 ]]; then
+      cp "$dst" "$dst.bak"; echo "  backed up: $dst.bak"
+    fi
+  fi
+  mv "$tmp" "$dst"
+  echo "  wrote $dst"
+}
+```
+
+- [ ] **Step 5: Add the update guard**
+
+Replace this exact block:
+
+```bash
+echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
+
+mkdir -p "$ORCH" "$SCRIPTS_DST"
+```
+
+with:
+
+```bash
+echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
+
+mkdir -p "$ORCH" "$SCRIPTS_DST"
+
+if [[ "$UPDATE" -eq 1 ]]; then
+  if [[ ! -f "$ORCH/roles.yaml" ]]; then
+    echo "No existing install at $ORCH (roles.yaml missing)." >&2
+    echo "Run without --update for a fresh install." >&2
+    exit 1
+  fi
+  FORCE=1
+  BACKUP=1
+  echo "Update mode: refreshing managed files (roles.yaml handled separately)."
+fi
+```
+
+- [ ] **Step 6: Preserve `roles.yaml` in update mode**
+
+Replace this exact line:
+
+```bash
+install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+```
+
+with:
+
+```bash
+if [[ "$UPDATE" -eq 1 ]]; then
+  echo "  preserved $ORCH/roles.yaml (customizations kept)"
+else
+  install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+fi
+```
+
+- [ ] **Step 7: Run the update test to verify it passes**
+
+Run the exact block from Step 1 again.
+Expected: PASS — prints `OK: --update refreshes managed files and preserves roles.yaml`.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add scripts/install-to-project.sh
+git commit -m "feat: add --update mode to refresh installs, preserving roles.yaml"
+```
+
+---
+
+### Task 7: `--migrate-roles` — convert legacy inline personas
+
+**Files:**
+- Modify: `scripts/install-to-project.sh` (add `--migrate-roles` flag + usage; add `migrate_roles` function; extend the roles.yaml branch with migration)
+
+**Interfaces:**
+- Consumes: the diff-aware `install_file`, `--update` machinery, and the roles.yaml branch from Task 6.
+- Produces: `install-to-project.sh --migrate-roles` (implies `--update`) — best-effort, idempotent in-place migration of a legacy `roles.yaml` that replaces inline `persona: |` blocks with `persona_file:` + `persona_summary:`, inserts a coordinator `persona_file`, adds the header comment, and writes `roles.yaml.bak` only when it actually changes.
+
+- [ ] **Step 1: Write the failing test (migrate a legacy roles.yaml)**
+
+Run:
+```bash
+bash -c '
+set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
+SB="$SCR/migrate-test"; rm -rf "$SB"; mkdir -p "$SB/.orca/orchestration" "$SB/scripts"
+cat > "$SB/.orca/orchestration/roles.yaml" <<YAML
+# Orca multi-model role orchestration
+# SSOT for coordinator routing. Project-specific hints live under project_hints.
+version: 1
+roles:
+  coordinator:
+    description: >
+      Decompose work.
+    agent: any
+    model: any
+    owns:
+      - task DAG design
+  architect:
+    handle_title: role-opus-architect
+    agent: claude
+    model: claude-opus-4-8
+    persona: |
+      You are ROLE=architect on Claude Opus 4.8 for myproj.
+      Strengths: judgment.
+      Reviews: Critical / Major / Minor.
+    owns:
+      - architecture / design
+YAML
+./scripts/install-to-project.sh --project-root "$SB" --migrate-roles >/dev/null
+f="$SB/.orca/orchestration/roles.yaml"
+grep -q "persona_file: personas/architect.md" "$f" || { echo "FAIL: architect persona_file not added"; exit 1; }
+grep -q "persona_file: personas/coordinator.md" "$f" || { echo "FAIL: coordinator persona_file not added"; exit 1; }
+grep -q "persona: |" "$f" && { echo "FAIL: inline persona block survived"; exit 1; }
+grep -q "architecture / design" "$f" || { echo "FAIL: owns keys lost"; exit 1; }
+grep -q "Personas live in personas" "$f" || { echo "FAIL: header comment not added"; exit 1; }
+[ -f "$f.bak" ] || { echo "FAIL: no roles.yaml.bak"; exit 1; }
+grep -q "persona: |" "$f.bak" || { echo "FAIL: backup missing original inline persona"; exit 1; }
+./scripts/install-to-project.sh --project-root "$SB" --migrate-roles >/dev/null
+[ "$(grep -c "persona_file: personas/architect.md" "$f")" -eq 1 ] || { echo "FAIL: not idempotent"; exit 1; }
+echo "OK: --migrate-roles converts legacy personas idempotently"
+'
+```
+Expected: FAIL — the install call aborts with `Unknown: --migrate-roles` (flag not implemented).
+
+- [ ] **Step 2: Add the `--migrate-roles` flag and update the usage string**
+
+Replace this exact block:
+
+```bash
+    --project-root) ROOT="${2:?}"; shift 2 ;;
+    --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --update) UPDATE=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update]"
+      exit 0
+      ;;
+```
+
+with:
+
+```bash
+    --project-root) ROOT="${2:?}"; shift 2 ;;
+    --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --update) UPDATE=1; shift ;;
+    --migrate-roles) MIGRATE=1; UPDATE=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles]"
+      exit 0
+      ;;
+```
+
+- [ ] **Step 3: Add the `migrate_roles` function**
+
+Replace this exact block (the end of the `install_file` function from Task 6):
+
+```bash
+  mv "$tmp" "$dst"
+  echo "  wrote $dst"
+}
+```
+
+with:
+
+```bash
+  mv "$tmp" "$dst"
+  echo "  wrote $dst"
+}
+
+migrate_roles() {
+  local target="$1"
+  python3 - "$target" <<'PY'
+import sys, re, shutil, pathlib
+
+target = sys.argv[1]
+lines = pathlib.Path(target).read_text().splitlines()
+
+REPL = {
+  "coordinator": [
+    "    persona_file: personas/coordinator.md",
+    "    persona_summary: >-",
+    "      The Conductor — decompose into a DAG, route by model strength, dispatch,",
+    "      synthesize; never bulk-implement.",
+  ],
+  "architect": [
+    "    persona_file: personas/architect.md",
+    "    persona_summary: >-",
+    "      The Strategist — plan, judge, and review high-stakes work with evidence;",
+    "      delegate bulk implementation; push back on weak plans.",
+  ],
+  "executor": [
+    "    persona_file: personas/executor.md",
+    "    persona_summary: >-",
+    "      The Closer — implement the approved plan end-to-end, verify before",
+    "      claiming done, integrate; escalate ambiguity to architect.",
+  ],
+  "thrifty": [
+    "    persona_file: personas/thrifty.md",
+    "    persona_summary: >-",
+    "      The Scout — fast, cheap small/exploratory work; small diffs; cite",
+    "      sources; escalate design risk early.",
+  ],
+  "fallback": [
+    "    persona_file: personas/fallback.md",
+    "    persona_summary: >-",
+    "      The Relief Pitcher — enter only on a primary's limit; smallest viable",
+    "      progress; stabilize and hand back; never re-architect.",
+  ],
+}
+
+def role_of(line):
+    m = re.match(r'^  (\w+):\s*$', line)
+    return m.group(1) if m else None
+
+has_pf = set()
+cur = None
+for line in lines:
+    r = role_of(line)
+    if r:
+        cur = r
+        continue
+    if cur and re.match(r'^    persona_file:', line):
+        has_pf.add(cur)
+
+header_present = any('Personas live in personas' in l for l in lines)
+out = []
+cur = None
+i = 0
+n = len(lines)
+migrated = []
+header_done = header_present
+while i < n:
+    line = lines[i]
+    if not header_done and line.startswith('# SSOT for coordinator routing'):
+        out.append(line)
+        out.append('# Personas live in personas/<role>.md (single source of truth). bootstrap injects')
+        out.append("# the full persona into each worker terminal; dispatch injects the file's")
+        out.append('# <!-- STANCE: ... --> line as a per-task reminder.')
+        header_done = True
+        i += 1
+        continue
+    r = role_of(line)
+    if r:
+        cur = r
+        out.append(line)
+        i += 1
+        continue
+    if cur and re.match(r'^    persona:\s*\|', line):
+        if cur in REPL and cur not in has_pf:
+            out.extend(REPL[cur])
+            migrated.append(cur)
+        else:
+            out.append(line)
+        i += 1
+        while i < n and re.match(r'^      ', lines[i]):
+            i += 1
+        continue
+    if cur == 'coordinator' and re.match(r'^    model:', line) \
+            and 'coordinator' not in has_pf and 'coordinator' not in migrated:
+        out.append(line)
+        out.extend(REPL['coordinator'])
+        migrated.append('coordinator')
+        i += 1
+        continue
+    out.append(line)
+    i += 1
+
+changed = bool(migrated) or (header_done and not header_present)
+if changed:
+    shutil.copyfile(target, target + '.bak')
+    pathlib.Path(target).write_text("\n".join(out) + "\n")
+    print("  migrated roles:", ", ".join(migrated) if migrated else "(header only)")
+else:
+    print("  roles.yaml already migrated (no change)")
+PY
+}
+```
+
+- [ ] **Step 4: Extend the roles.yaml branch with migration**
+
+Replace this exact block (from Task 6):
+
+```bash
+if [[ "$UPDATE" -eq 1 ]]; then
+  echo "  preserved $ORCH/roles.yaml (customizations kept)"
+else
+  install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+fi
+```
+
+with:
+
+```bash
+if [[ "$UPDATE" -eq 1 ]]; then
+  if [[ "$MIGRATE" -eq 1 ]]; then
+    migrate_roles "$ORCH/roles.yaml"
+  else
+    echo "  preserved $ORCH/roles.yaml (customizations kept; --migrate-roles to convert legacy personas)"
+  fi
+else
+  install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+fi
+```
+
+- [ ] **Step 5: Run the migration test to verify it passes**
+
+Run the exact block from Step 1 again.
+Expected: PASS — prints `OK: --migrate-roles converts legacy personas idempotently`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add scripts/install-to-project.sh
+git commit -m "feat: add --migrate-roles to convert legacy inline personas"
+```
+
+---
+
+### Task 8: Documentation
+
+**Files:**
+- Modify: `SKILL.md` (skill layout: add `personas/` + `check-personas.sh`; note persona injection in Roles section; document `--update`/`--migrate-roles` in Modes)
+- Modify: `templates/PLAYBOOK.md` (add a `## Personas` section)
+- Modify: `templates/SCRIPTS.md` (note the installed `personas/` dir and `check-personas.sh`)
+- Modify: `README.md` (add persona files to the "This adds:" list; add an "Update an existing install" section)
+
+**Interfaces:**
+- Consumes: the file layout and CLI flags established in Tasks 1–7.
+- Produces: docs that describe where personas live, how they flow, and how to update/migrate an existing install. No code depends on this task.
 
 - [ ] **Step 1: Update the SKILL.md skill layout block**
 
@@ -804,7 +1267,27 @@ worker with the full persona; dispatch prepends the file's `<!-- STANCE: … -->
 per-task reminder. Missing file → bootstrap uses a built-in one-liner and dispatch omits the reminder.
 ```
 
-- [ ] **Step 3: Add a Personas section to PLAYBOOK.md**
+- [ ] **Step 3: Document update/migrate in the SKILL.md Modes section**
+
+In `SKILL.md`, immediately after this line:
+
+```
+Then customize `project_hints` in `roles.yaml` and merge AGENTS.md constraints into routing.
+```
+
+add:
+
+````
+
+Update an existing install (adds personas, refreshes scripts/docs, preserves your `roles.yaml`):
+
+```bash
+"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --update
+# add --migrate-roles to also convert legacy inline personas to persona_file refs (roles.yaml.bak saved)
+```
+````
+
+- [ ] **Step 4: Add a Personas section to PLAYBOOK.md**
 
 In `templates/PLAYBOOK.md`, immediately after this line:
 
@@ -828,7 +1311,7 @@ Each role's persona is a single-source file in `.orca/orchestration/personas/<ro
 Edit the persona file (not the scripts) to tune a role. Missing file → scripts fall back safely.
 ```
 
-- [ ] **Step 4: Note personas in SCRIPTS.md**
+- [ ] **Step 5: Note personas in SCRIPTS.md**
 
 In `templates/SCRIPTS.md`, immediately after this line:
 
@@ -844,7 +1327,7 @@ Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and q
 (one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
 ```
 
-- [ ] **Step 5: Add persona files to the README install list**
+- [ ] **Step 6: Add persona files to the README install list**
 
 In `README.md`, replace this exact line:
 
@@ -859,7 +1342,38 @@ with:
 - `.orca/orchestration/personas/<role>.md` — per-role personas seeded into workers
 ```
 
-- [ ] **Step 6: Verify the doc edits landed**
+- [ ] **Step 7: Add an "Update an existing install" section to README.md**
+
+In `README.md`, immediately after this line:
+
+```
+See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
+```
+
+add:
+
+````
+
+## Update an existing install
+
+If you scaffolded a project before the persona system existed, upgrade it in place:
+
+```bash
+~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
+  --project-root "$(pwd)" --update
+```
+
+`--update` adds `.orca/orchestration/personas/`, refreshes the bootstrap/dispatch/fallback scripts and
+playbook docs (backing up any changed file to `<file>.bak`), and **preserves your `roles.yaml`**
+(`project_hints`, launch commands) and `handles.json`. If you customized launch commands inside the
+scripts, re-apply them from the `.bak` copies.
+
+Add `--migrate-roles` to also rewrite the legacy inline `persona:` blocks in `roles.yaml` to
+`persona_file:` references (original saved as `roles.yaml.bak`). This is optional — the scripts read the
+persona files directly, so persona injection works with or without the migration.
+````
+
+- [ ] **Step 8: Verify the doc edits landed**
 
 Run:
 ```bash
@@ -867,30 +1381,39 @@ bash -c '
 set -e
 grep -q "check-personas.sh" SKILL.md
 grep -q "personas/" SKILL.md
+grep -q -- "--update" SKILL.md
 grep -q "## Personas" templates/PLAYBOOK.md
 grep -q "personas/<role>.md" templates/SCRIPTS.md
 grep -q "per-role personas seeded into workers" README.md
+grep -q "Update an existing install" README.md
 echo "OK: docs updated"
 '
 ```
 Expected: PASS — prints `OK: docs updated`.
 
-- [ ] **Step 7: Final full-suite verification**
+- [ ] **Step 9: Final full-suite verification**
 
 Run:
 ```bash
 bash -c '
 set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
 ./scripts/check-personas.sh
 bash -n scripts/orca-bootstrap-roles.sh
 bash -n scripts/orca-dispatch-role.sh
 bash -n scripts/install-to-project.sh
+# update smoke: fresh install, drop personas, --update restores them
+SB="$SCR/final-smoke"; rm -rf "$SB"; mkdir -p "$SB"
+./scripts/install-to-project.sh --project-root "$SB" --project-name smoke >/dev/null
+rm -rf "$SB/.orca/orchestration/personas"
+./scripts/install-to-project.sh --project-root "$SB" --update >/dev/null
+[ -f "$SB/.orca/orchestration/personas/architect.md" ] || { echo "FAIL: update smoke"; exit 1; }
 echo "ALL GREEN"
 '
 ```
-Expected: PASS — persona lint OK, all scripts parse, prints `ALL GREEN`.
+Expected: PASS — persona lint OK, all scripts parse, update smoke restores personas, prints `ALL GREEN`.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add SKILL.md templates/PLAYBOOK.md templates/SCRIPTS.md README.md
@@ -903,13 +1426,15 @@ git commit -m "docs: document persona files and injection flow"
 
 **Spec coverage:**
 - Rewrite personas as operating-profile + light-character archetypes → Task 1 (all five files).
-- Single source of truth, no YAML parser → persona files + `grep`/`sed` only (Tasks 1–5).
+- Single source of truth, no YAML parser → persona files + `grep`/`sed`/Python line-surgery only (Tasks 1–7).
 - Bootstrap injects full persona → Task 3.
 - Dispatch injects STANCE reminder → Task 4.
-- Install copies persona files → Task 5.
+- Install copies persona files (fresh) → Task 5.
+- Update path for existing installs (preserve roles.yaml, backups) → Task 6.
+- Optional roles.yaml migration (`--migrate-roles`) → Task 7.
 - roles.yaml references files (no inline persona) → Task 2.
-- Docs (SKILL.md, PLAYBOOK.md, SCRIPTS.md) → Task 6 (+ README.md, from the README review).
-- Backward compatibility / graceful fallback → Task 3 (fallback_body), Task 4 (else branch), verified conceptually; harness + `bash -n` in Task 6 Step 7.
+- Docs (SKILL.md incl. Modes update/migrate, PLAYBOOK.md, SCRIPTS.md, README.md incl. Update section) → Task 8.
+- Backward compatibility / graceful fallback → Task 3 (fallback_body), Task 4 (else branch), Task 6 (diff-aware `install_file`, absent-persona restore); harness + `bash -n` + update smoke in Task 8 Step 9.
 - coordinator persona is reference-only, not bootstrapped → Task 1 Step 7 (Note), Task 2 (persona_file added but bootstrap seeds only the 4 workers — bootstrap has no coordinator seed call, unchanged).
 
 **Placeholder scan:** No TBD/TODO. All code blocks are complete literal content. Persona bodies are full text, not summaries.
@@ -917,6 +1442,10 @@ git commit -m "docs: document persona files and injection flow"
 **Type/name consistency:**
 - `persona_body` helper name identical in Task 3 Step 2/4 and its grep filter `^# |^<!-- STANCE:` matches Task 1 files' line 1 (`# `) and line 2 (`<!-- STANCE:`).
 - STANCE extraction `grep -m1 'STANCE:' … | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//'` is identical in `check-personas.sh` (Task 1), Task 4 script edit, and every test step.
-- `persona_file: personas/<role>.md` path form identical in Task 2 and asserted in Task 2 Step 8 and Task 5 Step 1.
-- `$OUT_DIR/personas/$role.md` (bootstrap, Task 3) and `$ROOT/.orca/orchestration/personas/$ROLE.md` (dispatch, Task 4) both resolve to `.orca/orchestration/personas/<role>.md`, matching the install target in Task 5.
+- `persona_file: personas/<role>.md` path form identical in Task 2, Task 7's `migrate_roles` REPL, and asserted in Task 2 Step 8, Task 5 Step 1, Task 7 Step 1.
+- `persona_summary` text in Task 7's `migrate_roles` REPL matches the summaries written into `templates/roles.yaml` in Task 2 (both derived from the same five one-liners; migration is doc-only, drift is cosmetic).
+- `$OUT_DIR/personas/$role.md` (bootstrap, Task 3) and `$ROOT/.orca/orchestration/personas/$ROLE.md` (dispatch, Task 4) both resolve to `.orca/orchestration/personas/<role>.md`, matching the install target in Tasks 5–6.
+- Flag/global consistency: `UPDATE`/`MIGRATE`/`BACKUP` globals (Task 6 Step 2) are set by `--update`/`--migrate-roles` (Tasks 6/7 flag parsing), read by the guard (Task 6 Step 5), `install_file` backup (Task 6 Step 4), and the roles.yaml branch (Tasks 6 Step 6 / 7 Step 4). `--migrate-roles` sets both `MIGRATE=1` and `UPDATE=1`.
 - Required section list in `check-personas.sh` matches the headers written in every persona file in Task 1 (verified: each file contains all nine substrings, `**How you decide` matched as a prefix to cover coordinator's `— the routing ladder` variant).
+
+**Cross-check — migration parser vs. real roles.yaml:** Task 7's `migrate_roles` matches role headers with `^  (\w+):$` (2-space indent, matching `templates/roles.yaml`), replaces `^    persona:\s*\|` blocks by consuming following `^      ` (6-space) body lines until the next 4-space key (e.g. `    owns:`) — consistent with the actual block-scalar indentation in Task 2's file.

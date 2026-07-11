@@ -40,6 +40,7 @@ Net effect: personas are under-specified *and* under-delivered, which caps worke
 | Storage/injection structure | **A** — separate `personas/<role>.md` files, read & injected by bootstrap |
 | Character level | Professional archetypes (`The Strategist`, `The Closer`, `The Scout`, `The Relief Pitcher`, `The Conductor`) |
 | Dispatch reminder | **Include** — extract a one-line `STANCE` marker from the persona file per dispatch |
+| Update path for existing installs | **Preserve + optional migration** — `install-to-project.sh --update` refreshes personas/scripts/docs and preserves `roles.yaml`; `--migrate-roles` opt-in rewrites legacy inline personas to `persona_file` refs (`.bak` backup) |
 
 ## Architecture
 
@@ -111,11 +112,17 @@ coordinator is the running agent, not a role worker terminal).
    - `seed()` uses the file content as `$body`. If the file is absent, keep the current hardcoded
      one-liner as fallback (backward compatible).
 
-4. **`scripts/install-to-project.sh`** (edit)
+4. **`scripts/install-to-project.sh`** (edit — fresh install)
    - `mkdir -p "$ORCH/personas"` and copy each `templates/personas/*.md` via the existing
      `install_file` (so `{{PROJECT_NAME}}` substitution still works and `--force` is respected).
+   - Make `install_file` diff-aware (skip byte-identical files) so re-runs are quiet.
 
-5. **`scripts/orca-dispatch-role.sh`** (edit)
+5. **`scripts/install-to-project.sh`** (edit — update path; see "Update path" section)
+   - Add `--update` and `--migrate-roles` flags. `--update` refreshes managed files (personas,
+     scripts, PLAYBOOK/SCRIPTS templates) with `.bak` backups and **preserves `roles.yaml`**;
+     `--migrate-roles` (implies `--update`) opt-in rewrites legacy inline personas to `persona_file`.
+
+6. **`scripts/orca-dispatch-role.sh`** (edit)
    - After resolving `$MODEL`, read `.orca/orchestration/personas/<role>.md`, extract the STANCE line,
      and build:
      ```
@@ -125,16 +132,41 @@ coordinator is the running agent, not a role worker terminal).
      ```
    - If the persona file or STANCE line is missing, fall back to today's `[ROLE|model]\n<spec>` exactly.
 
-6. **Docs** (edit)
+7. **Docs** (edit)
    - `SKILL.md`: add `personas/` to the skill layout; note bootstrap injects the full persona and
-     dispatch injects the STANCE reminder.
+     dispatch injects the STANCE reminder; document `--update` / `--migrate-roles` in Modes.
    - `templates/PLAYBOOK.md`: short "Personas" section describing where personas live and how they flow.
    - `templates/SCRIPTS.md`: note the `personas/` directory is installed and consumed by bootstrap/dispatch.
+   - `README.md`: add persona files to the install list and an "Update an existing install" section.
+
+## Update path for existing installs
+
+Projects that ran the installer before this feature need a safe upgrade. Because the scripts read
+`personas/<role>.md` **directly** (not `roles.yaml`), an update only strictly needs the persona files
+plus the refreshed `bootstrap`/`dispatch` scripts — `roles.yaml` migration is documentation-only.
+
+`install-to-project.sh --update`:
+
+- **Guard**: requires an existing `.orca/orchestration/roles.yaml`; errors otherwise (points to fresh install).
+- **Refreshes (force + `.bak` backup on change)**: `personas/*.md`, `PLAYBOOK.md`, `SCRIPTS.md`,
+  `handles.example.json`, and the three `scripts/orca-*.sh` files.
+- **Preserves (never touched)**: `roles.yaml` (its `project_hints`, launch commands), `handles.json`,
+  `AGENTS.md` (only appends its section if missing, as today), `.gitignore` (only ensures the handles entry).
+- **Notice**: prints which files changed and that any launch-command customizations inside the scripts
+  should be re-applied from the `.bak` copies.
+
+`--migrate-roles` (implies `--update`): best-effort in-place migration of `roles.yaml` — replaces each
+legacy inline `persona: |` block with `persona_file: personas/<role>.md` + `persona_summary`, inserts a
+`persona_file` for `coordinator` if absent, adds the header comment, and backs the original up to
+`roles.yaml.bak`. Idempotent: a role that already has `persona_file` is left alone; a role whose block
+can't be found is skipped with a warning (customizations survive). Runs only `grep`/`sed`/Python
+line-surgery — still no YAML parser.
 
 ## Data / control flow
 
 ```
 [install]  templates/personas/*.md ──copy──▶ .orca/orchestration/personas/*.md
+[update]   refresh personas + scripts + docs (.bak on change); preserve roles.yaml unless --migrate-roles
 [bootstrap] personas/<role>.md ──full text──▶ orca terminal send (seed)  ▶ worker holds persona
 [dispatch]  personas/<role>.md ──STANCE line──▶ prepended to task spec    ▶ per-task reminder
 [fallback]  unchanged; failover spec still routes to ROLE=fallback (Relief Pitcher persona already seeded)
@@ -146,14 +178,20 @@ coordinator is the running agent, not a role worker terminal).
   Nothing breaks for repos installed before this change.
 - No new runtime dependency: all extraction is `grep`/`sed`/plain read. YAML is never parsed by scripts.
 - `--force` semantics on install unchanged; persona files copied through the same `install_file` path.
+- `--update` never edits `roles.yaml`; `--migrate-roles` always writes a `roles.yaml.bak` first and is
+  idempotent, so a re-run or a partially-migrated file is safe.
 
 ## Testing / verification
 
-- `bash -n` on all three modified scripts (syntax).
+- `bash -n` on all modified scripts (syntax).
 - Dry-run install into a scratch dir: confirm `.orca/orchestration/personas/*.md` created and
   `roles.yaml` contains `persona_file`.
 - Extract-STANCE unit check: `grep`/`sed` on each persona file returns exactly one non-empty stance line.
 - Skeleton lint: each persona file contains all required section headers and a `STANCE` marker.
+- Update path: simulate a pre-feature install (remove personas, mutate a script), run `--update`,
+  assert personas restored, script refreshed with a `.bak`, and `roles.yaml` preserved (no `.bak`).
+- Migration: on a legacy inline-persona `roles.yaml`, run `--migrate-roles`, assert `persona_file`
+  references added, inline blocks removed, other keys (`owns`, etc.) intact, `.bak` written, idempotent.
 - Manual read-through of each persona for the operating-profile sections + archetype voice.
 
 ## Open questions
