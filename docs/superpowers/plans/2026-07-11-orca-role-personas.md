@@ -14,7 +14,7 @@
 - Backward compatible: if a persona file is missing, bootstrap falls back to its existing hardcoded one-liner and dispatch omits the STANCE line — no hard failure.
 - `{{PROJECT_NAME}}` substitution must continue to work for any file copied by `install_file` (persona `.md` files go through the same path).
 - Character is a professional archetype only (`The Strategist`, `The Closer`, `The Scout`, `The Relief Pitcher`, `The Conductor`) — no fantasy names, no heavy roleplay.
-- The `STANCE` contract: every persona file has exactly one line matching `<!-- STANCE: <text> -->` on line 2. Extraction: `grep -m1 'STANCE:' FILE | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//'`.
+- The `STANCE` contract: every persona file has exactly one `<!-- STANCE: <text> -->` line on its own line just below the H1 (a blank separator line after the H1 is fine, so it lands on line 2 or 3). Extraction is line-agnostic: `grep -m1 'STANCE:' FILE | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//'`.
 - Persona file skeleton sections (stable substrings, all required): `**Who you are.**`, `**Mission.**`, `**Play to these strengths.**`, `**Guard against these failure modes.**`, `**How you decide`, `**Output contract.**`, `**Collaboration protocol.**`, `**Definition of done.**`, `**Never.**`.
 - Do not change the fixed four-role model lineup, launch commands, routing tables, DAGs, or the failover mechanism.
 - Update mode (`--update`) must preserve `roles.yaml` and `handles.json`, refresh managed files (personas, the three `orca-*.sh` scripts, `PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`), and back up any changed managed file to `<file>.bak`. `--migrate-roles` implies `--update`, is opt-in, always writes `roles.yaml.bak` first, and is idempotent.

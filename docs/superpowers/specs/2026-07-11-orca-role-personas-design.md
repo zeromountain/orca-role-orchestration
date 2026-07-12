@@ -79,8 +79,9 @@ Every persona file follows one skeleton (content differs per role):
 **Never.** Hard do-not list.
 ```
 
-The `<!-- STANCE: ... -->` HTML comment on line 2 is the machine-readable hook. Dispatch extracts exactly
-this line (via `grep`/`sed`) so the compact reminder and the full persona never drift.
+The `<!-- STANCE: ... -->` HTML comment sits on its own line just below the H1 (a blank separator line is
+fine) and is the machine-readable hook. Dispatch extracts exactly this line (via line-agnostic `grep`/`sed`)
+so the compact reminder and the full persona never drift.
 
 ### The five archetypes
 
