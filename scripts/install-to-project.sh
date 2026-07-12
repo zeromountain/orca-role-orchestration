@@ -238,6 +238,20 @@ for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh
   chmod +x "$SCRIPTS_DST/$s"
 done
 
+if [[ "$UPDATE" -eq 1 ]]; then
+  OLD_SCRIPTS_DIR="$ROOT/scripts"
+  if [[ "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
+    for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
+      if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
+        cp "$OLD_SCRIPTS_DIR/$s" "$OLD_SCRIPTS_DIR/$s.bak"
+        rm -f "$OLD_SCRIPTS_DIR/$s"
+        echo "  relocated old $OLD_SCRIPTS_DIR/$s → $SCRIPTS_DST/ (backup: $s.bak)"
+      fi
+    done
+    rmdir "$OLD_SCRIPTS_DIR" 2>/dev/null && echo "  removed empty $OLD_SCRIPTS_DIR" || true
+  fi
+fi
+
 # gitignore handles.json
 GI="$ROOT/.gitignore"
 if [[ -f "$GI" ]]; then
