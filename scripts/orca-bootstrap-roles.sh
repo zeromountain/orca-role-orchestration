@@ -98,8 +98,21 @@ else
   CONSTRAINTS="Follow repository conventions; never commit secrets."
 fi
 
+persona_body() {
+  # $1 = role key. Echo persona file content minus the H1 and the STANCE comment.
+  # Return non-zero if the file is absent (caller falls back to a hardcoded one-liner).
+  local role="$1" file="$OUT_DIR/personas/$role.md"
+  [[ -f "$file" ]] || return 1
+  grep -vE '^# |^<!-- STANCE:' "$file"
+}
+
 seed() {
-  local handle="$1" role="$2" model="$3" body="$4"
+  local handle="$1" role="$2" model="$3" fallback_body="$4" body
+  if body="$(persona_body "$role")" && [[ -n "${body// }" ]]; then
+    : # use full persona file
+  else
+    body="$fallback_body"
+  fi
   orca terminal send --terminal "$handle" --text "$(cat <<EOF
 You are ROLE=$role on model $model in an Orca multi-agent setup for $PROJECT_NAME.
 
