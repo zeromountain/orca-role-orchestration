@@ -20,8 +20,9 @@ while [[ $# -gt 0 ]]; do
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --update) UPDATE=1; shift ;;
+    --migrate-roles) MIGRATE=1; UPDATE=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update]"
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles]"
       exit 0
       ;;
     *)
@@ -102,8 +103,120 @@ PY
   echo "  wrote $dst"
 }
 
+migrate_roles() {
+  local target="$1"
+  python3 - "$target" <<'PY'
+import sys, re, shutil, pathlib
+
+target = sys.argv[1]
+lines = pathlib.Path(target).read_text().splitlines()
+
+REPL = {
+  "coordinator": [
+    "    persona_file: personas/coordinator.md",
+    "    persona_summary: >-",
+    "      The Conductor — decompose into a DAG, route by model strength, dispatch,",
+    "      synthesize; never bulk-implement.",
+  ],
+  "architect": [
+    "    persona_file: personas/architect.md",
+    "    persona_summary: >-",
+    "      The Strategist — plan, judge, and review high-stakes work with evidence;",
+    "      delegate bulk implementation; push back on weak plans.",
+  ],
+  "executor": [
+    "    persona_file: personas/executor.md",
+    "    persona_summary: >-",
+    "      The Closer — implement the approved plan end-to-end, verify before",
+    "      claiming done, integrate; escalate ambiguity to architect.",
+  ],
+  "thrifty": [
+    "    persona_file: personas/thrifty.md",
+    "    persona_summary: >-",
+    "      The Scout — fast, cheap small/exploratory work; small diffs; cite",
+    "      sources; escalate design risk early.",
+  ],
+  "fallback": [
+    "    persona_file: personas/fallback.md",
+    "    persona_summary: >-",
+    "      The Relief Pitcher — enter only on a primary's limit; smallest viable",
+    "      progress; stabilize and hand back; never re-architect.",
+  ],
+}
+
+def role_of(line):
+    m = re.match(r'^  (\w+):\s*$', line)
+    return m.group(1) if m else None
+
+has_pf = set()
+cur = None
+for line in lines:
+    r = role_of(line)
+    if r:
+        cur = r
+        continue
+    if cur and re.match(r'^    persona_file:', line):
+        has_pf.add(cur)
+
+header_present = any('Personas live in personas' in l for l in lines)
+out = []
+cur = None
+i = 0
+n = len(lines)
+migrated = []
+header_done = header_present
+while i < n:
+    line = lines[i]
+    if not header_done and line.startswith('# SSOT for coordinator routing'):
+        out.append(line)
+        out.append('# Personas live in personas/<role>.md (single source of truth). bootstrap injects')
+        out.append("# the full persona into each worker terminal; dispatch injects the file's")
+        out.append('# <!-- STANCE: ... --> line as a per-task reminder.')
+        header_done = True
+        i += 1
+        continue
+    r = role_of(line)
+    if r:
+        cur = r
+        out.append(line)
+        i += 1
+        continue
+    if cur and re.match(r'^    persona:\s*\|', line):
+        if cur in REPL and cur not in has_pf:
+            out.extend(REPL[cur])
+            migrated.append(cur)
+        else:
+            out.append(line)
+        i += 1
+        while i < n and re.match(r'^      ', lines[i]):
+            i += 1
+        continue
+    if cur == 'coordinator' and re.match(r'^    model:', line) \
+            and 'coordinator' not in has_pf and 'coordinator' not in migrated:
+        out.append(line)
+        out.extend(REPL['coordinator'])
+        migrated.append('coordinator')
+        i += 1
+        continue
+    out.append(line)
+    i += 1
+
+changed = bool(migrated) or (header_done and not header_present)
+if changed:
+    shutil.copyfile(target, target + '.bak')
+    pathlib.Path(target).write_text("\n".join(out) + "\n")
+    print("  migrated roles:", ", ".join(migrated) if migrated else "(header only)")
+else:
+    print("  roles.yaml already migrated (no change)")
+PY
+}
+
 if [[ "$UPDATE" -eq 1 ]]; then
-  echo "  preserved $ORCH/roles.yaml (customizations kept)"
+  if [[ "$MIGRATE" -eq 1 ]]; then
+    migrate_roles "$ORCH/roles.yaml"
+  else
+    echo "  preserved $ORCH/roles.yaml (customizations kept; --migrate-roles to convert legacy personas)"
+  fi
 else
   install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
 fi
