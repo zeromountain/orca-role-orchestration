@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- No new runtime dependency: scripts must not parse YAML; use plain file read + `grep`/`sed` only.
+- No new runtime dependency: scripts must not parse YAML (no PyYAML/yq). Use plain file read + `grep`/`sed`; `python3` is already a dependency and may be used for line-based text surgery (as in `migrate_roles`), but never as a YAML parser.
 - Backward compatible: if a persona file is missing, bootstrap falls back to its existing hardcoded one-liner and dispatch omits the STANCE line — no hard failure.
 - `{{PROJECT_NAME}}` substitution must continue to work for any file copied by `install_file` (persona `.md` files go through the same path).
 - Character is a professional archetype only (`The Strategist`, `The Closer`, `The Scout`, `The Relief Pitcher`, `The Conductor`) — no fantasy names, no heavy roleplay.
