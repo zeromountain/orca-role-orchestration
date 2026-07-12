@@ -12,6 +12,17 @@ Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 
 Principle: **Opus deepens, Sol closes, Grok widens.** Limit → agy Flash Medium.
 
+## Personas
+
+Each role's persona is a single-source file in `.orca/orchestration/personas/<role>.md`
+(archetype + operating profile). Flow:
+
+- **install** copies `personas/*.md` into the project.
+- **bootstrap** seeds each worker with the full persona.
+- **dispatch** prepends the file's `<!-- STANCE: … -->` line to every task spec.
+
+Edit the persona file (not the scripts) to tune a role. Missing file → scripts fall back safely.
+
 ## Preconditions
 
 ```bash

@@ -46,6 +46,7 @@ From the target project:
 This adds:
 
 - `.orca/orchestration/roles.yaml` as the routing source of truth
+- `.orca/orchestration/personas/<role>.md` — per-role personas seeded into workers
 - `.orca/orchestration/PLAYBOOK.md` and script documentation
 - bootstrap, dispatch, and rate-limit fallback scripts under `scripts/`
 - a gitignore entry for local Orca terminal handles
@@ -58,6 +59,24 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 ```
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
+
+## Update an existing install
+
+If you scaffolded a project before the persona system existed, upgrade it in place:
+
+```bash
+~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
+  --project-root "$(pwd)" --update
+```
+
+`--update` adds `.orca/orchestration/personas/`, refreshes the bootstrap/dispatch/fallback scripts and
+playbook docs (backing up any changed file to `<file>.bak`), and **preserves your `roles.yaml`**
+(`project_hints`, launch commands) and `handles.json`. If you customized launch commands inside the
+scripts, re-apply them from the `.bak` copies.
+
+Add `--migrate-roles` to also rewrite the legacy inline `persona:` blocks in `roles.yaml` to
+`persona_file:` references (original saved as `roles.yaml.bak`). This is optional — the scripts read the
+persona files directly, so persona injection works with or without the migration.
 
 ## Security
 

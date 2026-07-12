@@ -30,6 +30,10 @@ Principle: **Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.*
 
 Load `references/model-roles.md` only when the user asks why a role was chosen.
 
+Each role's persona lives in `personas/<role>.md` (single source). Bootstrap seeds the
+worker with the full persona; dispatch prepends the file's `<!-- STANCE: … -->` line as a
+per-task reminder. Missing file → bootstrap uses a built-in one-liner and dispatch omits the reminder.
+
 ## Preconditions
 
 ```bash
@@ -50,7 +54,9 @@ orca-role-orchestration/
     orca-bootstrap-roles.sh
     orca-dispatch-role.sh
     orca-fallback-on-limit.sh
+    check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
+    personas/                  # architect|executor|thrifty|fallback|coordinator .md
   references/model-roles.md
 ```
 
@@ -80,6 +86,13 @@ Creates:
 - gitignores `handles.json`; appends short AGENTS.md section if AGENTS.md exists
 
 Then customize `project_hints` in `roles.yaml` and merge AGENTS.md constraints into routing.
+
+Update an existing install (adds personas, refreshes scripts/docs, preserves your `roles.yaml`):
+
+```bash
+"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --update
+# add --migrate-roles to also convert legacy inline personas to persona_file refs (roles.yaml.bak saved)
+```
 
 ### B) Bootstrap role workers
 

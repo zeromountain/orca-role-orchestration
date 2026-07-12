@@ -6,6 +6,9 @@
 | `scripts/orca-dispatch-role.sh` | Supervised task + inject to a role |
 | `scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.5 Flash (Medium) |
 
+Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and quoted
+(one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
+
 ```bash
 chmod +x scripts/orca-*.sh
 ./scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
