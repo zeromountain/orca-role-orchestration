@@ -82,6 +82,11 @@ install_file "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md"
 install_file "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md"
 install_file "$TPL/handles.example.json" "$ORCH/handles.example.json"
 
+mkdir -p "$ORCH/personas"
+for p in "$TPL"/personas/*.md; do
+  install_file "$p" "$ORCH/personas/$(basename "$p")"
+done
+
 for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
   install_file "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s"
   chmod +x "$SCRIPTS_DST/$s"
