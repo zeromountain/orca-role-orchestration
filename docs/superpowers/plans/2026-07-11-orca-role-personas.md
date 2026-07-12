@@ -1820,3 +1820,10 @@ git commit -m "docs: point script invocations at .orca/orchestration/scripts"
 - Required section list in `check-personas.sh` matches the headers written in every persona file in Task 1 (verified: each file contains all nine substrings, `**How you decide` matched as a prefix to cover coordinator's `— the routing ladder` variant).
 
 **Cross-check — migration parser vs. real roles.yaml:** Task 7's `migrate_roles` matches role headers with `^  (\w+):$` (2-space indent, matching `templates/roles.yaml`), replaces `^    persona:\s*\|` blocks by consuming following `^      ` (6-space) body lines until the next 4-space key (e.g. `    owns:`) — consistent with the actual block-scalar indentation in Task 2's file.
+
+## Post-review fixes (final whole-branch review, commit 5cfe989)
+
+The final whole-branch review surfaced two items fixed after Task 11:
+
+1. **(Important) Emitted/embedded `./scripts/orca-` paths.** Tasks 9/11 updated human-facing docs but missed the literal path strings the scripts *emit* / *embed*: the `"script"` value bootstrap writes into `handles.json`, bootstrap's final echo, the fallback script's JSON `"script"`, dispatch's "run … first" error, `templates/roles.yaml` `limit_failover` (policy step 4 + `script:`), and `templates/handles.example.json`. All rewritten to `.orca/orchestration/scripts/orca-*`. (`install-to-project.sh`'s `$ROOT/scripts` legacy-cleanup path is intentionally left as the old location.)
+2. **(Minor hardening) `migrate_roles` `in_roles` guard.** The parser now only treats 2-space keys as roles while inside the top-level `roles:` mapping (`in_roles` flips True on `^roles:$`, False on any other top-level `^[A-Za-z_]` key; comments/blanks don't flip it). This closes a latent data-loss path where a top-level block outside `roles:` with a role-named child + inline `persona: |` could be corrupted (unreachable with the shipped template, but `--migrate-roles` runs on user-modified files).
