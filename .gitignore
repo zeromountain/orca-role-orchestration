@@ -1,2 +1,5 @@
 .DS_Store
 .orca/orchestration/handles.json
+
+# Superpowers SDD working scratch (ledger, briefs, review packages)
+.superpowers/
