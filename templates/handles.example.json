@@ -36,7 +36,7 @@
     "enabled": true,
     "target_role": "fallback",
     "model": "Gemini 3.5 Flash (Medium)",
-    "script": "./scripts/orca-fallback-on-limit.sh"
+    "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh"
   },
   "routing_ssot": ".orca/orchestration/roles.yaml",
   "playbook": ".orca/orchestration/PLAYBOOK.md",

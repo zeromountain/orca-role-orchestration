@@ -300,8 +300,8 @@ limit_failover:
     1. Do not hammer the limited primary
     2. Create NEW task ROLE=fallback with goal + partial progress
     3. Dispatch --inject to role-agy-fallback
-    4. Script: ./scripts/orca-fallback-on-limit.sh --from <role> --spec "..."
-  script: ./scripts/orca-fallback-on-limit.sh
+    4. Script: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "..."
+  script: .orca/orchestration/scripts/orca-fallback-on-limit.sh
 
 lifecycle:
   supervised_only_when:

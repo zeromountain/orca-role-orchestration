@@ -144,13 +144,30 @@ REPL = {
   ],
 }
 
+ROLES_HEADER = re.compile(r'^roles:\s*$')
+
 def role_of(line):
     m = re.match(r'^  (\w+):\s*$', line)
     return m.group(1) if m else None
 
+def is_toplevel_key(line):
+    # A non-comment, non-blank line starting at column 0 with a word character
+    return bool(re.match(r'^[A-Za-z_]', line))
+
 has_pf = set()
 cur = None
+in_roles = False
 for line in lines:
+    if ROLES_HEADER.match(line):
+        in_roles = True
+        cur = None
+        continue
+    if is_toplevel_key(line) and not ROLES_HEADER.match(line):
+        in_roles = False
+        cur = None
+        continue
+    if not in_roles:
+        continue
     r = role_of(line)
     if r:
         cur = r
@@ -161,6 +178,7 @@ for line in lines:
 header_present = any('Personas live in personas' in l for l in lines)
 out = []
 cur = None
+in_roles = False
 i = 0
 n = len(lines)
 migrated = []
@@ -175,13 +193,25 @@ while i < n:
         header_done = True
         i += 1
         continue
-    r = role_of(line)
+    if ROLES_HEADER.match(line):
+        in_roles = True
+        cur = None
+        out.append(line)
+        i += 1
+        continue
+    if is_toplevel_key(line) and not ROLES_HEADER.match(line):
+        in_roles = False
+        cur = None
+        out.append(line)
+        i += 1
+        continue
+    r = role_of(line) if in_roles else None
     if r:
         cur = r
         out.append(line)
         i += 1
         continue
-    if cur and re.match(r'^    persona:\s*\|', line):
+    if in_roles and cur and re.match(r'^    persona:\s*\|', line):
         if cur in REPL and cur not in has_pf:
             out.extend(REPL[cur])
             migrated.append(cur)
@@ -195,7 +225,7 @@ while i < n:
                 out.append(lines[i])
                 i += 1
         continue
-    if cur == 'coordinator' and re.match(r'^    model:', line) \
+    if in_roles and cur == 'coordinator' and re.match(r'^    model:', line) \
             and 'coordinator' not in has_pf and 'coordinator' not in migrated:
         out.append(line)
         out.extend(REPL['coordinator'])

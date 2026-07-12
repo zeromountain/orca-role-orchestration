@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Dispatch supervised Orca task to a role worker.
 # Usage:
-#   ./scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
-#   ./scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
+#   .orca/orchestration/scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
+#   .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -f "$HANDLES_FILE" ]]; then
-  echo "Missing $HANDLES_FILE — run ./scripts/orca-bootstrap-roles.sh first" >&2
+  echo "Missing $HANDLES_FILE — run .orca/orchestration/scripts/orca-bootstrap-roles.sh first" >&2
   exit 1
 fi
 

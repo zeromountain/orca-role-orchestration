@@ -110,7 +110,7 @@ d["roles"]["fallback"]={
 d["limit_failover"]={
   "enabled": True, "target_role": "fallback",
   "model": "Gemini 3.5 Flash (Medium)",
-  "script": "./scripts/orca-fallback-on-limit.sh",
+  "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
 }
 d["updatedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
 with open(path,"w") as f:

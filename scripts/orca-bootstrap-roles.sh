@@ -164,7 +164,7 @@ data = {
     "enabled": True,
     "target_role": "fallback",
     "model": "Gemini 3.5 Flash (Medium)",
-    "script": "./scripts/orca-fallback-on-limit.sh",
+    "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
   },
   "routing_ssot": ".orca/orchestration/roles.yaml",
   "playbook": ".orca/orchestration/PLAYBOOK.md",
@@ -177,4 +177,4 @@ print(json.dumps(data["roles"], indent=2))
 PY
 
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
-echo "Limit failover: ./scripts/orca-fallback-on-limit.sh --from <role> --spec \"...\""
+echo "Limit failover: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec \"...\""
