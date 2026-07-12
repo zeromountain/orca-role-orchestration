@@ -10,14 +10,18 @@ SCRIPTS_SRC="$SKILL_DIR/scripts"
 ROOT=""
 PROJECT_NAME=""
 FORCE=0
+UPDATE=0
+MIGRATE=0
+BACKUP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-root) ROOT="${2:?}"; shift 2 ;;
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --update) UPDATE=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force]"
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update]"
       exit 0
       ;;
     *)
@@ -55,15 +59,24 @@ echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
 
 mkdir -p "$ORCH" "$SCRIPTS_DST"
 
+if [[ "$UPDATE" -eq 1 ]]; then
+  if [[ ! -f "$ORCH/roles.yaml" ]]; then
+    echo "No existing install at $ORCH (roles.yaml missing)." >&2
+    echo "Run without --update for a fresh install." >&2
+    exit 1
+  fi
+  FORCE=1
+  BACKUP=1
+  echo "Update mode: refreshing managed files (roles.yaml handled separately)."
+fi
+
 install_file() {
   local src="$1"
   local dst="$2"
-  if [[ -f "$dst" && "$FORCE" -ne 1 ]]; then
-    echo "  skip existing: $dst (use --force to overwrite)"
-    return
-  fi
+  local tmp
+  tmp="$(mktemp)"
   if [[ "$src" == *.yaml ]] || [[ "$src" == *.md ]]; then
-    python3 - "$src" "$dst" "$PROJECT_NAME" <<'PY'
+    python3 - "$src" "$tmp" "$PROJECT_NAME" <<'PY'
 import pathlib
 import sys
 
@@ -72,12 +85,28 @@ text = pathlib.Path(source).read_text()
 pathlib.Path(destination).write_text(text.replace("{{PROJECT_NAME}}", project_name))
 PY
   else
-    cp "$src" "$dst"
+    cp "$src" "$tmp"
   fi
+  if [[ -f "$dst" ]]; then
+    if cmp -s "$tmp" "$dst"; then
+      rm -f "$tmp"; echo "  unchanged: $dst"; return
+    fi
+    if [[ "$FORCE" -ne 1 ]]; then
+      rm -f "$tmp"; echo "  skip existing: $dst (use --force or --update)"; return
+    fi
+    if [[ "$BACKUP" -eq 1 ]]; then
+      cp "$dst" "$dst.bak"; echo "  backed up: $dst.bak"
+    fi
+  fi
+  mv "$tmp" "$dst"
   echo "  wrote $dst"
 }
 
-install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+if [[ "$UPDATE" -eq 1 ]]; then
+  echo "  preserved $ORCH/roles.yaml (customizations kept)"
+else
+  install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
+fi
 install_file "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md"
 install_file "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md"
 install_file "$TPL/handles.example.json" "$ORCH/handles.example.json"
