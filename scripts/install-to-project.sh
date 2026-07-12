@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Install Orca role-orchestration scaffold into a project root.
 # Usage:
-#   install-to-project.sh [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles]
+#   install-to-project.sh [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles] [--fresh]
+#
+# With no mode flag, the installer AUTO-DETECTS: an existing .orca/orchestration/roles.yaml
+# switches it to update mode (refresh to the current skill version, preserving roles.yaml);
+# otherwise it does a fresh install. Use --fresh to force first-time behavior.
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,6 +17,7 @@ FORCE=0
 UPDATE=0
 MIGRATE=0
 BACKUP=0
+FRESH=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,8 +26,10 @@ while [[ $# -gt 0 ]]; do
     --force) FORCE=1; shift ;;
     --update) UPDATE=1; shift ;;
     --migrate-roles) MIGRATE=1; UPDATE=1; shift ;;
+    --fresh) FRESH=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles]"
+      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles] [--fresh]"
+      echo "  (no mode flag) auto-detects: existing roles.yaml → update; otherwise fresh install"
       exit 0
       ;;
     *)
@@ -60,6 +67,14 @@ echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
 
 mkdir -p "$ORCH" "$SCRIPTS_DST"
 
+# Auto-detect existing install: if roles.yaml is already present and no explicit mode
+# was requested, switch to update (refresh to the current skill version, preserving the
+# user's roles.yaml). --fresh forces a clean first-time install; --force/--update are explicit.
+if [[ "$UPDATE" -eq 0 && "$FORCE" -eq 0 && "$FRESH" -eq 0 && -f "$ORCH/roles.yaml" ]]; then
+  UPDATE=1
+  echo "Detected existing install at $ORCH → updating to the current skill version (roles.yaml preserved). Use --fresh for a clean install."
+fi
+
 if [[ "$UPDATE" -eq 1 ]]; then
   if [[ ! -f "$ORCH/roles.yaml" ]]; then
     echo "No existing install at $ORCH (roles.yaml missing)." >&2
@@ -69,6 +84,12 @@ if [[ "$UPDATE" -eq 1 ]]; then
   FORCE=1
   BACKUP=1
   echo "Update mode: refreshing managed files (roles.yaml handled separately)."
+fi
+
+# Legacy layout hint: an existing roles.yaml with inline persona blocks predates the
+# persona-file system; suggest (do not force) the opt-in migration of the user's SSOT.
+if [[ "$UPDATE" -eq 1 && "$MIGRATE" -eq 0 ]] && grep -q '^    persona: |' "$ORCH/roles.yaml" 2>/dev/null; then
+  echo "  note: roles.yaml has legacy inline personas — re-run with --migrate-roles to convert them to persona_file refs (roles.yaml.bak saved)."
 fi
 
 install_file() {

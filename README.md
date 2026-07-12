@@ -36,14 +36,17 @@ Restart or reload your agent so it discovers `SKILL.md`. You can then ask it to 
 
 ## Add the scaffold to a project
 
-From the target project:
+From the target project — the same command handles both first-time setup and upgrades. The installer
+**auto-detects**: if `.orca/orchestration/roles.yaml` is absent it does a fresh install; if it is present
+it updates in place to the current skill version, preserving your `roles.yaml` (see
+[Update an existing install](#update-an-existing-install)).
 
 ```bash
 ~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
   --project-root "$(pwd)"
 ```
 
-This adds:
+A fresh install adds:
 
 - `.orca/orchestration/roles.yaml` as the routing source of truth
 - `.orca/orchestration/personas/<role>.md` — per-role personas seeded into workers
@@ -62,21 +65,27 @@ See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](
 
 ## Update an existing install
 
-If you scaffolded a project before the persona system existed, upgrade it in place:
+If a project was scaffolded before the current version, just re-run the installer — it detects the
+existing `.orca/orchestration/roles.yaml` and updates in place (you can also pass `--update` explicitly):
 
 ```bash
 ~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
-  --project-root "$(pwd)" --update
+  --project-root "$(pwd)"          # auto-detected update; or add --update to be explicit
 ```
 
-`--update` adds `.orca/orchestration/personas/`, refreshes the bootstrap/dispatch/fallback scripts and
-playbook docs (backing up any changed file to `<file>.bak`), and **preserves your `roles.yaml`**
-(`project_hints`, launch commands) and `handles.json`. If you customized launch commands inside the
-scripts, re-apply them from the `.bak` copies.
+The update adds `.orca/orchestration/personas/`, refreshes the bootstrap/dispatch/fallback scripts and
+playbook docs (backing up any changed file to `<file>.bak`), relocates any legacy
+`<project>/scripts/orca-*.sh` into `.orca/orchestration/scripts/` (your own project scripts are left
+untouched), and **preserves your `roles.yaml`** (`project_hints`, launch commands) and `handles.json`.
+If you customized launch commands inside the scripts, re-apply them from the `.bak` copies.
 
-Add `--migrate-roles` to also rewrite the legacy inline `persona:` blocks in `roles.yaml` to
-`persona_file:` references (original saved as `roles.yaml.bak`). This is optional — the scripts read the
-persona files directly, so persona injection works with or without the migration.
+If your `roles.yaml` still has legacy inline `persona:` blocks the installer prints a hint; re-run with
+`--migrate-roles` to rewrite them to `persona_file:` references (original saved as `roles.yaml.bak`). This
+is optional — the scripts read the persona files directly, so persona injection works with or without the
+migration.
+
+Force a clean first-time install even when a scaffold already exists with `--fresh`; `--force` overwrites
+everything including `roles.yaml`.
 
 ## Security
 

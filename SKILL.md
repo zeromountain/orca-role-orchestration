@@ -70,28 +70,41 @@ in trusted repositories, or remove the bypass flags before bootstrapping.
 
 ## Modes
 
-### A) Install scaffold into current project (first time or new repo)
+### A) Install or update scaffold in current project
+
+The installer **auto-detects** state — always run the same command; it does the right thing:
 
 ```bash
 SKILL=~/.agents/skills/orca-role-orchestration
 "$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)"
-# optional: --project-name my-app --force
+# optional: --project-name my-app
 ```
 
-Creates:
+Detection (based on `.orca/orchestration/roles.yaml`):
+
+- **absent** → **fresh install** (first time / new repo).
+- **present** → **update in place** to the current skill version: adds `personas/`, refreshes
+  scripts/docs (changed files → `<file>.bak`), relocates any legacy `<project>/scripts/orca-*.sh`,
+  and **preserves your `roles.yaml`** (`project_hints`, launch commands) and `handles.json`.
+  If `roles.yaml` still has legacy inline personas, it prints a hint to re-run with `--migrate-roles`.
+
+Fresh install creates:
 
 - `.orca/orchestration/roles.yaml` (SSOT)
+- `.orca/orchestration/personas/{architect,executor,thrifty,fallback,coordinator}.md`
 - `.orca/orchestration/PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`
 - `.orca/orchestration/scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh`
 - gitignores `handles.json`; appends short AGENTS.md section if AGENTS.md exists
 
 Then customize `project_hints` in `roles.yaml` and merge AGENTS.md constraints into routing.
 
-Update an existing install (adds personas, refreshes scripts/docs, preserves your `roles.yaml`):
+Overrides:
 
 ```bash
-"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --update
-# add --migrate-roles to also convert legacy inline personas to persona_file refs (roles.yaml.bak saved)
+"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --migrate-roles  # update + convert legacy inline personas to persona_file refs (roles.yaml.bak saved)
+"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --fresh          # force first-time behavior even if a scaffold exists
+"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --update         # explicit update (same as auto-detected update)
+# --force overwrites everything including roles.yaml (clean re-scaffold)
 ```
 
 ### B) Bootstrap role workers
