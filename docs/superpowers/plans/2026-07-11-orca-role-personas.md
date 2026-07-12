@@ -1144,11 +1144,15 @@ while i < n:
         if cur in REPL and cur not in has_pf:
             out.extend(REPL[cur])
             migrated.append(cur)
+            i += 1
+            while i < n and re.match(r'^      ', lines[i]):
+                i += 1
         else:
             out.append(line)
-        i += 1
-        while i < n and re.match(r'^      ', lines[i]):
             i += 1
+            while i < n and re.match(r'^      ', lines[i]):
+                out.append(lines[i])
+                i += 1
         continue
     if cur == 'coordinator' and re.match(r'^    model:', line) \
             and 'coordinator' not in has_pf and 'coordinator' not in migrated:

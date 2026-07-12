@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Orca role-orchestration scaffold into a project root.
 # Usage:
-#   install-to-project.sh [--project-root PATH] [--project-name NAME] [--force]
+#   install-to-project.sh [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles]
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
