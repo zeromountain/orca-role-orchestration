@@ -2,17 +2,20 @@
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/orca-bootstrap-roles.sh` | Start 4 role workers + write `handles.json` |
-| `scripts/orca-dispatch-role.sh` | Supervised task + inject to a role |
-| `scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.5 Flash (Medium) |
+| `.orca/orchestration/scripts/orca-bootstrap-roles.sh` | Start 4 role workers + write `handles.json` |
+| `.orca/orchestration/scripts/orca-dispatch-role.sh` | Supervised task + inject to a role |
+| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.5 Flash (Medium) |
+
+Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and quoted
+(one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
 
 ```bash
-chmod +x scripts/orca-*.sh
-./scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
-./scripts/orca-dispatch-role.sh architect --spec "Plan: …"
-./scripts/orca-dispatch-role.sh thrifty --spec-file /tmp/task.md
-./scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
-./scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
+chmod +x .orca/orchestration/scripts/orca-*.sh
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+.orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec-file /tmp/task.md
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
 ```
 
 Roles: `architect` | `executor` | `thrifty` | `fallback`

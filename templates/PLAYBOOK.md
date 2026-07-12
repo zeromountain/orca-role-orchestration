@@ -12,6 +12,17 @@ Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 
 Principle: **Opus deepens, Sol closes, Grok widens.** Limit → agy Flash Medium.
 
+## Personas
+
+Each role's persona is a single-source file in `.orca/orchestration/personas/<role>.md`
+(archetype + operating profile). Flow:
+
+- **install** copies `personas/*.md` into the project.
+- **bootstrap** seeds each worker with the full persona.
+- **dispatch** prepends the file's `<!-- STANCE: … -->` line to every task spec.
+
+Edit the persona file (not the scripts) to tune a role. Missing file → scripts fall back safely.
+
 ## Preconditions
 
 ```bash
@@ -25,9 +36,9 @@ Same-checkout work: `orca terminal create --worktree active` (do not invent work
 ## Bootstrap
 
 ```bash
-./scripts/orca-bootstrap-roles.sh
+.orca/orchestration/scripts/orca-bootstrap-roles.sh
 # or
-./scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
 ```
 
 Tabs: `role-opus-architect` · `role-sol-executor` · `role-grok-thrifty` · `role-agy-fallback`
@@ -38,9 +49,9 @@ Handles: `.orca/orchestration/handles.json` (gitignore).
 Only when user asks to supervise / coordinate / wait / DAG:
 
 ```bash
-./scripts/orca-dispatch-role.sh architect --spec "Plan only: …"
-./scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
-./scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan only: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 
 orca orchestration check --wait \
   --types worker_done,escalation,decision_gate \
@@ -52,8 +63,8 @@ Timeout / `count:0` = checkpoint, not failure if terminal still alive.
 ## Limit failover
 
 ```bash
-./scripts/orca-fallback-on-limit.sh --check-handle term_…
-./scripts/orca-fallback-on-limit.sh --from architect --spec "Continue: …"
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --check-handle term_…
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue: …"
 ```
 
 ## Routing cheat sheet

@@ -2,9 +2,11 @@
 # Failover primary role → Antigravity Gemini 3.5 Flash (Medium).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HANDLES_FILE="$ROOT/.orca/orchestration/handles.json"
-DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+HANDLES_FILE="$ORCH/handles.json"
+DISPATCH="$HERE/orca-dispatch-role.sh"
 FROM=""
 SPEC=""
 SPEC_FILE=""
@@ -108,7 +110,7 @@ d["roles"]["fallback"]={
 d["limit_failover"]={
   "enabled": True, "target_role": "fallback",
   "model": "Gemini 3.5 Flash (Medium)",
-  "script": "./scripts/orca-fallback-on-limit.sh",
+  "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
 }
 d["updatedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
 with open(path,"w") as f:

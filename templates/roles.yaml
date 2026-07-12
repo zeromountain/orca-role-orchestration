@@ -1,6 +1,9 @@
 # Orca multi-model role orchestration
 # Source: GPT-5.6 Sol / Opus 4.8 / Grok 4.5 role strengths + Antigravity fallback
 # SSOT for coordinator routing. Project-specific hints live under project_hints.
+# Personas live in personas/<role>.md (single source of truth). bootstrap injects
+# the full persona into each worker terminal; dispatch injects the file's
+# <!-- STANCE: ... --> line as a per-task reminder.
 
 version: 1
 project: "{{PROJECT_NAME}}"
@@ -13,6 +16,10 @@ roles:
       worker_done/escalation, synthesize. Does not implement bulk code.
     agent: any
     model: any
+    persona_file: personas/coordinator.md
+    persona_summary: >-
+      The Conductor — decompose into a DAG, route by model strength, dispatch,
+      synthesize; never bulk-implement.
     owns:
       - task DAG design
       - decision gates
@@ -29,13 +36,10 @@ roles:
     effort: high
     launch_command: >-
       claude --model claude-opus-4-8 --dangerously-skip-permissions
-    persona: |
-      You are ROLE=architect on Claude Opus 4.8 for {{PROJECT_NAME}}.
-      Strengths: judgment, honesty, long-horizon coherence, architecture,
-      critical review, push-back on bad plans, high-stakes correctness.
-      Do NOT do bulk low-risk implementation when a Grok/Sol worker exists.
-      Prefer plans, ADRs, review findings, risk callouts, surgical fixes.
-      Reviews: Critical / Major / Minor with evidence, fix suggestion, open questions.
+    persona_file: personas/architect.md
+    persona_summary: >-
+      The Strategist — plan, judge, and review high-stakes work with evidence;
+      delegate bulk implementation; push back on weak plans.
     owns:
       - architecture / design
       - ambiguous requirements
@@ -62,12 +66,10 @@ roles:
     effort: high
     launch_command: >-
       codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox
-    persona: |
-      You are ROLE=executor on GPT-5.6 Sol (Codex) for {{PROJECT_NAME}}.
-      Strengths: terminal/CLI agent loops, hard implementation, persistence,
-      tool coordination, verification, collaborative execution.
-      Execute well-scoped tasks end-to-end. Escalate ambiguity to architect.
-      Default closer: integrate, verify, align with project SSOT.
+    persona_file: personas/executor.md
+    persona_summary: >-
+      The Closer — implement the approved plan end-to-end, verify before
+      claiming done, integrate; escalate ambiguity to architect.
     owns:
       - hard multi-step implementation from an approved plan
       - terminal-heavy debug / fix loops
@@ -94,12 +96,10 @@ roles:
     effort: default
     launch_command: >-
       grok --model grok-4.5 --permission-mode bypassPermissions
-    persona: |
-      You are ROLE=thrifty on Grok 4.5 for {{PROJECT_NAME}}.
-      Strengths: speed, cost, codebase navigation, routine edits, prototypes,
-      research breadth, high-volume small tickets.
-      Prefer small diffs. Escalate design risk upward.
-      External facts need source URL + date before promotion to SSOT.
+    persona_file: personas/thrifty.md
+    persona_summary: >-
+      The Scout — fast, cheap small/exploratory work; small diffs; cite
+      sources; escalate design risk early.
     owns:
       - well-scoped tickets and small diffs
       - codebase search / navigation / mechanical renames
@@ -127,11 +127,10 @@ roles:
     effort: medium
     launch_command: >-
       agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions
-    persona: |
-      You are ROLE=fallback on Antigravity Gemini 3.5 Flash (Medium).
-      Run only when a primary role hit rate/session limit or model overload.
-      Continue interrupted work with smallest viable progress.
-      Do not re-architect unless required to finish.
+    persona_file: personas/fallback.md
+    persona_summary: >-
+      The Relief Pitcher — enter only on a primary's limit; smallest viable
+      progress; stabilize and hand back; never re-architect.
     owns:
       - continue work when primaries are rate/session limited
       - low-to-medium complexity fixes while primaries cool down
@@ -301,8 +300,8 @@ limit_failover:
     1. Do not hammer the limited primary
     2. Create NEW task ROLE=fallback with goal + partial progress
     3. Dispatch --inject to role-agy-fallback
-    4. Script: ./scripts/orca-fallback-on-limit.sh --from <role> --spec "..."
-  script: ./scripts/orca-fallback-on-limit.sh
+    4. Script: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "..."
+  script: .orca/orchestration/scripts/orca-fallback-on-limit.sh
 
 lifecycle:
   supervised_only_when:

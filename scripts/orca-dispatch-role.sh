@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Dispatch supervised Orca task to a role worker.
 # Usage:
-#   ./scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
-#   ./scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
+#   .orca/orchestration/scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
+#   .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HANDLES_FILE="$ROOT/.orca/orchestration/handles.json"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+HANDLES_FILE="$ORCH/handles.json"
 ROLE=""
 SPEC=""
 SPEC_FILE=""
@@ -36,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -f "$HANDLES_FILE" ]]; then
-  echo "Missing $HANDLES_FILE — run ./scripts/orca-bootstrap-roles.sh first" >&2
+  echo "Missing $HANDLES_FILE — run .orca/orchestration/scripts/orca-bootstrap-roles.sh first" >&2
   exit 1
 fi
 
@@ -67,8 +69,19 @@ with open(sys.argv[1]) as stream:
 print(data["roles"][sys.argv[2]]["model"])
 PY
 )"
-FULL_SPEC="[ROLE=$ROLE | $MODEL]
+PERSONA_FILE="$ORCH/personas/$ROLE.md"
+STANCE=""
+if [[ -f "$PERSONA_FILE" ]]; then
+  STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
+fi
+if [[ -n "${STANCE// }" ]]; then
+  FULL_SPEC="[ROLE=$ROLE | $MODEL]
+STANCE: $STANCE
 $SPEC"
+else
+  FULL_SPEC="[ROLE=$ROLE | $MODEL]
+$SPEC"
+fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE"
 CREATE_JSON="$(orca orchestration task-create --deps "$DEPS" --spec "$FULL_SPEC" --json)"
