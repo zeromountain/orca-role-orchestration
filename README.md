@@ -48,14 +48,14 @@ This adds:
 - `.orca/orchestration/roles.yaml` as the routing source of truth
 - `.orca/orchestration/personas/<role>.md` — per-role personas seeded into workers
 - `.orca/orchestration/PLAYBOOK.md` and script documentation
-- bootstrap, dispatch, and rate-limit fallback scripts under `scripts/`
+- bootstrap, dispatch, and rate-limit fallback scripts under `.orca/orchestration/scripts/`
 - a gitignore entry for local Orca terminal handles
 
 Then customize `.orca/orchestration/roles.yaml` and bootstrap the workers:
 
 ```bash
 orca repo add --path "$(pwd)" # only if the project is not already in Orca
-./scripts/orca-bootstrap-roles.sh --worktree "path:$(pwd)"
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree "path:$(pwd)"
 ```
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.

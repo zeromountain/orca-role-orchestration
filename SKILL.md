@@ -82,7 +82,7 @@ Creates:
 
 - `.orca/orchestration/roles.yaml` (SSOT)
 - `.orca/orchestration/PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`
-- `scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh`
+- `.orca/orchestration/scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh`
 - gitignores `handles.json`; appends short AGENTS.md section if AGENTS.md exists
 
 Then customize `project_hints` in `roles.yaml` and merge AGENTS.md constraints into routing.
@@ -97,7 +97,7 @@ Update an existing install (adds personas, refreshes scripts/docs, preserves you
 ### B) Bootstrap role workers
 
 ```bash
-./scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
 ```
 
 Writes `.orca/orchestration/handles.json`. Re-run after closed tabs / invalid handles. Duplicate tabs possible if old `role-*` tabs still open — close them first when clean slate is needed.
@@ -111,9 +111,9 @@ Use **supervised** lifecycle only when the user wants coordinate / supervise / w
 3. Dispatch:
 
 ```bash
-./scripts/orca-dispatch-role.sh architect --spec "Plan only: <goal>. Follow AGENTS.md."
-./scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
-./scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan only: <goal>. Follow AGENTS.md."
+.orca/orchestration/scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
+.orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 ```
 
 4. Wait with rolling windows (timeout ≠ failure):
@@ -127,7 +127,7 @@ orca orchestration check --wait \
 5. On rate/session limit:
 
 ```bash
-./scripts/orca-fallback-on-limit.sh --from <role|term_*> --spec "Continue: <goal + partial>"
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role|term_*> --spec "Continue: <goal + partial>"
 ```
 
 ### D) Full handoff (no lifecycle)
