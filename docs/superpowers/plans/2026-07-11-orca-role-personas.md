@@ -4,7 +4,7 @@
 
 **Goal:** Give each Orca role a rich, injectable persona (operating profile + professional-archetype character) that actually reaches the worker, so workers perform better during real task execution.
 
-**Architecture:** Personas live as single-source markdown files under `templates/personas/<role>.md`. Bootstrap seeds each worker terminal with the full persona; dispatch prepends a compact one-line `STANCE` reminder per task; install copies the persona files into `.orca/orchestration/personas/`. Projects that were scaffolded before this feature upgrade in place via `install-to-project.sh --update` (preserves `roles.yaml`, backs up changed files) with an opt-in `--migrate-roles`. All script consumption is plain file read + `grep`/`sed` — no YAML parser, no new dependency. Every consumer degrades gracefully if a persona file is absent (backward compatible with pre-existing installs).
+**Architecture:** Personas live as single-source markdown files under `templates/personas/<role>.md`. Bootstrap seeds each worker terminal with the full persona; dispatch prepends a compact one-line `STANCE` reminder per task; install copies the persona files into `.orca/orchestration/personas/`. Orchestration scripts install to `.orca/orchestration/scripts/` (not the project's `scripts/` folder) and self-locate their data dir and project root from their own path. Projects that were scaffolded before these changes upgrade in place via `install-to-project.sh --update` (preserves `roles.yaml`, backs up changed files, relocates legacy scripts) with an opt-in `--migrate-roles`. All script consumption is plain file read + `grep`/`sed` — no YAML parser, no new dependency. Every consumer degrades gracefully if a persona file is absent (backward compatible with pre-existing installs).
 
 **Tech Stack:** Bash, Python 3 (already used by scripts for JSON), Markdown. Target repo: `orca-role-orchestration` skill package.
 
@@ -18,6 +18,7 @@
 - Persona file skeleton sections (stable substrings, all required): `**Who you are.**`, `**Mission.**`, `**Play to these strengths.**`, `**Guard against these failure modes.**`, `**How you decide`, `**Output contract.**`, `**Collaboration protocol.**`, `**Definition of done.**`, `**Never.**`.
 - Do not change the fixed four-role model lineup, launch commands, routing tables, DAGs, or the failover mechanism.
 - Update mode (`--update`) must preserve `roles.yaml` and `handles.json`, refresh managed files (personas, the three `orca-*.sh` scripts, `PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`), and back up any changed managed file to `<file>.bak`. `--migrate-roles` implies `--update`, is opt-in, always writes `roles.yaml.bak` first, and is idempotent.
+- Installed scripts live in `.orca/orchestration/scripts/` (Tasks 9–11), NOT `<project>/scripts/`. Each script self-locates: `HERE`=its dir, `ORCH="$HERE/.."`, `ROOT="$ORCH/../.."`. Fresh install must not create `<project>/scripts/`; `--update` relocates legacy `<project>/scripts/orca-*.sh` (`.bak` + remove) and never touches project-owned scripts.
 - Never commit secrets.
 
 ---
@@ -1391,7 +1392,7 @@ echo "OK: docs updated"
 ```
 Expected: PASS — prints `OK: docs updated`.
 
-- [ ] **Step 9: Final full-suite verification**
+- [ ] **Step 9: Full-suite verification (personas + update)**
 
 Run:
 ```bash
@@ -1403,21 +1404,384 @@ bash -n scripts/orca-bootstrap-roles.sh
 bash -n scripts/orca-dispatch-role.sh
 bash -n scripts/install-to-project.sh
 # update smoke: fresh install, drop personas, --update restores them
-SB="$SCR/final-smoke"; rm -rf "$SB"; mkdir -p "$SB"
+SB="$SCR/step9-smoke"; rm -rf "$SB"; mkdir -p "$SB"
 ./scripts/install-to-project.sh --project-root "$SB" --project-name smoke >/dev/null
 rm -rf "$SB/.orca/orchestration/personas"
 ./scripts/install-to-project.sh --project-root "$SB" --update >/dev/null
 [ -f "$SB/.orca/orchestration/personas/architect.md" ] || { echo "FAIL: update smoke"; exit 1; }
-echo "ALL GREEN"
+echo "PERSONAS + UPDATE GREEN"
 '
 ```
-Expected: PASS — persona lint OK, all scripts parse, update smoke restores personas, prints `ALL GREEN`.
+Expected: PASS — persona lint OK, all scripts parse, update smoke restores personas, prints `PERSONAS + UPDATE GREEN`.
 
 - [ ] **Step 10: Commit**
 
 ```bash
 git add SKILL.md templates/PLAYBOOK.md templates/SCRIPTS.md README.md
 git commit -m "docs: document persona files and injection flow"
+```
+
+---
+
+### Task 9: Relocate orchestration scripts under `.orca/orchestration/scripts/`
+
+Prevents the installer from writing into the project's own `scripts/` folder. This changes where scripts live and how they self-locate their data dir; the persona-injection logic (Tasks 3–4) still points at `.orca/orchestration/personas/`, now via `$ORCH`.
+
+> Note: Task 6's update test asserted the old `<project>/scripts/` location, which was correct at that point. From this task on, installed scripts live in `.orca/orchestration/scripts/`; Task 9 and Task 11 assert the new location.
+
+**Files:**
+- Modify: `scripts/orca-bootstrap-roles.sh` (path-resolution header → `HERE`/`ORCH`/`ROOT`; `OUT_DIR="$ORCH"`)
+- Modify: `scripts/orca-dispatch-role.sh` (path-resolution header; `HANDLES_FILE`/`PERSONA_FILE` → `$ORCH`)
+- Modify: `scripts/orca-fallback-on-limit.sh` (path-resolution header; `HANDLES_FILE` → `$ORCH`; `DISPATCH` → `$HERE/orca-dispatch-role.sh`)
+- Modify: `scripts/install-to-project.sh` (`SCRIPTS_DST="$ORCH/scripts"`; AGENTS.md snippet + "Next" hints → new path)
+
+**Interfaces:**
+- Consumes: the persona reads added in Tasks 3–4 (`$OUT_DIR/personas/...`, `$ROOT/.orca/orchestration/personas/...`).
+- Produces: scripts that resolve `HERE`=their dir, `ORCH="$HERE/.."` (= `.orca/orchestration`), `ROOT="$ORCH/../.."` (= project root), installed to `.orca/orchestration/scripts/`. Task 10 adds old-location cleanup; Task 11 updates docs.
+
+- [ ] **Step 1: Write the failing test (fresh install lands scripts in the new location)**
+
+Run:
+```bash
+bash -c '
+set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
+SB="$SCR/relocate-test"; rm -rf "$SB"; mkdir -p "$SB"
+./scripts/install-to-project.sh --project-root "$SB" --project-name reloc >/dev/null
+for s in orca-bootstrap-roles orca-dispatch-role orca-fallback-on-limit; do
+  [ -f "$SB/.orca/orchestration/scripts/$s.sh" ] || { echo "FAIL: $s.sh not in .orca/orchestration/scripts"; exit 1; }
+  [ -x "$SB/.orca/orchestration/scripts/$s.sh" ] || { echo "FAIL: $s.sh not executable"; exit 1; }
+  [ -f "$SB/scripts/$s.sh" ] && { echo "FAIL: $s.sh should not be in <project>/scripts"; exit 1; }
+done
+[ -d "$SB/scripts" ] && { echo "FAIL: fresh install must not create <project>/scripts"; exit 1; }
+grep -q "ORCH=\"\$(cd \"\$HERE/..\" && pwd)\"" scripts/orca-dispatch-role.sh || { echo "FAIL: dispatch not relocated"; exit 1; }
+echo "OK: scripts relocated to .orca/orchestration/scripts"
+'
+```
+Expected: FAIL — fresh install still writes to `$SB/scripts/`, so `$s.sh should not be in <project>/scripts`.
+
+- [ ] **Step 2: Relocate the bootstrap script header**
+
+In `scripts/orca-bootstrap-roles.sh`, replace this exact block:
+
+```bash
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT_DIR="$ROOT/.orca/orchestration"
+HANDLES_FILE="$OUT_DIR/handles.json"
+```
+
+with:
+
+```bash
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+OUT_DIR="$ORCH"
+HANDLES_FILE="$OUT_DIR/handles.json"
+```
+
+- [ ] **Step 3: Relocate the dispatch script header and persona path**
+
+In `scripts/orca-dispatch-role.sh`, replace this exact block:
+
+```bash
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HANDLES_FILE="$ROOT/.orca/orchestration/handles.json"
+```
+
+with:
+
+```bash
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+HANDLES_FILE="$ORCH/handles.json"
+```
+
+Then replace this exact line (added in Task 4):
+
+```bash
+PERSONA_FILE="$ROOT/.orca/orchestration/personas/$ROLE.md"
+```
+
+with:
+
+```bash
+PERSONA_FILE="$ORCH/personas/$ROLE.md"
+```
+
+- [ ] **Step 4: Relocate the fallback script header**
+
+In `scripts/orca-fallback-on-limit.sh`, replace this exact block:
+
+```bash
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HANDLES_FILE="$ROOT/.orca/orchestration/handles.json"
+DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
+```
+
+with:
+
+```bash
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+HANDLES_FILE="$ORCH/handles.json"
+DISPATCH="$HERE/orca-dispatch-role.sh"
+```
+
+- [ ] **Step 5: Point the installer at the new scripts directory**
+
+In `scripts/install-to-project.sh`, replace this exact line:
+
+```bash
+SCRIPTS_DST="$ROOT/scripts"
+```
+
+with:
+
+```bash
+SCRIPTS_DST="$ORCH/scripts"
+```
+
+- [ ] **Step 6: Update the AGENTS.md snippet paths**
+
+In `scripts/install-to-project.sh`, replace this exact block:
+
+```bash
+- Bootstrap: \`./scripts/orca-bootstrap-roles.sh\`
+- Dispatch: \`./scripts/orca-dispatch-role.sh <role> --spec "…"\`
+- Limit failover: \`./scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
+```
+
+with:
+
+```bash
+- Bootstrap: \`.orca/orchestration/scripts/orca-bootstrap-roles.sh\`
+- Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
+- Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
+```
+
+- [ ] **Step 7: Update the "Next" hint path**
+
+In `scripts/install-to-project.sh`, replace this exact line:
+
+```bash
+echo "  3) ./scripts/orca-bootstrap-roles.sh --worktree path:$ROOT"
+```
+
+with:
+
+```bash
+echo "  3) .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$ROOT"
+```
+
+- [ ] **Step 8: Run the relocation test to verify it passes**
+
+Run the exact block from Step 1 again.
+Expected: PASS — prints `OK: scripts relocated to .orca/orchestration/scripts`.
+
+- [ ] **Step 9: Verify all scripts still parse**
+
+Run:
+```bash
+bash -c '
+set -e
+bash -n scripts/orca-bootstrap-roles.sh
+bash -n scripts/orca-dispatch-role.sh
+bash -n scripts/orca-fallback-on-limit.sh
+bash -n scripts/install-to-project.sh
+echo "OK: scripts parse after relocation"
+'
+```
+Expected: PASS — prints `OK: scripts parse after relocation`.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add scripts/orca-bootstrap-roles.sh scripts/orca-dispatch-role.sh scripts/orca-fallback-on-limit.sh scripts/install-to-project.sh
+git commit -m "feat: install orchestration scripts under .orca/orchestration/scripts"
+```
+
+---
+
+### Task 10: Relocate old `<project>/scripts/orca-*.sh` on update
+
+**Files:**
+- Modify: `scripts/install-to-project.sh` (in `--update`, back up + remove legacy `<project>/scripts/orca-*.sh`)
+
+**Interfaces:**
+- Consumes: the `--update` machinery (Task 6), the new `SCRIPTS_DST` (Task 9).
+- Produces: an update that leaves no orca scripts in `<project>/scripts/` (backed up to `<file>.bak`), while never touching the project's own scripts.
+
+- [ ] **Step 1: Write the failing test (old-layout update relocates orca scripts, keeps project scripts)**
+
+Run:
+```bash
+bash -c '
+set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
+SB="$SCR/update-relocate-test"; rm -rf "$SB"; mkdir -p "$SB/scripts" "$SB/.orca/orchestration"
+printf "version: 1\n" > "$SB/.orca/orchestration/roles.yaml"
+printf "#!/usr/bin/env bash\n# old bootstrap\n" > "$SB/scripts/orca-bootstrap-roles.sh"
+printf "#!/usr/bin/env bash\n# old dispatch\n"  > "$SB/scripts/orca-dispatch-role.sh"
+printf "#!/usr/bin/env bash\n# old fallback\n"  > "$SB/scripts/orca-fallback-on-limit.sh"
+printf "#!/usr/bin/env bash\necho project-own\n" > "$SB/scripts/build.sh"
+./scripts/install-to-project.sh --project-root "$SB" --update >/dev/null
+[ -f "$SB/.orca/orchestration/scripts/orca-bootstrap-roles.sh" ] || { echo "FAIL: new-location script missing"; exit 1; }
+[ ! -f "$SB/scripts/orca-bootstrap-roles.sh" ] || { echo "FAIL: old orca script not removed"; exit 1; }
+[ -f "$SB/scripts/orca-bootstrap-roles.sh.bak" ] || { echo "FAIL: old orca script not backed up"; exit 1; }
+[ -f "$SB/scripts/build.sh" ] || { echo "FAIL: project-owned script was removed"; exit 1; }
+echo "OK: update relocates old orca scripts, keeps project scripts"
+'
+```
+Expected: FAIL — `--update` does not yet remove old scripts, so `old orca script not removed`.
+
+- [ ] **Step 2: Add old-script relocation to the update path**
+
+In `scripts/install-to-project.sh`, replace this exact block (the scripts install loop from the original file):
+
+```bash
+for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
+  install_file "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s"
+  chmod +x "$SCRIPTS_DST/$s"
+done
+```
+
+with:
+
+```bash
+for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
+  install_file "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s"
+  chmod +x "$SCRIPTS_DST/$s"
+done
+
+if [[ "$UPDATE" -eq 1 ]]; then
+  OLD_SCRIPTS_DIR="$ROOT/scripts"
+  if [[ "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
+    for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
+      if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
+        cp "$OLD_SCRIPTS_DIR/$s" "$OLD_SCRIPTS_DIR/$s.bak"
+        rm -f "$OLD_SCRIPTS_DIR/$s"
+        echo "  relocated old $OLD_SCRIPTS_DIR/$s → $SCRIPTS_DST/ (backup: $s.bak)"
+      fi
+    done
+    rmdir "$OLD_SCRIPTS_DIR" 2>/dev/null && echo "  removed empty $OLD_SCRIPTS_DIR" || true
+  fi
+fi
+```
+
+- [ ] **Step 3: Run the update-relocation test to verify it passes**
+
+Run the exact block from Step 1 again.
+Expected: PASS — prints `OK: update relocates old orca scripts, keeps project scripts`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scripts/install-to-project.sh
+git commit -m "feat: relocate legacy <project>/scripts/orca-*.sh on --update"
+```
+
+---
+
+### Task 11: Update doc references to the new script location
+
+**Files:**
+- Modify: `SKILL.md`, `templates/PLAYBOOK.md`, `templates/SCRIPTS.md`, `README.md` (installed-script invocations → `.orca/orchestration/scripts/orca-*.sh`)
+
+**Interfaces:**
+- Consumes: the new script location (Tasks 9–10).
+- Produces: docs whose "run this in your project" examples use `.orca/orchestration/scripts/orca-*.sh`; the skill-package layout diagram and the `install-to-project.sh` installer path stay as-is. No code depends on this task.
+
+- [ ] **Step 1: Rewrite the three named-script invocations across docs**
+
+Run (idempotent — the negative lookbehind skips already-migrated paths):
+```bash
+bash -c '
+set -e
+for f in SKILL.md templates/PLAYBOOK.md templates/SCRIPTS.md README.md; do
+  perl -0pi -e "s{(?<!orchestration/)(?:\./)?scripts/orca-(bootstrap-roles|dispatch-role|fallback-on-limit)\.sh}{.orca/orchestration/scripts/orca-\$1.sh}g" "$f"
+done
+echo "OK: named-script invocations rewritten"
+'
+```
+
+- [ ] **Step 2: Fix the remaining glob / brace / prose references**
+
+Run:
+```bash
+bash -c '
+set -e
+# SKILL.md brace-expansion form in the install "Creates:" list
+perl -0pi -e "s{scripts/orca-\{bootstrap-roles,dispatch-role,fallback-on-limit\}\.sh}{.orca/orchestration/scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh}g" SKILL.md
+# SCRIPTS.md chmod glob
+perl -0pi -e "s{(?<!orchestration/)scripts/orca-\*\.sh}{.orca/orchestration/scripts/orca-*.sh}g" templates/SCRIPTS.md
+# README.md prose ("scripts under scripts/")
+perl -0pi -e "s{fallback scripts under \`scripts/\`}{fallback scripts under \`.orca/orchestration/scripts/\`}g" README.md
+echo "OK: glob/brace/prose references rewritten"
+'
+```
+
+- [ ] **Step 3: Verify no stale installed-script references remain**
+
+Run:
+```bash
+bash -c '
+set -e
+if grep -rEn "(^|[^/])scripts/orca-(bootstrap-roles|dispatch-role|fallback-on-limit|\*)\.sh" SKILL.md templates/PLAYBOOK.md templates/SCRIPTS.md README.md | grep -v "orchestration/scripts/"; then
+  echo "FAIL: stale <project>/scripts/orca-*.sh reference remains"; exit 1
+fi
+grep -q ".orca/orchestration/scripts/orca-bootstrap-roles.sh" SKILL.md || { echo "FAIL: SKILL.md not updated"; exit 1; }
+grep -q ".orca/orchestration/scripts/orca-dispatch-role.sh" templates/PLAYBOOK.md || { echo "FAIL: PLAYBOOK.md not updated"; exit 1; }
+grep -q ".orca/orchestration/scripts/" templates/SCRIPTS.md || { echo "FAIL: SCRIPTS.md not updated"; exit 1; }
+grep -q ".orca/orchestration/scripts/" README.md || { echo "FAIL: README.md not updated"; exit 1; }
+echo "OK: no stale script references"
+'
+```
+Expected: PASS — prints `OK: no stale script references`.
+
+- [ ] **Step 4: Final full-suite verification (everything, end-to-end)**
+
+Run:
+```bash
+bash -c '
+set -e
+SCR="/private/tmp/claude-501/-Users-zeromountain-Desktop-orca-role-orchestration/6c8b1024-5646-420e-b1af-8d77fb357724/scratchpad"
+./scripts/check-personas.sh
+bash -n scripts/orca-bootstrap-roles.sh
+bash -n scripts/orca-dispatch-role.sh
+bash -n scripts/orca-fallback-on-limit.sh
+bash -n scripts/install-to-project.sh
+# fresh install: personas + scripts in new location, no <project>/scripts
+SB="$SCR/final-fresh"; rm -rf "$SB"; mkdir -p "$SB"
+./scripts/install-to-project.sh --project-root "$SB" --project-name final >/dev/null
+[ -f "$SB/.orca/orchestration/personas/architect.md" ] || { echo "FAIL: persona missing"; exit 1; }
+[ -f "$SB/.orca/orchestration/scripts/orca-bootstrap-roles.sh" ] || { echo "FAIL: script not relocated"; exit 1; }
+[ -d "$SB/scripts" ] && { echo "FAIL: <project>/scripts created"; exit 1; }
+# stance extraction against installed persona
+stance="$(grep -m1 "STANCE:" "$SB/.orca/orchestration/personas/architect.md" | sed -E "s/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//")"
+[ -n "${stance// }" ] || { echo "FAIL: stance empty"; exit 1; }
+# update from old layout: relocate scripts, keep project scripts, preserve roles.yaml
+SB2="$SCR/final-update"; rm -rf "$SB2"; mkdir -p "$SB2/scripts" "$SB2/.orca/orchestration"
+printf "version: 1\n# SENTINEL\n" > "$SB2/.orca/orchestration/roles.yaml"
+printf "#!/usr/bin/env bash\n" > "$SB2/scripts/orca-dispatch-role.sh"
+printf "#!/usr/bin/env bash\necho own\n" > "$SB2/scripts/build.sh"
+./scripts/install-to-project.sh --project-root "$SB2" --update >/dev/null
+[ -f "$SB2/.orca/orchestration/scripts/orca-dispatch-role.sh" ] || { echo "FAIL: update did not install new-location script"; exit 1; }
+[ ! -f "$SB2/scripts/orca-dispatch-role.sh" ] || { echo "FAIL: old orca script not removed"; exit 1; }
+[ -f "$SB2/scripts/build.sh" ] || { echo "FAIL: project script removed"; exit 1; }
+grep -q "SENTINEL" "$SB2/.orca/orchestration/roles.yaml" || { echo "FAIL: roles.yaml not preserved"; exit 1; }
+echo "ALL GREEN"
+'
+```
+Expected: PASS — prints `ALL GREEN`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add SKILL.md templates/PLAYBOOK.md templates/SCRIPTS.md README.md
+git commit -m "docs: point script invocations at .orca/orchestration/scripts"
 ```
 
 ---
@@ -1433,8 +1797,9 @@ git commit -m "docs: document persona files and injection flow"
 - Update path for existing installs (preserve roles.yaml, backups) → Task 6.
 - Optional roles.yaml migration (`--migrate-roles`) → Task 7.
 - roles.yaml references files (no inline persona) → Task 2.
-- Docs (SKILL.md incl. Modes update/migrate, PLAYBOOK.md, SCRIPTS.md, README.md incl. Update section) → Task 8.
-- Backward compatibility / graceful fallback → Task 3 (fallback_body), Task 4 (else branch), Task 6 (diff-aware `install_file`, absent-persona restore); harness + `bash -n` + update smoke in Task 8 Step 9.
+- Docs (SKILL.md incl. Modes update/migrate, PLAYBOOK.md, SCRIPTS.md, README.md incl. Update section) → Task 8; script-path doc updates → Task 11.
+- Script relocation out of `<project>/scripts/` → `.orca/orchestration/scripts/` → Task 9 (headers + install dest), Task 10 (update cleanup of legacy scripts), Task 11 (docs).
+- Backward compatibility / graceful fallback → Task 3 (fallback_body), Task 4 (else branch), Task 6 (diff-aware `install_file`, absent-persona restore), Task 10 (legacy-script relocation on update); harness + `bash -n` + smokes in Task 8 Step 9 and Task 11 Step 4.
 - coordinator persona is reference-only, not bootstrapped → Task 1 Step 7 (Note), Task 2 (persona_file added but bootstrap seeds only the 4 workers — bootstrap has no coordinator seed call, unchanged).
 
 **Placeholder scan:** No TBD/TODO. All code blocks are complete literal content. Persona bodies are full text, not summaries.
@@ -1444,7 +1809,9 @@ git commit -m "docs: document persona files and injection flow"
 - STANCE extraction `grep -m1 'STANCE:' … | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//'` is identical in `check-personas.sh` (Task 1), Task 4 script edit, and every test step.
 - `persona_file: personas/<role>.md` path form identical in Task 2, Task 7's `migrate_roles` REPL, and asserted in Task 2 Step 8, Task 5 Step 1, Task 7 Step 1.
 - `persona_summary` text in Task 7's `migrate_roles` REPL matches the summaries written into `templates/roles.yaml` in Task 2 (both derived from the same five one-liners; migration is doc-only, drift is cosmetic).
-- `$OUT_DIR/personas/$role.md` (bootstrap, Task 3) and `$ROOT/.orca/orchestration/personas/$ROLE.md` (dispatch, Task 4) both resolve to `.orca/orchestration/personas/<role>.md`, matching the install target in Tasks 5–6.
+- `$OUT_DIR/personas/$role.md` (bootstrap, Task 3) and `$ROOT/.orca/orchestration/personas/$ROLE.md` (dispatch, Task 4) both resolve to `.orca/orchestration/personas/<role>.md`, matching the install target in Tasks 5–6. Task 9 rewrites both to use `$OUT_DIR`=`$ORCH` (bootstrap) and `$ORCH/personas/$ROLE.md` (dispatch) — same resolved path under the new script location.
+- Relocation path math (Task 9): scripts at `.orca/orchestration/scripts/` → `HERE`=that dir, `ORCH="$HERE/.."`=`.orca/orchestration`, `ROOT="$ORCH/../.."`=project root. `SCRIPTS_DST="$ORCH/scripts"` (Task 9 Step 5) matches; `OLD_SCRIPTS_DIR="$ROOT/scripts"` (Task 10) is the legacy location and is guarded `!= "$SCRIPTS_DST"`.
+- Doc rewrite regex (Task 11) targets only `scripts/orca-(bootstrap-roles|dispatch-role|fallback-on-limit)\.sh` (plus the `orca-*.sh` glob and brace forms in Step 2) with a `(?<!orchestration/)` lookbehind for idempotency; skill-package layout diagram (`scripts/` on its own line) and `install-to-project.sh` installer path are not matched.
 - Flag/global consistency: `UPDATE`/`MIGRATE`/`BACKUP` globals (Task 6 Step 2) are set by `--update`/`--migrate-roles` (Tasks 6/7 flag parsing), read by the guard (Task 6 Step 5), `install_file` backup (Task 6 Step 4), and the roles.yaml branch (Tasks 6 Step 6 / 7 Step 4). `--migrate-roles` sets both `MIGRATE=1` and `UPDATE=1`.
 - Required section list in `check-personas.sh` matches the headers written in every persona file in Task 1 (verified: each file contains all nine substrings, `**How you decide` matched as a prefix to cover coordinator's `— the routing ladder` variant).
 

@@ -41,6 +41,7 @@ Net effect: personas are under-specified *and* under-delivered, which caps worke
 | Character level | Professional archetypes (`The Strategist`, `The Closer`, `The Scout`, `The Relief Pitcher`, `The Conductor`) |
 | Dispatch reminder | **Include** — extract a one-line `STANCE` marker from the persona file per dispatch |
 | Update path for existing installs | **Preserve + optional migration** — `install-to-project.sh --update` refreshes personas/scripts/docs and preserves `roles.yaml`; `--migrate-roles` opt-in rewrites legacy inline personas to `persona_file` refs (`.bak` backup) |
+| Installed-script location | **`.orca/orchestration/scripts/`** — namespaced under the dir the skill owns, so fresh install stops creating `<project>/scripts/`; `--update` backs up old `<project>/scripts/orca-*.sh` to `.bak` and removes them (project-owned scripts untouched) |
 
 ## Architecture
 
@@ -132,12 +133,21 @@ coordinator is the running agent, not a role worker terminal).
      ```
    - If the persona file or STANCE line is missing, fall back to today's `[ROLE|model]\n<spec>` exactly.
 
-7. **Docs** (edit)
+7. **`scripts/orca-bootstrap-roles.sh`, `orca-dispatch-role.sh`, `orca-fallback-on-limit.sh`** (edit — relocation)
+   - Replace the `ROOT=dirname/..` header with `HERE`/`ORCH`/`ROOT` resolution (installed layout
+     `.orca/orchestration/scripts/`). Point handles/personas at `$ORCH`; fallback calls `$HERE/orca-dispatch-role.sh`.
+
+8. **`scripts/install-to-project.sh`** (edit — relocation)
+   - `SCRIPTS_DST="$ORCH/scripts"`; update the AGENTS.md snippet + "Next" hints to `.orca/orchestration/scripts/`.
+   - In `--update`, back up and remove old `<project>/scripts/orca-*.sh` (leave project-owned scripts).
+
+9. **Docs** (edit)
    - `SKILL.md`: add `personas/` to the skill layout; note bootstrap injects the full persona and
      dispatch injects the STANCE reminder; document `--update` / `--migrate-roles` in Modes.
    - `templates/PLAYBOOK.md`: short "Personas" section describing where personas live and how they flow.
    - `templates/SCRIPTS.md`: note the `personas/` directory is installed and consumed by bootstrap/dispatch.
    - `README.md`: add persona files to the install list and an "Update an existing install" section.
+   - All docs: point installed-script invocations at `.orca/orchestration/scripts/orca-*.sh`.
 
 ## Update path for existing installs
 
@@ -162,11 +172,29 @@ legacy inline `persona: |` block with `persona_file: personas/<role>.md` + `pers
 can't be found is skipped with a warning (customizations survive). Runs only `grep`/`sed`/Python
 line-surgery — still no YAML parser.
 
+## Script location (avoid root `scripts/` collision)
+
+The original installer wrote the three worker scripts to `<project>/scripts/orca-*.sh`, which pollutes —
+and can collide with — a project's own `scripts/` directory. Relocate them under the directory the skill
+already owns:
+
+- New install target: `.orca/orchestration/scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh`.
+- Each script self-locates from its own path: `HERE=<scriptdir>`, `ORCH="$HERE/.."` (= `.orca/orchestration`),
+  `ROOT="$ORCH/../.."` (= project root). Data references become `$ORCH/handles.json`,
+  `$ORCH/personas/<role>.md`; the fallback script calls its sibling via `$HERE/orca-dispatch-role.sh`.
+  Bootstrap still uses `$ROOT` for `package.json` / `AGENTS.md`.
+- Fresh install no longer creates `<project>/scripts/`.
+- On `--update`, existing `<project>/scripts/orca-*.sh` (old location) are backed up to `<file>.bak` and the
+  originals removed; a project's own scripts in that folder are never touched.
+- All docs and the AGENTS.md snippet reference `.orca/orchestration/scripts/orca-*.sh`; the skill-package
+  layout diagram and the `install-to-project.sh` installer path are unchanged.
+
 ## Data / control flow
 
 ```
 [install]  templates/personas/*.md ──copy──▶ .orca/orchestration/personas/*.md
-[update]   refresh personas + scripts + docs (.bak on change); preserve roles.yaml unless --migrate-roles
+[install]  scripts/orca-*.sh ──copy──▶ .orca/orchestration/scripts/orca-*.sh   (NOT <project>/scripts/)
+[update]   refresh personas + scripts + docs (.bak on change); preserve roles.yaml unless --migrate-roles; relocate old <project>/scripts/orca-*.sh
 [bootstrap] personas/<role>.md ──full text──▶ orca terminal send (seed)  ▶ worker holds persona
 [dispatch]  personas/<role>.md ──STANCE line──▶ prepended to task spec    ▶ per-task reminder
 [fallback]  unchanged; failover spec still routes to ROLE=fallback (Relief Pitcher persona already seeded)
@@ -192,6 +220,10 @@ line-surgery — still no YAML parser.
   assert personas restored, script refreshed with a `.bak`, and `roles.yaml` preserved (no `.bak`).
 - Migration: on a legacy inline-persona `roles.yaml`, run `--migrate-roles`, assert `persona_file`
   references added, inline blocks removed, other keys (`owns`, etc.) intact, `.bak` written, idempotent.
+- Relocation (fresh): install into a scratch dir; assert scripts land in `.orca/orchestration/scripts/`,
+  are executable, and `<project>/scripts/` is not created.
+- Relocation (update): simulate old-layout `<project>/scripts/orca-*.sh` plus a project-owned script,
+  run `--update`, assert orca scripts moved (old removed, `.bak` kept) and the project-owned script survives.
 - Manual read-through of each persona for the operating-profile sections + archetype voice.
 
 ## Open questions
