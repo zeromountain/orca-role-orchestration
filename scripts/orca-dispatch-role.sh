@@ -67,8 +67,19 @@ with open(sys.argv[1]) as stream:
 print(data["roles"][sys.argv[2]]["model"])
 PY
 )"
-FULL_SPEC="[ROLE=$ROLE | $MODEL]
+PERSONA_FILE="$ROOT/.orca/orchestration/personas/$ROLE.md"
+STANCE=""
+if [[ -f "$PERSONA_FILE" ]]; then
+  STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
+fi
+if [[ -n "${STANCE// }" ]]; then
+  FULL_SPEC="[ROLE=$ROLE | $MODEL]
+STANCE: $STANCE
 $SPEC"
+else
+  FULL_SPEC="[ROLE=$ROLE | $MODEL]
+$SPEC"
+fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE"
 CREATE_JSON="$(orca orchestration task-create --deps "$DEPS" --spec "$FULL_SPEC" --json)"
