@@ -3,8 +3,10 @@
 # fallback (agy Gemini 3.5 Flash Medium).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT_DIR="$ROOT/.orca/orchestration"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+OUT_DIR="$ORCH"
 HANDLES_FILE="$OUT_DIR/handles.json"
 WORKTREE="active"
 PROJECT_NAME="$(basename "$ROOT")"

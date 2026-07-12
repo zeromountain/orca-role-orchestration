@@ -54,7 +54,7 @@ PY
 fi
 
 ORCH="$ROOT/.orca/orchestration"
-SCRIPTS_DST="$ROOT/scripts"
+SCRIPTS_DST="$ORCH/scripts"
 
 echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
 
@@ -267,9 +267,9 @@ $MARKER
 
 - SSOT: \`.orca/orchestration/roles.yaml\`
 - Playbook: \`.orca/orchestration/PLAYBOOK.md\`
-- Bootstrap: \`./scripts/orca-bootstrap-roles.sh\`
-- Dispatch: \`./scripts/orca-dispatch-role.sh <role> --spec "…"\`
-- Limit failover: \`./scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
+- Bootstrap: \`.orca/orchestration/scripts/orca-bootstrap-roles.sh\`
+- Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
+- Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
 EOF
   echo "  appended Orca section to AGENTS.md"
 fi
@@ -278,4 +278,4 @@ echo "Done."
 echo "Next:"
 echo "  1) Customize .orca/orchestration/roles.yaml project_hints if needed"
 echo "  2) orca repo add --path $ROOT   # if not already in Orca"
-echo "  3) ./scripts/orca-bootstrap-roles.sh --worktree path:$ROOT"
+echo "  3) .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$ROOT"

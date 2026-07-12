@@ -5,8 +5,10 @@
 #   ./scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HANDLES_FILE="$ROOT/.orca/orchestration/handles.json"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ORCH="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "$ORCH/../.." && pwd)"
+HANDLES_FILE="$ORCH/handles.json"
 ROLE=""
 SPEC=""
 SPEC_FILE=""
@@ -67,7 +69,7 @@ with open(sys.argv[1]) as stream:
 print(data["roles"][sys.argv[2]]["model"])
 PY
 )"
-PERSONA_FILE="$ROOT/.orca/orchestration/personas/$ROLE.md"
+PERSONA_FILE="$ORCH/personas/$ROLE.md"
 STANCE=""
 if [[ -f "$PERSONA_FILE" ]]; then
   STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
