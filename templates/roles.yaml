@@ -75,6 +75,7 @@ roles:
       - terminal-heavy debug / fix loops
       - tests, typecheck, build verification
       - PR-sized end-to-end delivery
+      - raster image generation and edit via Codex $imagegen skill
     route_keywords:
       - implement
       - implement hard
@@ -88,6 +89,21 @@ roles:
       - integrate
       - verify
       - ultra
+      - image
+      - imagegen
+      - generate image
+      - edit image
+      - mockup
+      - illustration
+      - sprite
+      - hero image
+      - product shot
+      - 이미지
+      - 이미지 생성
+      - 이미지 편집
+      - 목업
+      - 일러스트
+      - 스프라이트
 
   thrifty:
     handle_title: role-grok-thrifty
@@ -169,6 +185,18 @@ routing_table:
   - match: terminal_agent_loop
     when: "Shell-heavy repro, multi-step CLI workflow"
     primary: executor
+  - match: image_generation
+    when: >
+      User wants a new or edited raster image (hero, mockup, illustration,
+      sprite, product shot, transparent cutout, etc.). Not SVG/vector/code-native icons.
+    primary: executor
+    notes: |
+      Coordinator clarity gate BEFORE dispatch:
+      enough brief = subject + intended use (+ style/destination if project-bound).
+      If missing critical slots → ask user; do not dispatch.
+      Spec MUST require Codex $imagegen skill only
+      (${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/SKILL.md).
+      Do not route to thrifty/Grok image tools.
   - match: small_ticket
     when: "Clear 1-3 file change, docs polish, rename"
     primary: thrifty
@@ -180,7 +208,7 @@ routing_table:
     primary: thrifty
     secondary: architect
   - match: prototype
-    when: "Spike / demo / one-shot mock"
+    when: "Spike / demo / one-shot mock (code/UI, not raster image generation)"
     primary: thrifty
     secondary: architect
   - match: verification
@@ -272,6 +300,30 @@ dags:
         role: executor
         deps: [critique]
 
+  image_generate:
+    description: Raster image via Codex $imagegen (after brief is clear)
+    steps:
+      - id: generate
+        role: executor
+        deps: []
+        spec_template: |
+          ROLE=executor. Image task for {{PROJECT_NAME}}.
+          Use Codex skill $imagegen ONLY
+          (read ${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/SKILL.md).
+          Do NOT use other image APIs, Grok/Claude image tools, or invent scripts.
+
+          Brief (already clarified with user):
+          {{image_brief}}
+
+          Rules:
+          - Built-in image_gen path inside $imagegen by default
+          - CLI fallback only if user explicitly confirmed
+          - Project-bound assets: copy final file into workspace; report absolute path
+          - Do not overwrite existing assets unless user asked to replace
+          - If brief is still missing a success-critical detail → escalate/ask; do not invent
+
+          Done: final path(s) + short prompt used + built-in vs CLI mode.
+
 project_hints:
   # Customize per project after install (paths, always_architect globs, etc.)
   always_architect: []
@@ -280,6 +332,8 @@ project_hints:
   notes: |
     Merge constraints from AGENTS.md / CLAUDE.md into seed personas and specs.
     Model disagreement → project SSOT docs + current code win.
+    Raster image gen/edit → executor + Codex $imagegen only (clarity gate first).
+    SVG/vector/code-native icons stay on thrifty/executor code paths, not $imagegen.
 
 limit_failover:
   enabled: true

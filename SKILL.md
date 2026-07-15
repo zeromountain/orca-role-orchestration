@@ -3,9 +3,11 @@ name: orca-role-orchestration
 description: >
   Install and run Orca multi-model role orchestration: Claude Opus 4.8 (architect),
   GPT-5.6 Sol via Codex (executor), Grok 4.5 (thrifty), Antigravity Gemini 3.5 Flash
-  Medium (fallback on rate/session limits). Use whenever the user wants model role
-  separation in Orca Agent IDE, multi-model routing, role workers, bootstrap roles,
-  dispatch by role, plan-execute-review DAGs, limit failover to agy/Gemini Flash,
+  Medium (fallback on rate/session limits). Raster image generation/edit routes to
+  executor with Codex $imagegen; if the image brief is ambiguous, ask the user first.
+  Use whenever the user wants model role separation in Orca Agent IDE, multi-model
+  routing, role workers, bootstrap roles, dispatch by role, plan-execute-review DAGs,
+  image generation / imagegen / 이미지 생성, limit failover to agy/Gemini Flash,
   or mentions Opus/Sol/Grok role split, orca-role-orchestration, /orca-role-orchestration,
   "역할 오케스트레이션", "모델별 역할 분리", "architect executor thrifty", or
   "fallback Gemini Flash". Prefer this skill over ad-hoc multi-agent setup when work
@@ -129,6 +131,22 @@ Use **supervised** lifecycle only when the user wants coordinate / supervise / w
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 ```
 
+Image generation (only after the clarity gate below):
+
+```bash
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --spec "
+Use Codex \$imagegen skill only
+(read \${CODEX_HOME:-\$HOME/.codex}/skills/.system/imagegen/SKILL.md).
+Goal: <one-sentence deliverable>
+Subject: …
+Use: …
+Style: …
+Destination: <workspace path or preview-only>
+Constraints/Avoid: …
+Done: final path(s) + mode (built-in|CLI)
+"
+```
+
 4. Wait with rolling windows (timeout ≠ failure):
 
 ```bash
@@ -153,11 +171,33 @@ If user says hand off / 넘겨줘 without supervise language: do **not** task-cr
 |-----------|------|
 | Design, ambiguous scope, high-risk review | architect |
 | Hard implement, debug, typecheck/build, close PR unit | executor |
-| Small fix, map code, research, prototype | thrifty |
+| Raster image generate/edit (Codex `$imagegen`) | executor |
+| Small fix, map code, research, code prototype | thrifty |
 | Primary hit session/rate/quota limit | fallback |
 
 Standard DAG: `architect(plan) → executor|thrifty(impl) → architect(review-only)`.
+Image DAG: clarity gate → `executor` (`$imagegen`) only.
 Cost ladder: `thrifty → executor → architect`.
+
+## Image generation (Codex `$imagegen`)
+
+When the user wants a **new or edited raster image** (hero, mockup photo, illustration, sprite, product shot, transparent cutout, etc.):
+
+1. **Route to executor (Codex)** — never thrifty/Grok or Claude image tools for these tasks.
+2. **Clarity gate (coordinator, before dispatch):** if the brief is missing success-critical slots, **ask the user first**. Do not invent brand names, extra subjects, or marketing copy.
+
+| Slot | Ask when missing |
+|------|------------------|
+| Subject | what is in the frame |
+| Intended use | hero, ad, sprite, preview-only, … |
+| Destination | project path vs preview-only (if project-bound) |
+| Style / constraints | only if user cares (medium, palette, no text, aspect) |
+| Edit target | for edits: which file + what must stay unchanged |
+
+If the request is already specific enough, skip questions and dispatch.
+
+3. **Spec must require** Codex skill `$imagegen` only (`${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/SKILL.md`). Built-in path by default; CLI fallback only after user confirmation.
+4. **Not `$imagegen`:** extending SVG/vector icon sets, logos that must match repo-native vectors, simple shapes better done in HTML/CSS/SVG.
 
 ## Spec hygiene
 
@@ -168,6 +208,8 @@ Scripts auto-prefix `[ROLE=<role> | <model>]`. Body should include:
 - Allowed file scope
 - Done definition / verification commands
 
+Image specs: subject, use, destination, constraints/avoid, `$imagegen`-only mandate.
+
 Edit ownership: one role edits a file set at a time; review-only architect does not bulk rewrite.
 
 ## Coordinator checklist
@@ -175,7 +217,7 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 1. `orca status --json` ready
 2. Scaffold present (`roles.yaml` + scripts) or run install
 3. Handles valid or bootstrap
-4. Route by roles.yaml
+4. Route by roles.yaml (image intent → clarity gate → executor/`$imagegen`)
 5. Dispatch --inject → check --wait
 6. Limit → fallback script
 7. Synthesize worker_done bodies; re-dispatch fixes if needed
@@ -186,6 +228,7 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 - Use fallback as default quality lane
 - Retry a limited primary until its window resets
 - Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
+- Generate images without a clear brief (ask first) or with non-Codex image tools when `$imagegen` is the path
 
 ## Related
 

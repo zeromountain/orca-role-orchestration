@@ -6,7 +6,7 @@ Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 | Role | Model | CLI | Own |
 |------|-------|-----|-----|
 | **architect** | Claude Opus 4.8 | `claude` | Design, judgment, high-risk review |
-| **executor** | GPT-5.6 Sol | `codex` | Hard implement, terminal loops, verify, close work |
+| **executor** | GPT-5.6 Sol | `codex` | Hard implement, terminal loops, verify, close work, raster images via `$imagegen` |
 | **thrifty** | Grok 4.5 | `grok` | Small tickets, explore, research, prototypes |
 | **fallback** | Gemini 3.5 Flash (Medium) | `agy` | **Rate/session limit only** |
 
@@ -74,16 +74,39 @@ Timeout / `count:0` = checkpoint, not failure if terminal still alive.
 | Design / ambiguous | architect | — |
 | High-risk (auth/PII/security) | architect → executor → architect review | |
 | Hard implement / debug | executor | thrifty explore |
+| Raster image generate/edit | executor (`$imagegen`) | — (ask user first if brief unclear) |
 | Small fix / rename / polish | thrifty | — |
 | Map code (read-only) | thrifty | — |
 | Research / alternatives | thrifty | architect critique → executor integrate |
-| Prototype | thrifty | architect before promote |
+| Prototype (code/UI) | thrifty | architect before promote |
 | typecheck / build / test | executor | — |
+
+## Image generation clarity gate
+
+Before dispatching image work to executor:
+
+1. Detect intent (generate/edit image, 이미지 생성/편집, mockup photo, hero art, illustration, sprite, product shot, transparent cutout).
+2. If **subject** or **intended use** is missing (and destination when project-bound), **ask the user** — do not invent creative requirements.
+3. When clear, dispatch executor with a `$imagegen`-only spec (see `dags.image_generate` in `roles.yaml`).
+4. Not for SVG/vector icon systems or code-native graphics — keep those on thrifty/executor code paths.
+
+```bash
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --spec "
+Use Codex \$imagegen skill only.
+Goal: …
+Subject: …
+Use: …
+Destination: …
+Done: final path(s) + mode
+"
+```
 
 ## Patterns
 
 ```text
 Plan → Execute → Review:  architect → executor|thrifty → architect(review-only)
+Image (clear brief):      executor ($imagegen)
+Image (ambiguous brief):  ask user → then executor ($imagegen)
 Cost ladder:              thrifty → executor → architect
 Limit:                    any primary → fallback (agy)
 Research:                 thrifty → architect → executor

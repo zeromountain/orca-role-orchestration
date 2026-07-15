@@ -5,7 +5,7 @@ An installable Agent Skill and project scaffold for routing Orca Agent IDE work 
 | Role | Default model | Best for |
 |---|---|---|
 | `architect` | Claude Opus 4.8 | Architecture, planning, high-risk review |
-| `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification |
+| `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
 | `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
 | `fallback` | Gemini 3.5 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
