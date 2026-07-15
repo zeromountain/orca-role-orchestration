@@ -1,0 +1,20 @@
+{
+  "name": "orca-role-orchestration",
+  "interface": {
+    "displayName": "Orca Role Orchestration"
+  },
+  "plugins": [
+    {
+      "name": "orca-role-orchestration",
+      "source": {
+        "source": "url",
+        "url": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

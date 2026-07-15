@@ -50,7 +50,14 @@ If the project is not in Orca: `orca repo add --path <abs-project-root>`.
 
 ```
 orca-role-orchestration/
-  SKILL.md
+  SKILL.md                     # single skill at plugin root (Claude Code layout)
+  .claude-plugin/
+    plugin.json                # Claude plugin identity
+    marketplace.json           # Claude self-marketplace catalog (source: "./")
+  .codex-plugin/
+    plugin.json                # Codex plugin identity (skills: "./", hooks: {})
+  .agents/plugins/
+    marketplace.json           # Codex marketplace catalog (source url "./")
   scripts/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
@@ -71,6 +78,24 @@ Resolve the skill root from this file’s directory. A conventional installation
 `~/.agents/skills/orca-role-orchestration/`
 (Grok may also see `~/.grok/skills/orca-role-orchestration` → symlink)
 
+**Claude Code plugin marketplace** (self-marketplace; root `SKILL.md` is the single skill):
+
+```text
+/plugin marketplace add zeromountain/orca-role-orchestration
+/plugin install orca-role-orchestration@orca-role-orchestration
+```
+
+Namespaced skill: `/orca-role-orchestration:…`. Manifests: `.claude-plugin/plugin.json` + `marketplace.json` (`source: "./"`).
+
+**Codex plugin marketplace** (same repo root; do not move layout):
+
+```bash
+codex plugin marketplace add zeromountain/orca-role-orchestration
+codex plugin add orca-role-orchestration@orca-role-orchestration
+```
+
+Manifests: `.codex-plugin/plugin.json` (`skills: "./"`, `hooks: {}`) + `.agents/plugins/marketplace.json`. Do not move `scripts/` or `templates/` — installers require skill-root layout.
+
 The default worker launch commands bypass provider permission checks. Use them only
 in trusted repositories, or remove the bypass flags before bootstrapping.
 
@@ -78,7 +103,21 @@ in trusted repositories, or remove the bypass flags before bootstrapping.
 
 ### A) Install or update (one free re-run command)
 
-**Global skill** (clone-or-pull + symlinks into existing agent skill dirs):
+**Claude Code** — marketplace (discovery + skill load):
+
+```text
+/plugin marketplace add zeromountain/orca-role-orchestration
+/plugin install orca-role-orchestration@orca-role-orchestration
+```
+
+**Codex** — marketplace:
+
+```bash
+codex plugin marketplace add zeromountain/orca-role-orchestration
+codex plugin add orca-role-orchestration@orca-role-orchestration
+```
+
+**Global skill** (clone-or-pull + multi-agent symlinks; preferred for project scaffold path):
 
 ```bash
 ./scripts/install-skill.sh

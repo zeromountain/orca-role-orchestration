@@ -1,0 +1,26 @@
+{
+  "name": "orca-role-orchestration",
+  "description": "Marketplace for the orca-role-orchestration skill and project scaffold",
+  "owner": {
+    "name": "zeromountain"
+  },
+  "plugins": [
+    {
+      "name": "orca-role-orchestration",
+      "source": "./",
+      "description": "Four-role Orca multi-model role orchestration: Opus architect, Sol executor, Grok thrifty, Gemini Flash fallback",
+      "author": {
+        "name": "zeromountain"
+      },
+      "homepage": "https://github.com/zeromountain/orca-role-orchestration",
+      "repository": "https://github.com/zeromountain/orca-role-orchestration",
+      "license": "MIT",
+      "keywords": [
+        "orca",
+        "orchestration",
+        "multi-model",
+        "roles"
+      ]
+    }
+  ]
+}

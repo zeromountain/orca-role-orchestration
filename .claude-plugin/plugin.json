@@ -1,0 +1,18 @@
+{
+  "name": "orca-role-orchestration",
+  "description": "Four-role Orca Agent IDE orchestration: Claude Opus architect, GPT Sol executor, Grok thrifty, Gemini Flash fallback. Project scaffold, playbook, and supervised dispatch.",
+  "author": {
+    "name": "zeromountain"
+  },
+  "homepage": "https://github.com/zeromountain/orca-role-orchestration",
+  "repository": "https://github.com/zeromountain/orca-role-orchestration",
+  "license": "MIT",
+  "keywords": [
+    "orca",
+    "orchestration",
+    "multi-model",
+    "skills",
+    "roles",
+    "claude-code"
+  ]
+}

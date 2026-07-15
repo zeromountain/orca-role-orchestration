@@ -24,7 +24,65 @@ orca status --json
 which orca claude codex grok agy
 ```
 
-## Install or update the global skill
+## Install for Claude Code (plugin marketplace)
+
+This repo is a **self-contained marketplace** (same pattern as Superpowers): root `SKILL.md` + `.claude-plugin/` manifests. Layout stays at repo root so `scripts/install-to-project.sh` paths keep working.
+
+```text
+/plugin marketplace add zeromountain/orca-role-orchestration
+/plugin install orca-role-orchestration@orca-role-orchestration
+```
+
+CLI:
+
+```bash
+claude plugin marketplace add zeromountain/orca-role-orchestration
+claude plugin install orca-role-orchestration@orca-role-orchestration
+```
+
+Local dry-run from a checkout:
+
+```bash
+claude plugin validate .
+claude --plugin-dir "$(pwd)"
+# skill namespace: /orca-role-orchestration:…
+```
+
+Refresh after new commits (plugin version is SHA-based — no pin field in `plugin.json`):
+
+```text
+/plugin marketplace update orca-role-orchestration
+/plugin update orca-role-orchestration@orca-role-orchestration
+```
+
+Claude plugin install loads the skill for Claude Code. For **project scaffold** and multi-agent paths (`~/.agents/skills`, Codex/Grok), also use `install-skill.sh` below (or run `install-to-project.sh` from the plugin cache / a clone).
+
+## Install for Codex (plugin marketplace)
+
+Codex discovers this repo via `.agents/plugins/marketplace.json` and loads the plugin from `.codex-plugin/plugin.json` (root single skill, `skills: "./"`, empty `hooks: {}` so no Claude hooks leak in).
+
+```bash
+codex plugin marketplace add zeromountain/orca-role-orchestration
+codex plugin add orca-role-orchestration@orca-role-orchestration
+```
+
+Local dry-run from a checkout:
+
+```bash
+codex plugin marketplace add "$(pwd)"
+codex plugin add orca-role-orchestration@orca-role-orchestration
+codex plugin list
+```
+
+Refresh marketplace snapshots after new commits:
+
+```bash
+codex plugin marketplace upgrade
+```
+
+Same note as Claude: plugin install loads the skill into Codex; project scaffold still uses `install-to-project.sh` from a full skill root (`install-skill.sh`, clone, or plugin cache).
+
+## Install or update the global skill (multi-agent)
 
 Same command installs and updates (clone-or-pull + optional multi-agent symlinks):
 
