@@ -1,0 +1,18 @@
+# User-owned project customization for Orca role orchestration.
+# This file is YOURS: the installer creates it once and never overwrites it.
+# Managed routing lives in roles.yaml (refreshed on every install re-run).
+#
+# Coordinator: read this file together with roles.yaml when routing work.
+
+project: "{{PROJECT_NAME}}"
+
+project_hints:
+  # Customize per project after install (paths, always_architect globs, etc.)
+  always_architect: []
+  prefer_executor: []
+  prefer_thrifty: []
+  notes: |
+    Merge constraints from AGENTS.md / CLAUDE.md into seed personas and specs.
+    Model disagreement → project SSOT docs + current code win.
+    Raster image gen/edit → executor + Codex $imagegen only (clarity gate first).
+    SVG/vector/code-native icons stay on thrifty/executor code paths, not $imagegen.

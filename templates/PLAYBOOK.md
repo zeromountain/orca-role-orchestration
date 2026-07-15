@@ -1,6 +1,7 @@
 # Orca multi-model orchestration playbook
 
-SSOT: `.orca/orchestration/roles.yaml`
+SSOT (managed routing): `.orca/orchestration/roles.yaml`  
+User hints: `.orca/orchestration/project_hints.yaml` (yours — installer never overwrites)  
 Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 
 | Role | Model | CLI | Own |

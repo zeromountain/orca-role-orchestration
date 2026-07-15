@@ -1,12 +1,10 @@
 # Orca multi-model role orchestration
-# Source: GPT-5.6 Sol / Opus 4.8 / Grok 4.5 role strengths + Antigravity fallback
-# SSOT for coordinator routing. Project-specific hints live under project_hints.
-# Personas live in personas/<role>.md (single source of truth). bootstrap injects
-# the full persona into each worker terminal; dispatch injects the file's
-# <!-- STANCE: ... --> line as a per-task reminder.
+# MANAGED FILE — overwritten on every install re-run.
+# User customization: edit project_hints.yaml (never roles.yaml).
+# Personas live in personas/<role>.md (bootstrap seeds; dispatch uses STANCE).
+# agent/model fields document defaults; launch lives in orca-bootstrap-roles.sh.
 
 version: 1
-project: "{{PROJECT_NAME}}"
 worktree: active
 
 roles:
@@ -34,8 +32,6 @@ roles:
     agent: claude
     model: claude-opus-4-8
     effort: high
-    launch_command: >-
-      claude --model claude-opus-4-8 --dangerously-skip-permissions
     persona_file: personas/architect.md
     persona_summary: >-
       The Strategist — plan, judge, and review high-stakes work with evidence;
@@ -64,8 +60,6 @@ roles:
     agent: codex
     model: gpt-5.6-sol
     effort: high
-    launch_command: >-
-      codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox
     persona_file: personas/executor.md
     persona_summary: >-
       The Closer — implement the approved plan end-to-end, verify before
@@ -110,8 +104,6 @@ roles:
     agent: grok
     model: grok-4.5
     effort: default
-    launch_command: >-
-      grok --model grok-4.5 --permission-mode bypassPermissions
     persona_file: personas/thrifty.md
     persona_summary: >-
       The Scout — fast, cheap small/exploratory work; small diffs; cite
@@ -141,8 +133,6 @@ roles:
     cli: agy
     model: "Gemini 3.5 Flash (Medium)"
     effort: medium
-    launch_command: >-
-      agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions
     persona_file: personas/fallback.md
     persona_summary: >-
       The Relief Pitcher — enter only on a primary's limit; smallest viable
@@ -324,32 +314,22 @@ dags:
 
           Done: final path(s) + short prompt used + built-in vs CLI mode.
 
-project_hints:
-  # Customize per project after install (paths, always_architect globs, etc.)
-  always_architect: []
-  prefer_executor: []
-  prefer_thrifty: []
-  notes: |
-    Merge constraints from AGENTS.md / CLAUDE.md into seed personas and specs.
-    Model disagreement → project SSOT docs + current code win.
-    Raster image gen/edit → executor + Codex $imagegen only (clarity gate first).
-    SVG/vector/code-native icons stay on thrifty/executor code paths, not $imagegen.
-
 limit_failover:
   enabled: true
   target_role: fallback
   agent: antigravity
   model: "Gemini 3.5 Flash (Medium)"
-  launch_command: >-
-    agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions
   detect_patterns:
+    # Mirrors scripts/orca-fallback-on-limit.sh LIMIT_RE (doc only; script is authoritative)
     - "session limit"
     - "rate limit"
     - "usage limit"
     - "overloaded"
-    - "quota"
+    - "quota exceeded"
     - "try again later"
     - "429"
+    - "hit your limit"
+    - "capacity"
   policy: |
     1. Do not hammer the limited primary
     2. Create NEW task ROLE=fallback with goal + partial progress

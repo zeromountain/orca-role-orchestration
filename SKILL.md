@@ -52,13 +52,17 @@ If the project is not in Orca: `orca repo add --path <abs-project-root>`.
 orca-role-orchestration/
   SKILL.md
   scripts/
-    install-to-project.sh      # scaffold into any repo
+    install-to-project.sh      # project scaffold install/update (idempotent)
+    install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
     orca-bootstrap-roles.sh
     orca-dispatch-role.sh
     orca-fallback-on-limit.sh
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
+    roles.yaml                 # managed routing (always refreshed)
+    project_hints.yaml         # user-owned (create once)
     personas/                  # architect|executor|thrifty|fallback|coordinator .md
+  tests/install.sh
   references/model-roles.md
 ```
 
@@ -72,42 +76,35 @@ in trusted repositories, or remove the bypass flags before bootstrapping.
 
 ## Modes
 
-### A) Install or update scaffold in current project
+### A) Install or update (one free re-run command)
 
-The installer **auto-detects** state — always run the same command; it does the right thing:
+**Global skill** (clone-or-pull + symlinks into existing agent skill dirs):
+
+```bash
+./scripts/install-skill.sh
+# or: curl -fsSL …/install-skill.sh | bash
+```
+
+**Project scaffold** — same command for first install and every update:
 
 ```bash
 SKILL=~/.agents/skills/orca-role-orchestration
 "$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)"
 # optional: --project-name my-app
+# recovery: --reset   # overwrite forked personas too (always .bak)
 ```
 
-Detection (based on `.orca/orchestration/roles.yaml`):
+| Path | Policy |
+|------|--------|
+| `roles.yaml` | **Managed** — always refreshed to skill template |
+| `project_hints.yaml` | **Yours** — created once, never overwritten |
+| `personas/*.md` | Refresh if unmodified; skip if locally forked |
+| scripts, PLAYBOOK, SCRIPTS | Managed refresh (`.bak` on content change) |
+| `install-manifest.json` | Version stamp (`git describe`) + file hashes |
 
-- **absent** → **fresh install** (first time / new repo).
-- **present** → **update in place** to the current skill version: adds `personas/`, refreshes
-  scripts/docs (changed files → `<file>.bak`), relocates any legacy `<project>/scripts/orca-*.sh`,
-  and **preserves your `roles.yaml`** (`project_hints`, launch commands) and `handles.json`.
-  If `roles.yaml` still has legacy inline personas, it prints a hint to re-run with `--migrate-roles`.
+Legacy single-file installs auto-migrate: extract `project` + `project_hints` → `project_hints.yaml`, then refresh managed `roles.yaml`.
 
-Fresh install creates:
-
-- `.orca/orchestration/roles.yaml` (SSOT)
-- `.orca/orchestration/personas/{architect,executor,thrifty,fallback,coordinator}.md`
-- `.orca/orchestration/PLAYBOOK.md`, `SCRIPTS.md`, `handles.example.json`
-- `.orca/orchestration/scripts/orca-{bootstrap-roles,dispatch-role,fallback-on-limit}.sh`
-- gitignores `handles.json`; appends short AGENTS.md section if AGENTS.md exists
-
-Then customize `project_hints` in `roles.yaml` and merge AGENTS.md constraints into routing.
-
-Overrides:
-
-```bash
-"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --migrate-roles  # update + convert legacy inline personas to persona_file refs (roles.yaml.bak saved)
-"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --fresh          # force first-time behavior even if a scaffold exists
-"$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)" --update         # explicit update (same as auto-detected update)
-# --force overwrites everything including roles.yaml (clean re-scaffold)
-```
+Then customize **`project_hints.yaml`** (not `roles.yaml`) and bootstrap workers.
 
 ### B) Bootstrap role workers
 
@@ -121,7 +118,7 @@ Writes `.orca/orchestration/handles.json`. Re-run after closed tabs / invalid ha
 
 Use **supervised** lifecycle only when the user wants coordinate / supervise / wait / DAG / results:
 
-1. Read `.orca/orchestration/roles.yaml` routing_table (and AGENTS.md).
+1. Read `.orca/orchestration/roles.yaml` routing_table **and** `.orca/orchestration/project_hints.yaml` (and AGENTS.md).
 2. Pick primary role (and secondary if dual path).
 3. Dispatch:
 
@@ -215,9 +212,9 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 ## Coordinator checklist
 
 1. `orca status --json` ready
-2. Scaffold present (`roles.yaml` + scripts) or run install
+2. Scaffold present (`roles.yaml` + `project_hints.yaml` + scripts) or re-run install
 3. Handles valid or bootstrap
-4. Route by roles.yaml (image intent → clarity gate → executor/`$imagegen`)
+4. Route by roles.yaml + project_hints.yaml (image intent → clarity gate → executor/`$imagegen`)
 5. Dispatch --inject → check --wait
 6. Limit → fallback script
 7. Synthesize worker_done bodies; re-dispatch fixes if needed

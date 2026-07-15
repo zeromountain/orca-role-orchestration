@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Install Orca role-orchestration scaffold into a project root.
-# Usage:
-#   install-to-project.sh [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles] [--fresh]
+# Install or update Orca role-orchestration scaffold into a project root.
 #
-# With no mode flag, the installer AUTO-DETECTS: an existing .orca/orchestration/roles.yaml
-# switches it to update mode (refresh to the current skill version, preserving roles.yaml);
-# otherwise it does a fresh install. Use --fresh to force first-time behavior.
+# One primary command (idempotent — re-run freely):
+#   install-to-project.sh [--project-root PATH] [--project-name NAME]
+#
+# Recovery:
+#   --reset   overwrite managed files AND forked personas (always .bak first)
+#
+# Managed (always refreshed): roles.yaml, PLAYBOOK, SCRIPTS, scripts, handles.example
+# User-owned (create once):   project_hints.yaml
+# Personas:                   refresh only if unmodified since last install (hash match)
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,24 +17,27 @@ TPL="$SKILL_DIR/templates"
 SCRIPTS_SRC="$SKILL_DIR/scripts"
 ROOT=""
 PROJECT_NAME=""
-FORCE=0
-UPDATE=0
-MIGRATE=0
-BACKUP=0
-FRESH=0
+RESET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-root) ROOT="${2:?}"; shift 2 ;;
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
-    --force) FORCE=1; shift ;;
-    --update) UPDATE=1; shift ;;
-    --migrate-roles) MIGRATE=1; UPDATE=1; shift ;;
-    --fresh) FRESH=1; shift ;;
+    --reset) RESET=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--project-root PATH] [--project-name NAME] [--force] [--update] [--migrate-roles] [--fresh]"
-      echo "  (no mode flag) auto-detects: existing roles.yaml → update; otherwise fresh install"
+      cat <<'EOF'
+Usage: install-to-project.sh [--project-root PATH] [--project-name NAME] [--reset]
+
+  (default)  Install or update. Safe to re-run.
+             Managed files refresh; project_hints.yaml and forked personas preserved.
+  --reset    Overwrite managed files and forked personas (each gets .bak).
+EOF
       exit 0
+      ;;
+    --force|--update|--fresh|--migrate-roles)
+      echo "Removed flag: $1" >&2
+      echo "Use flagless install for install/update, or --reset for recovery." >&2
+      exit 1
       ;;
     *)
       echo "Unknown: $1" >&2
@@ -62,39 +69,30 @@ fi
 
 ORCH="$ROOT/.orca/orchestration"
 SCRIPTS_DST="$ORCH/scripts"
+MANIFEST="$ORCH/install-manifest.json"
 
-echo "Installing orca-role-orchestration → $ROOT (project=$PROJECT_NAME)"
-
-mkdir -p "$ORCH" "$SCRIPTS_DST"
-
-# Auto-detect existing install: if roles.yaml is already present and no explicit mode
-# was requested, switch to update (refresh to the current skill version, preserving the
-# user's roles.yaml). --fresh forces a clean first-time install; --force/--update are explicit.
-if [[ "$UPDATE" -eq 0 && "$FORCE" -eq 0 && "$FRESH" -eq 0 && -f "$ORCH/roles.yaml" ]]; then
-  UPDATE=1
-  echo "Detected existing install at $ORCH → updating to the current skill version (roles.yaml preserved). Use --fresh for a clean install."
-fi
-
-if [[ "$UPDATE" -eq 1 ]]; then
-  if [[ ! -f "$ORCH/roles.yaml" ]]; then
-    echo "No existing install at $ORCH (roles.yaml missing)." >&2
-    echo "Run without --update for a fresh install." >&2
-    exit 1
+skill_version() {
+  if git -C "$SKILL_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$SKILL_DIR" describe --tags --always --dirty 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
   fi
-  FORCE=1
-  BACKUP=1
-  echo "Update mode: refreshing managed files (roles.yaml handled separately)."
-fi
+}
 
-# Legacy layout hint: an existing roles.yaml with inline persona blocks predates the
-# persona-file system; suggest (do not force) the opt-in migration of the user's SSOT.
-if [[ "$UPDATE" -eq 1 && "$MIGRATE" -eq 0 ]] && grep -q '^    persona: |' "$ORCH/roles.yaml" 2>/dev/null; then
-  echo "  note: roles.yaml has legacy inline personas — re-run with --migrate-roles to convert them to persona_file refs (roles.yaml.bak saved)."
-fi
+VERSION="$(skill_version)"
+echo "orca-role-orchestration ${VERSION} → ${ROOT} (project=${PROJECT_NAME})"
 
-install_file() {
+mkdir -p "$ORCH" "$SCRIPTS_DST" "$ORCH/personas"
+
+# report lists (bash 3.2 compatible — no mapfile)
+REPORT_REFRESHED=()
+REPORT_PRESERVED=()
+REPORT_INSTALLED=()
+REPORT_MIGRATED=()
+REPORT_UNCHANGED=()
+
+render_to_tmp() {
   local src="$1"
-  local dst="$2"
   local tmp
   tmp="$(mktemp)"
   if [[ "$src" == *.yaml ]] || [[ "$src" == *.md ]]; then
@@ -109,213 +107,235 @@ PY
   else
     cp "$src" "$tmp"
   fi
-  if [[ -f "$dst" ]]; then
-    if cmp -s "$tmp" "$dst"; then
-      rm -f "$tmp"; echo "  unchanged: $dst"; return
-    fi
-    if [[ "$FORCE" -ne 1 ]]; then
-      rm -f "$tmp"; echo "  skip existing: $dst (use --force or --update)"; return
-    fi
-    if [[ "$BACKUP" -eq 1 ]]; then
-      cp "$dst" "$dst.bak"; echo "  backed up: $dst.bak"
-    fi
-  fi
-  mv "$tmp" "$dst"
-  echo "  wrote $dst"
+  printf '%s' "$tmp"
 }
 
-migrate_roles() {
-  local target="$1"
-  python3 - "$target" <<'PY'
-import sys, re, shutil, pathlib
-
-target = sys.argv[1]
-lines = pathlib.Path(target).read_text().splitlines()
-
-REPL = {
-  "coordinator": [
-    "    persona_file: personas/coordinator.md",
-    "    persona_summary: >-",
-    "      The Conductor — decompose into a DAG, route by model strength, dispatch,",
-    "      synthesize; never bulk-implement.",
-  ],
-  "architect": [
-    "    persona_file: personas/architect.md",
-    "    persona_summary: >-",
-    "      The Strategist — plan, judge, and review high-stakes work with evidence;",
-    "      delegate bulk implementation; push back on weak plans.",
-  ],
-  "executor": [
-    "    persona_file: personas/executor.md",
-    "    persona_summary: >-",
-    "      The Closer — implement the approved plan end-to-end, verify before",
-    "      claiming done, integrate; escalate ambiguity to architect.",
-  ],
-  "thrifty": [
-    "    persona_file: personas/thrifty.md",
-    "    persona_summary: >-",
-    "      The Scout — fast, cheap small/exploratory work; small diffs; cite",
-    "      sources; escalate design risk early.",
-  ],
-  "fallback": [
-    "    persona_file: personas/fallback.md",
-    "    persona_summary: >-",
-    "      The Relief Pitcher — enter only on a primary's limit; smallest viable",
-    "      progress; stabilize and hand back; never re-architect.",
-  ],
-}
-
-ROLES_HEADER = re.compile(r'^roles:\s*$')
-
-def role_of(line):
-    m = re.match(r'^  (\w+):\s*$', line)
-    return m.group(1) if m else None
-
-def is_toplevel_key(line):
-    # A non-comment, non-blank line starting at column 0 with a word character
-    return bool(re.match(r'^[A-Za-z_]', line))
-
-has_pf = set()
-cur = None
-in_roles = False
-for line in lines:
-    if ROLES_HEADER.match(line):
-        in_roles = True
-        cur = None
-        continue
-    if is_toplevel_key(line) and not ROLES_HEADER.match(line):
-        in_roles = False
-        cur = None
-        continue
-    if not in_roles:
-        continue
-    r = role_of(line)
-    if r:
-        cur = r
-        continue
-    if cur and re.match(r'^    persona_file:', line):
-        has_pf.add(cur)
-
-header_present = any('Personas live in personas' in l for l in lines)
-out = []
-cur = None
-in_roles = False
-i = 0
-n = len(lines)
-migrated = []
-header_done = header_present
-while i < n:
-    line = lines[i]
-    if not header_done and line.startswith('# SSOT for coordinator routing'):
-        out.append(line)
-        out.append('# Personas live in personas/<role>.md (single source of truth). bootstrap injects')
-        out.append("# the full persona into each worker terminal; dispatch injects the file's")
-        out.append('# <!-- STANCE: ... --> line as a per-task reminder.')
-        header_done = True
-        i += 1
-        continue
-    if ROLES_HEADER.match(line):
-        in_roles = True
-        cur = None
-        out.append(line)
-        i += 1
-        continue
-    if is_toplevel_key(line) and not ROLES_HEADER.match(line):
-        in_roles = False
-        cur = None
-        out.append(line)
-        i += 1
-        continue
-    r = role_of(line) if in_roles else None
-    if r:
-        cur = r
-        out.append(line)
-        i += 1
-        continue
-    if in_roles and cur and re.match(r'^    persona:\s*\|', line):
-        if cur in REPL and cur not in has_pf:
-            out.extend(REPL[cur])
-            migrated.append(cur)
-            i += 1
-            while i < n and re.match(r'^      ', lines[i]):
-                i += 1
-        else:
-            out.append(line)
-            i += 1
-            while i < n and re.match(r'^      ', lines[i]):
-                out.append(lines[i])
-                i += 1
-        continue
-    if in_roles and cur == 'coordinator' and re.match(r'^    model:', line) \
-            and 'coordinator' not in has_pf and 'coordinator' not in migrated:
-        out.append(line)
-        out.extend(REPL['coordinator'])
-        migrated.append('coordinator')
-        i += 1
-        continue
-    out.append(line)
-    i += 1
-
-changed = bool(migrated) or (header_done and not header_present)
-if changed:
-    shutil.copyfile(target, target + '.bak')
-    pathlib.Path(target).write_text("\n".join(out) + "\n")
-    print("  migrated roles:", ", ".join(migrated) if migrated else "(header only)")
-else:
-    print("  roles.yaml already migrated (no change)")
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 }
 
-if [[ "$UPDATE" -eq 1 ]]; then
-  if [[ "$MIGRATE" -eq 1 ]]; then
-    migrate_roles "$ORCH/roles.yaml"
-  else
-    echo "  preserved $ORCH/roles.yaml (customizations kept; --migrate-roles to convert legacy personas)"
+# Write managed file: bak on content change, skip if identical
+write_managed() {
+  local src="$1"
+  local dst="$2"
+  local label="${3:-$dst}"
+  local tmp
+  tmp="$(render_to_tmp "$src")"
+  if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp"
+    REPORT_UNCHANGED+=("$label")
+    return 0
   fi
-else
-  install_file "$TPL/roles.yaml" "$ORCH/roles.yaml"
-fi
-install_file "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md"
-install_file "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md"
-install_file "$TPL/handles.example.json" "$ORCH/handles.example.json"
+  if [[ -f "$dst" ]]; then
+    cp "$dst" "${dst}.bak"
+  fi
+  mv "$tmp" "$dst"
+  if [[ "$dst" == *.sh ]]; then
+    chmod +x "$dst"
+  fi
+  if [[ -f "${dst}.bak" ]]; then
+    REPORT_REFRESHED+=("$label")
+  else
+    REPORT_INSTALLED+=("$label")
+  fi
+}
 
-mkdir -p "$ORCH/personas"
+# --- one-time migration: pre-split roles.yaml → project_hints.yaml ---
+if [[ -f "$ORCH/roles.yaml" && ! -f "$ORCH/project_hints.yaml" ]]; then
+  python3 - "$ORCH/roles.yaml" "$ORCH/project_hints.yaml" "$TPL/project_hints.yaml" "$PROJECT_NAME" <<'PY'
+import pathlib
+import re
+import shutil
+import sys
+
+roles_path, hints_dst, hints_tpl, project_name = sys.argv[1:5]
+roles = pathlib.Path(roles_path)
+shutil.copyfile(roles_path, roles_path + ".bak")
+lines = roles.read_text().splitlines()
+
+project_line = None
+hints_block = []
+i = 0
+n = len(lines)
+while i < n:
+    line = lines[i]
+    if re.match(r"^project:\s*", line):
+        project_line = line
+        i += 1
+        continue
+    if re.match(r"^project_hints:\s*$", line):
+        hints_block.append(line)
+        i += 1
+        while i < n and not re.match(r"^[A-Za-z_]", lines[i]):
+            hints_block.append(lines[i])
+            i += 1
+        continue
+    i += 1
+
+if project_line is None and not hints_block:
+    # No user keys to extract — fall through to template write later
+    sys.exit(0)
+
+tpl = pathlib.Path(hints_tpl).read_text().replace("{{PROJECT_NAME}}", project_name)
+# Prefer extracted blocks when present
+if project_line is None:
+    project_line = f'project: "{project_name}"'
+if not hints_block:
+    # keep template project_hints section
+    pathlib.Path(hints_dst).write_text(tpl)
+else:
+    # header from template + extracted project + extracted hints
+    header = []
+    for line in tpl.splitlines():
+        if line.startswith("project:") or line.startswith("project_hints:"):
+            break
+        header.append(line)
+    body = "\n".join(header + ["", project_line, ""] + hints_block) + "\n"
+    pathlib.Path(hints_dst).write_text(body)
+print("migrated")
+PY
+  if [[ -f "$ORCH/project_hints.yaml" ]]; then
+    REPORT_MIGRATED+=("project_hints → project_hints.yaml (old SSOT: roles.yaml.bak)")
+  fi
+fi
+
+# --- user file: create once, never touch again ---
+if [[ ! -f "$ORCH/project_hints.yaml" ]]; then
+  write_managed "$TPL/project_hints.yaml" "$ORCH/project_hints.yaml" "project_hints.yaml"
+  # write_managed may mark installed; that's correct for first create
+else
+  REPORT_PRESERVED+=("project_hints.yaml")
+fi
+
+# --- personas: fork-preserve via manifest hashes ---
+OLD_MANIFEST_JSON="{}"
+if [[ -f "$MANIFEST" ]]; then
+  OLD_MANIFEST_JSON="$(cat "$MANIFEST")"
+fi
+
 for p in "$TPL"/personas/*.md; do
-  install_file "$p" "$ORCH/personas/$(basename "$p")"
+  base="$(basename "$p")"
+  dst="$ORCH/personas/$base"
+  label="personas/$base"
+  rendered="$(render_to_tmp "$p")"
+  if [[ ! -f "$dst" ]]; then
+    mv "$rendered" "$dst"
+    REPORT_INSTALLED+=("$label")
+    continue
+  fi
+  prev_hash="$(python3 -c 'import json,sys; m=json.loads(sys.argv[1]); print(m.get("files",{}).get(sys.argv[2],""))' "$OLD_MANIFEST_JSON" "$label" 2>/dev/null || true)"
+  cur_hash="$(sha256_file "$dst")"
+  if [[ "$RESET" -eq 1 ]]; then
+    if ! cmp -s "$rendered" "$dst"; then
+      cp "$dst" "${dst}.bak"
+      mv "$rendered" "$dst"
+      REPORT_REFRESHED+=("$label (reset)")
+    else
+      rm -f "$rendered"
+      REPORT_UNCHANGED+=("$label")
+    fi
+    continue
+  fi
+  if [[ -z "$prev_hash" ]]; then
+    # pre-manifest install: fail-safe treat as forked
+    rm -f "$rendered"
+    REPORT_PRESERVED+=("$label (forked/no prior hash)")
+    continue
+  fi
+  if [[ "$cur_hash" == "$prev_hash" ]]; then
+    # unmodified since install — safe to refresh to new template
+    if cmp -s "$rendered" "$dst"; then
+      rm -f "$rendered"
+      REPORT_UNCHANGED+=("$label")
+    else
+      mv "$rendered" "$dst"
+      REPORT_REFRESHED+=("$label")
+    fi
+  else
+    rm -f "$rendered"
+    REPORT_PRESERVED+=("$label (locally modified)")
+  fi
 done
+
+# --- managed files: unconditional overwrite (bak on diff) ---
+write_managed "$TPL/roles.yaml" "$ORCH/roles.yaml" "roles.yaml"
+write_managed "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md" "PLAYBOOK.md"
+write_managed "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md" "SCRIPTS.md"
+write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.example.json"
 
 for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
-  install_file "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s"
-  chmod +x "$SCRIPTS_DST/$s"
+  write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
 
-if [[ "$UPDATE" -eq 1 ]]; then
-  OLD_SCRIPTS_DIR="$ROOT/scripts"
-  if [[ "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
-    for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
-      if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
-        cp "$OLD_SCRIPTS_DIR/$s" "$OLD_SCRIPTS_DIR/$s.bak"
-        rm -f "$OLD_SCRIPTS_DIR/$s"
-        echo "  relocated old $OLD_SCRIPTS_DIR/$s → $SCRIPTS_DST/ (backup: $s.bak)"
+# Relocate legacy project/scripts/orca-*.sh if present.
+# Never touch the skill package's own scripts/ when installing into the skill repo itself.
+OLD_SCRIPTS_DIR="$ROOT/scripts"
+if [[ "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
+  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh; do
+    if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
+      # Skip if this is the skill source file (same path as SCRIPTS_SRC)
+      if [[ "$OLD_SCRIPTS_DIR/$s" -ef "$SCRIPTS_SRC/$s" ]]; then
+        continue
       fi
-    done
-    rmdir "$OLD_SCRIPTS_DIR" 2>/dev/null && echo "  removed empty $OLD_SCRIPTS_DIR" || true
-  fi
+      cp "$OLD_SCRIPTS_DIR/$s" "$OLD_SCRIPTS_DIR/$s.bak"
+      rm -f "$OLD_SCRIPTS_DIR/$s"
+      REPORT_REFRESHED+=("relocated legacy scripts/$s")
+    fi
+  done
+  rmdir "$OLD_SCRIPTS_DIR" 2>/dev/null || true
 fi
+
+# --- write install-manifest.json ---
+python3 - "$MANIFEST" "$VERSION" "$ORCH" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+manifest_path, version, orch = sys.argv[1:4]
+orch_p = pathlib.Path(orch)
+files = {}
+candidates = [
+    "roles.yaml",
+    "project_hints.yaml",
+    "PLAYBOOK.md",
+    "SCRIPTS.md",
+    "handles.example.json",
+]
+for rel in candidates:
+    p = orch_p / rel
+    if p.is_file():
+        files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+for p in sorted((orch_p / "personas").glob("*.md")):
+    files[f"personas/{p.name}"] = hashlib.sha256(p.read_bytes()).hexdigest()
+for p in sorted((orch_p / "scripts").glob("orca-*.sh")):
+    files[f"scripts/{p.name}"] = hashlib.sha256(p.read_bytes()).hexdigest()
+
+data = {
+    "skill_version": version,
+    "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "files": files,
+}
+pathlib.Path(manifest_path).write_text(json.dumps(data, indent=2) + "\n")
+PY
 
 # gitignore handles.json
 GI="$ROOT/.gitignore"
 if [[ -f "$GI" ]]; then
   if ! grep -qF '.orca/orchestration/handles.json' "$GI" 2>/dev/null; then
     printf '\n# Orca local terminal handles\n.orca/orchestration/handles.json\n' >> "$GI"
-    echo "  updated .gitignore"
+    REPORT_REFRESHED+=(".gitignore")
   fi
 else
   printf '# Orca local terminal handles\n.orca/orchestration/handles.json\n' > "$GI"
-  echo "  created .gitignore"
+  REPORT_INSTALLED+=(".gitignore")
 fi
 
-# Optional AGENTS.md snippet if AGENTS.md exists and lacks section
+# Optional AGENTS.md snippet
 AGENTS="$ROOT/AGENTS.md"
 MARKER="## Orca Role Orchestration"
 if [[ -f "$AGENTS" ]] && ! grep -qF "$MARKER" "$AGENTS" 2>/dev/null; then
@@ -330,17 +350,35 @@ $MARKER
 | thrifty | Grok 4.5 | \`grok\` |
 | fallback | Gemini 3.5 Flash (Medium) | \`agy\` |
 
-- SSOT: \`.orca/orchestration/roles.yaml\`
+- Managed routing: \`.orca/orchestration/roles.yaml\`
+- Project hints (yours): \`.orca/orchestration/project_hints.yaml\`
 - Playbook: \`.orca/orchestration/PLAYBOOK.md\`
 - Bootstrap: \`.orca/orchestration/scripts/orca-bootstrap-roles.sh\`
 - Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
 - Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
 EOF
-  echo "  appended Orca section to AGENTS.md"
+  REPORT_REFRESHED+=("AGENTS.md (section appended)")
 fi
+
+# --- report ---
+print_list() {
+  local title="$1"
+  shift
+  if [[ $# -gt 0 ]]; then
+    local joined
+    joined=$(printf '%s, ' "$@" | sed 's/, $//')
+    echo "  ${title}: ${joined}"
+  fi
+}
+
+print_list "installed" "${REPORT_INSTALLED[@]+"${REPORT_INSTALLED[@]}"}"
+print_list "refreshed" "${REPORT_REFRESHED[@]+"${REPORT_REFRESHED[@]}"}"
+print_list "preserved" "${REPORT_PRESERVED[@]+"${REPORT_PRESERVED[@]}"}"
+print_list "migrated" "${REPORT_MIGRATED[@]+"${REPORT_MIGRATED[@]}"}"
 
 echo "Done."
 echo "Next:"
-echo "  1) Customize .orca/orchestration/roles.yaml project_hints if needed"
+echo "  1) Customize .orca/orchestration/project_hints.yaml if needed"
 echo "  2) orca repo add --path $ROOT   # if not already in Orca"
 echo "  3) .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$ROOT"
+echo "Re-run this installer anytime to pull managed updates (roles.yaml, scripts, docs)."

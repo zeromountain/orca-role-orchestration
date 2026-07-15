@@ -9,7 +9,7 @@ An installable Agent Skill and project scaffold for routing Orca Agent IDE work 
 | `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
 | `fallback` | Gemini 3.5 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
-The defaults are intentionally opinionated. Model IDs and CLI flags can change; edit the launch commands in `templates/roles.yaml` and the bootstrap script to match your installed providers.
+The defaults are intentionally opinionated. Launch commands live in `scripts/orca-bootstrap-roles.sh` (not `roles.yaml`). Edit that script if you need different model IDs or CLI flags.
 
 ## Prerequisites
 
@@ -24,37 +24,45 @@ orca status --json
 which orca claude codex grok agy
 ```
 
-## Install as a global Agent Skill
+## Install or update the global skill
+
+Same command installs and updates (clone-or-pull + optional multi-agent symlinks):
 
 ```bash
-mkdir -p ~/.agents/skills
-git clone https://github.com/zeromountain/orca-role-orchestration.git \
-  ~/.agents/skills/orca-role-orchestration
+# from a checkout, or curl raw from GitHub
+curl -fsSL https://raw.githubusercontent.com/zeromountain/orca-role-orchestration/main/scripts/install-skill.sh | bash
+# or:
+./scripts/install-skill.sh
 ```
 
-Restart or reload your agent so it discovers `SKILL.md`. You can then ask it to use `orca-role-orchestration` or run the scaffold installer directly.
+Canonical path: `~/.agents/skills/orca-role-orchestration`. If `~/.claude/skills`, `~/.codex/skills`, or `~/.grok/skills` exist, they get a symlink to that checkout.
 
-## Add the scaffold to a project
+Restart or reload your agent so it discovers `SKILL.md`.
 
-From the target project — the same command handles both first-time setup and upgrades. The installer
-**auto-detects**: if `.orca/orchestration/roles.yaml` is absent it does a fresh install; if it is present
-it updates in place to the current skill version, preserving your `roles.yaml` (see
-[Update an existing install](#update-an-existing-install)).
+## Install or update the project scaffold
+
+**One flagless command** — safe to re-run anytime:
 
 ```bash
 ~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
   --project-root "$(pwd)"
 ```
 
-A fresh install adds:
+| Layer | Path | On re-run |
+|-------|------|-----------|
+| Managed routing | `.orca/orchestration/roles.yaml` | Always refreshed (`.bak` if changed) |
+| Your hints | `.orca/orchestration/project_hints.yaml` | Created once; **never** overwritten |
+| Personas | `.orca/orchestration/personas/*.md` | Refresh if unmodified; skip if forked |
+| Scripts / docs | `scripts/`, `PLAYBOOK.md`, … | Always refreshed |
+| Version stamp | `install-manifest.json` | Written every run |
 
-- `.orca/orchestration/roles.yaml` as the routing source of truth
-- `.orca/orchestration/personas/<role>.md` — per-role personas seeded into workers
-- `.orca/orchestration/PLAYBOOK.md` and script documentation
-- bootstrap, dispatch, and rate-limit fallback scripts under `.orca/orchestration/scripts/`
-- a gitignore entry for local Orca terminal handles
+Recovery (overwrite forked personas too):
 
-Then customize `.orca/orchestration/roles.yaml` and bootstrap the workers:
+```bash
+…/install-to-project.sh --project-root "$(pwd)" --reset
+```
+
+Then bootstrap workers:
 
 ```bash
 orca repo add --path "$(pwd)" # only if the project is not already in Orca
@@ -62,30 +70,6 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 ```
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
-
-## Update an existing install
-
-If a project was scaffolded before the current version, just re-run the installer — it detects the
-existing `.orca/orchestration/roles.yaml` and updates in place (you can also pass `--update` explicitly):
-
-```bash
-~/.agents/skills/orca-role-orchestration/scripts/install-to-project.sh \
-  --project-root "$(pwd)"          # auto-detected update; or add --update to be explicit
-```
-
-The update adds `.orca/orchestration/personas/`, refreshes the bootstrap/dispatch/fallback scripts and
-playbook docs (backing up any changed file to `<file>.bak`), relocates any legacy
-`<project>/scripts/orca-*.sh` into `.orca/orchestration/scripts/` (your own project scripts are left
-untouched), and **preserves your `roles.yaml`** (`project_hints`, launch commands) and `handles.json`.
-If you customized launch commands inside the scripts, re-apply them from the `.bak` copies.
-
-If your `roles.yaml` still has legacy inline `persona:` blocks the installer prints a hint; re-run with
-`--migrate-roles` to rewrite them to `persona_file:` references (original saved as `roles.yaml.bak`). This
-is optional — the scripts read the persona files directly, so persona injection works with or without the
-migration.
-
-Force a clean first-time install even when a scaffold already exists with `--fresh`; `--force` overwrites
-everything including `roles.yaml`.
 
 ## Security
 

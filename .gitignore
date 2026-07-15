@@ -1,5 +1,7 @@
 .DS_Store
-.orca/orchestration/handles.json
+
+# Local Orca runtime scaffold (installed into consumer projects)
+.orca/
 
 # Superpowers SDD working scratch (ledger, briefs, review packages)
 .superpowers/
