@@ -5,3 +5,6 @@
 
 # Superpowers SDD working scratch (ledger, briefs, review packages)
 .superpowers/
+
+# Orca local terminal handles
+.orca/orchestration/handles.json

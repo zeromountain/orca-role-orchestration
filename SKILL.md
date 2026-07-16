@@ -62,7 +62,9 @@ orca-role-orchestration/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
     orca-bootstrap-roles.sh
-    orca-dispatch-role.sh
+    orca-dispatch-role.sh      # recreates dead/missing role tabs
+    orca-close-role.sh         # close role tab after worker_done
+    orca-roles-lib.sh          # shared role meta / create / seed
     orca-fallback-on-limit.sh
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
@@ -151,7 +153,7 @@ Then customize **`project_hints.yaml`** (not `roles.yaml`) and bootstrap workers
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
 ```
 
-Writes `.orca/orchestration/handles.json`. Re-run after closed tabs / invalid handles. Duplicate tabs possible if old `role-*` tabs still open — close them first when clean slate is needed.
+Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral**: after `worker_done` the coordinator closes them; the next dispatch recreates a dead/missing handle automatically. For a clean slate, close leftover `role-*` tabs before re-bootstrap.
 
 ### C) Route + supervised dispatch
 
@@ -159,7 +161,7 @@ Use **supervised** lifecycle only when the user wants coordinate / supervise / w
 
 1. Read `.orca/orchestration/roles.yaml` routing_table **and** `.orca/orchestration/project_hints.yaml` (and AGENTS.md).
 2. Pick primary role (and secondary if dual path).
-3. Dispatch:
+3. Dispatch (auto-recreates dead/missing role tabs):
 
 ```bash
 .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan only: <goal>. Follow AGENTS.md."
@@ -191,7 +193,13 @@ orca orchestration check --wait \
   --timeout-ms 900000 --json
 ```
 
-5. On rate/session limit:
+5. On each `worker_done`, **close that role's tab** (ephemeral workers):
+
+```bash
+.orca/orchestration/scripts/orca-close-role.sh <role>
+```
+
+6. On rate/session limit:
 
 ```bash
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role|term_*> --spec "Continue: <goal + partial>"
@@ -252,11 +260,12 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 
 1. `orca status --json` ready
 2. Scaffold present (`roles.yaml` + `project_hints.yaml` + scripts) or re-run install
-3. Handles valid or bootstrap
+3. Handles valid or bootstrap (dispatch also recreates dead tabs)
 4. Route by roles.yaml + project_hints.yaml (image intent → clarity gate → executor/`$imagegen`)
 5. Dispatch --inject → check --wait
 6. Limit → fallback script
 7. Synthesize worker_done bodies; re-dispatch fixes if needed
+8. On each `worker_done`, close that role's tab: `orca-close-role.sh <role>` (tabs are ephemeral; next dispatch recreates)
 
 ## Do not
 
@@ -265,6 +274,17 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 - Retry a limited primary until its window resets
 - Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
 - Generate images without a clear brief (ask first) or with non-Codex image tools when `$imagegen` is the path
+- Tell a worker to self-exit the shell (generic Orca preamble forbids it; use coordinator `orca-close-role.sh` instead)
+
+## Exit-on-done (ephemeral role tabs)
+
+Supervised workers must not linger forever after a task. Termination is **coordinator-driven**:
+
+1. Worker sends `worker_done`, then stays silent (persona + seed contract).
+2. Coordinator runs `orca-close-role.sh <role>` (kills PTY).
+3. Next dispatch for that role recreates a live terminal if the handle is dead/missing.
+
+Do not instruct workers to "exit the shell" — that fights Orca's injected preamble. Silence + coordinator close is the correct contract.
 
 ## Related
 

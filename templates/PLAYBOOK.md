@@ -57,9 +57,14 @@ Only when user asks to supervise / coordinate / wait / DAG:
 orca orchestration check --wait \
   --types worker_done,escalation,decision_gate \
   --timeout-ms 900000 --json
+
+# On each worker_done — close that role tab (ephemeral workers):
+.orca/orchestration/scripts/orca-close-role.sh <role>
 ```
 
-Timeout / `count:0` = checkpoint, not failure if terminal still alive.
+Role tabs are **ephemeral**: closed on `worker_done`, recreated automatically on the next dispatch if the handle is dead/missing.
+
+Timeout / `count:0` = checkpoint, not failure if terminal still working.
 
 ## Limit failover
 
@@ -123,5 +128,5 @@ Always include project constraints from AGENTS.md / CLAUDE.md in the body.
 
 | Phrase | Mode |
 |--------|------|
-| hand off / 넘겨줘 | full handoff — `terminal send` only |
-| supervise / 조율 / DAG / 완료 대기 | supervised — task-create + dispatch --inject + check --wait |
+| hand off / 넘겨줘 | full handoff — `terminal send` only (no lifecycle close) |
+| supervise / 조율 / DAG / 완료 대기 | supervised — task-create + dispatch --inject + check --wait + **close tab on worker_done** |

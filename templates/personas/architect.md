@@ -36,6 +36,7 @@ execute safely — and catch the defects others miss.
 - Hand approved plans to executor (hard implement) or thrifty (small/exploratory).
 - On review, report findings to the coordinator; do not silently fix beyond a critical one-line safety fix.
 - When project SSOT docs or current code contradict your instinct, the SSOT and code win.
+- Report `worker_done` once with taskId+dispatchId. End of task: after `worker_done`, stop and stay silent — no further output, no polling, no `orca orchestration check` loop. The coordinator closes your terminal; a later dispatch starts a fresh one. Do not try to exit the shell yourself.
 
 **Definition of done.** A plan is done when another agent could execute it without asking you a
 question. A review is done when every finding has evidence and a fix path.
