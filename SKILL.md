@@ -63,8 +63,9 @@ orca-role-orchestration/
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
     orca-bootstrap-roles.sh
     orca-dispatch-role.sh      # recreates dead/missing role tabs
-    orca-close-role.sh         # manual close role tab after worker_done
-    orca-wait-done.sh          # preferred wait: check --wait + auto-close tab
+    orca-close-role.sh         # manual emergency close
+    orca-reap-task.sh          # background auto-close on dispatch complete
+    orca-wait-done.sh          # optional blocking wait
     orca-roles-lib.sh          # shared role meta / create / seed
     orca-fallback-on-limit.sh
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
@@ -154,7 +155,7 @@ Then customize **`project_hints.yaml`** (not `roles.yaml`) and bootstrap workers
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
 ```
 
-Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral**: after `worker_done` the coordinator closes them; the next dispatch recreates a dead/missing handle automatically. For a clean slate, close leftover `role-*` tabs before re-bootstrap.
+Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral and auto-closed**: each `orca-dispatch-role.sh` starts a background reaper and injects AUTO-CLOSE into the worker. Next dispatch recreates a dead handle.
 
 ### C) Route + supervised dispatch
 
@@ -186,16 +187,15 @@ Done: final path(s) + mode (built-in|CLI)
 "
 ```
 
-4. Wait **and auto-close** completed worker (do not use bare `check --wait` alone):
+4. Wait for results if needed (close is already automatic — no extra close step):
 
 ```bash
-.orca/orchestration/scripts/orca-wait-done.sh --role <role> --timeout-ms 900000
-# or one-shot:
-.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…" --wait
+orca orchestration check --wait \
+  --types worker_done,escalation,decision_gate \
+  --timeout-ms 900000 --json
 ```
 
-`orca-wait-done.sh` runs `check --wait` then on `worker_done` closes the worker with
-`orca terminal close --tab`. Timeout / `count:0` = checkpoint, not failure.
+Timeout / `count:0` = checkpoint, not failure. Tab close does not depend on this wait.
 
 5. On rate/session limit:
 
@@ -260,7 +260,7 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 2. Scaffold present (`roles.yaml` + `project_hints.yaml` + scripts) or re-run install
 3. Handles valid or bootstrap (dispatch also recreates dead tabs)
 4. Route by roles.yaml + project_hints.yaml (image intent → clarity gate → executor/`$imagegen`)
-5. Dispatch --inject → **`orca-wait-done.sh`** (auto-close on worker_done)
+5. Dispatch via `orca-dispatch-role.sh` (auto-reaper + worker AUTO-CLOSE — no manual close)
 6. Limit → fallback script
 7. Synthesize worker_done bodies; re-dispatch fixes if needed
 
@@ -271,18 +271,17 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 - Retry a limited primary until its window resets
 - Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
 - Generate images without a clear brief (ask first) or with non-Codex image tools when `$imagegen` is the path
-- Tell a worker to self-exit the shell (generic Orca preamble forbids it; use `orca-wait-done.sh` / `orca-close-role.sh`)
-- Use bare `orca orchestration check --wait` for role workers without closing — orphaned sub-sessions stay open
+- Pass `--no-reap` unless you intentionally want tabs to linger
 
-## Exit-on-done (ephemeral role tabs)
+## Exit-on-done (automatic)
 
-Supervised workers must not linger after a task. Workers cannot kill their own PTY (Orca preamble: do not exit the shell). Termination is **automatic via wait-done**:
+Supervised workers must not linger after a task. Close is **automatic** on every `orca-dispatch-role.sh`:
 
-1. Worker sends `worker_done`, then stays silent (persona + seed contract).
-2. Coordinator waits with `orca-wait-done.sh` (or `dispatch … --wait`) — closes the worker tab on `worker_done` via `orca terminal close --tab`.
+1. **Background reaper** (`orca-reap-task.sh`) polls `dispatch-show` and runs `orca terminal close --tab` when status is `completed` or `failed`. Does not consume inbox messages.
+2. **Worker AUTO-CLOSE block** is injected into every task spec: after `worker_done`, the worker runs the same close command on its handle.
 3. Next dispatch recreates a live terminal if the handle is dead/missing.
 
-Manual fallback: `orca-close-role.sh <role|term_*>`.
+Opt out only with `--no-reap`. Manual emergency: `orca-close-role.sh <role|term_*>`.
 
 ## Related
 

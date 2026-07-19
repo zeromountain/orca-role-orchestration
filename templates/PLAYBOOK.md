@@ -54,16 +54,12 @@ Only when user asks to supervise / coordinate / wait / DAG:
 .orca/orchestration/scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 
-# Preferred: wait + auto-close completed worker tab
-.orca/orchestration/scripts/orca-wait-done.sh --role thrifty --timeout-ms 900000
-
-# Or one-shot dispatch+wait+close:
-.orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec "…" --wait
+# Optional: block until result (close is already automatic via reaper)
+orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json
+# or: .orca/orchestration/scripts/orca-wait-done.sh --role thrifty
 ```
 
-Role tabs are **ephemeral**: `orca-wait-done.sh` closes the worker tab on `worker_done` (uses `orca terminal close --tab`). Next dispatch recreates a dead/missing handle automatically.
-
-Do **not** use bare `orca orchestration check --wait` for role workers unless you also close — orphaned sub-sessions linger.
+Role tabs are **ephemeral and auto-closed**: every dispatch starts a background reaper (`orca-reap-task.sh`) and injects an AUTO-CLOSE command into the worker. No manual close step. Next dispatch recreates a dead handle automatically.
 
 Timeout / `count:0` = checkpoint, not failure if terminal still working.
 
@@ -130,4 +126,4 @@ Always include project constraints from AGENTS.md / CLAUDE.md in the body.
 | Phrase | Mode |
 |--------|------|
 | hand off / 넘겨줘 | full handoff — `terminal send` only (no lifecycle close) |
-| supervise / 조율 / DAG / 완료 대기 | supervised — task-create + dispatch --inject + check --wait + **close tab on worker_done** |
+| supervise / 조율 / DAG / 완료 대기 | supervised — task-create + dispatch --inject (auto-reaper closes tab) + optional check --wait |

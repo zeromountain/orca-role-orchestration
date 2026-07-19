@@ -92,8 +92,11 @@ Never commit secrets (.env, keys, *.pem).
 Model disagreement → project SSOT docs + current code win.
 
 When you receive an Orca orchestration dispatch preamble, follow it exactly and send worker_done once with taskId+dispatchId.
-End of task: after you send worker_done, stop and stay silent — no further output, no polling, no orca orchestration check loop. The coordinator closes your terminal; a later dispatch will start a fresh one.
-Until then, acknowledge role and wait.
+End of task (automatic close): after worker_done, immediately run
+  orca terminal close --terminal <YOUR_HANDLE> --tab --json
+using the handle given in the dispatch AUTO-CLOSE block. Then stop — no polling, no check loop.
+A background reaper also closes the tab; self-close is belt-and-suspenders.
+Until a dispatch arrives, acknowledge role and wait.
 EOF
 )" --enter --json >/dev/null
 }

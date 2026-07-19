@@ -1,13 +1,12 @@
+
 .DS_Store
-
-# Local Orca runtime scaffold (installed into consumer projects)
 .orca/
-
-# Superpowers SDD working scratch (ledger, briefs, review packages)
-.superpowers/
-
-# Orca local terminal handles
-.orca/orchestration/handles.json
-
-# Orca dispatch close ledger (local)
 .orca/orchestration/dispatch-ledger.jsonl
+.orca/orchestration/handles.json
+.orca/orchestration/reapers/
+.superpowers/
+# Local Orca runtime scaffold (installed into consumer projects)
+# Orca auto-close reaper state
+# Orca dispatch close ledger (local)
+# Orca local terminal handles
+# Superpowers SDD working scratch (ledger, briefs, review packages)

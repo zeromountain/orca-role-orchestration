@@ -4,8 +4,8 @@
 #   .orca/orchestration/scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
 #   .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 #
-# Role tabs are ephemeral: wait with orca-wait-done.sh (or --wait) so worker
-# tabs auto-close on worker_done. This script recreates a dead/missing terminal.
+# Role tabs are ephemeral. After inject, a background reaper watches dispatch
+# status and auto-closes the worker tab on completed|failed (no manual step).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -19,23 +19,27 @@ SPEC=""
 SPEC_FILE=""
 DEPS="[]"
 WAIT_DONE=0
+NO_REAP=0
 TIMEOUT_MS=900000
+REAP_TIMEOUT_MS=3600000
 WORKTREE="active"
 PROJECT_NAME="$(basename "$ROOT")"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
+REAPER_DIR="$ORCH/reapers"
 
 usage() {
   cat <<'EOF'
 Usage:
   orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "text"
   orca-dispatch-role.sh <role> --spec-file file.md [--deps '["task_id"]']
-  orca-dispatch-role.sh <role> --spec "…" --wait [--timeout-ms N]
+  orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--timeout-ms N]
 
-fallback = Antigravity Gemini 3.5 Flash (Medium) for rate/session limits.
-Recreates the role terminal if the stored handle is dead/missing.
---wait runs orca-wait-done.sh after inject (auto-closes the worker tab on worker_done).
-Without --wait, prefer:
-  .orca/orchestration/scripts/orca-wait-done.sh --role <role>
+By default a background reaper auto-closes the worker tab when the dispatch
+completes or fails (no coordinator action required).
+
+  --wait      Also block on orca-wait-done.sh (optional; reaper still runs unless --no-reap)
+  --no-reap   Disable automatic background close (tabs will linger unless closed elsewhere)
+  --timeout-ms  Timeout for --wait only (default 900000). Reaper default lifetime 1h.
 EOF
 }
 
@@ -48,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --spec-file) SPEC_FILE="${2:?}"; shift 2 ;;
     --deps) DEPS="${2:?}"; shift 2 ;;
     --wait) WAIT_DONE=1; shift ;;
+    --no-reap) NO_REAP=1; shift ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
@@ -96,13 +101,25 @@ STANCE=""
 if [[ -f "$PERSONA_FILE" ]]; then
   STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
 fi
+
+# Spec always carries auto-close contract so the worker also self-closes after worker_done.
+AUTO_CLOSE_BLOCK="
+AUTO-CLOSE (required, automatic):
+After you send worker_done exactly once, immediately run this shell command (do not skip):
+  orca terminal close --terminal ${HANDLE} --tab --json
+Your Orca terminal handle for this session is: ${HANDLE}
+Then stop. Do not poll orchestration. A background reaper also closes this tab if needed.
+"
+
 if [[ -n "${STANCE// }" ]]; then
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 STANCE: $STANCE
-$SPEC"
+$SPEC
+$AUTO_CLOSE_BLOCK"
 else
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
-$SPEC"
+$SPEC
+$AUTO_CLOSE_BLOCK"
 fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE"
@@ -135,7 +152,7 @@ disp=r.get("dispatch") or r
 print(disp.get("id") or disp.get("dispatch_id") or "")
 ' 2>/dev/null || true)"
 
-# Ledger for wait-done auto-close (taskId → handle/role)
+# Ledger for reaper / wait-done
 python3 - "$LEDGER_FILE" "$TASK_ID" "$DISPATCH_ID" "$ROLE" "$HANDLE" <<'PY'
 import json, sys, datetime, os
 path, task_id, dispatch_id, role, handle = sys.argv[1:6]
@@ -153,13 +170,29 @@ with open(path, "a") as f:
 print(f"ledger += {role} {task_id} → {handle}", file=sys.stderr)
 PY
 
+# Background reaper: auto-close on completed|failed (default ON)
+if [[ "$NO_REAP" -eq 0 ]]; then
+  mkdir -p "$REAPER_DIR"
+  LOG="$REAPER_DIR/${TASK_ID}.log"
+  PID_FILE="$REAPER_DIR/${TASK_ID}.pid"
+  nohup "$HERE/orca-reap-task.sh" \
+    --task "$TASK_ID" \
+    --handle "$HANDLE" \
+    --role "$ROLE" \
+    --timeout-ms "$REAP_TIMEOUT_MS" \
+    >>"$LOG" 2>&1 &
+  echo $! >"$PID_FILE"
+  echo "Auto-reaper started pid=$(cat "$PID_FILE") log=$LOG"
+  echo "Worker tab will close automatically when dispatch completes."
+else
+  echo "Reaper disabled (--no-reap). Tab will linger unless closed elsewhere."
+fi
+
 if [[ "$WAIT_DONE" -eq 1 ]]; then
-  echo "Waiting for worker_done (auto-close on completion)…"
+  echo "Also blocking on wait-done…"
   exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE"
 fi
 
-echo "Dispatched. Prefer wait+auto-close:"
-echo "  .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE --timeout-ms $TIMEOUT_MS"
-echo "  orca orchestration dispatch-show --task $TASK_ID --json"
-echo "Manual close (if not using wait-done):"
-echo "  .orca/orchestration/scripts/orca-close-role.sh $ROLE"
+echo "Dispatched. task_id=$TASK_ID handle=$HANDLE"
+echo "  status: orca orchestration dispatch-show --task $TASK_ID --json"
+echo "  optional block: .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE"

@@ -42,7 +42,7 @@ project's SSOT — as a clean PR-sized unit. For raster image tasks, produce the
 - Take plans from architect; delegate pure exploration/small side-quests to thrifty when it speeds you up.
 - Report `worker_done` once with taskId+dispatchId when the deliverable is verified.
 - Escalate design-level questions upward rather than making architectural calls.
-- End of task: after `worker_done`, stop and stay silent — no further output, no polling, no `orca orchestration check` loop. The coordinator closes your terminal; a later dispatch starts a fresh one. Do not try to exit the shell yourself.
+- End of task: after `worker_done`, immediately run `orca terminal close --terminal <YOUR_HANDLE> --tab --json` from the dispatch AUTO-CLOSE block, then stop (no polling). A background reaper also closes the tab.
 
 **Definition of done.** Code implemented, verification commands run and green, changes integrated
 and consistent with project SSOT — and you can show the command output that proves it. For images:

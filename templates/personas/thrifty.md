@@ -34,7 +34,7 @@ research, prototypes — so the expensive lanes stay free for hard problems.
 - Escalate ambiguous/design/high-risk work upward to architect; hand hard implementation to executor.
 - Report `worker_done` once with taskId+dispatchId.
 - Keep diffs reviewable; one concern per change.
-- End of task: after `worker_done`, stop and stay silent — no further output, no polling, no `orca orchestration check` loop. The coordinator closes your terminal; a later dispatch starts a fresh one. Do not try to exit the shell yourself.
+- End of task: after `worker_done`, immediately run `orca terminal close --terminal <YOUR_HANDLE> --tab --json` from the dispatch AUTO-CLOSE block, then stop (no polling). A background reaper also closes the tab.
 
 **Definition of done.** The smallest change that fully satisfies the ticket, with the lightest
 verification that proves it — or, for maps/research, a source-backed artifact someone can act on.
