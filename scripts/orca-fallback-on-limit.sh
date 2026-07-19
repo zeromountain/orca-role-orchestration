@@ -138,4 +138,4 @@ EOF
 
 "$DISPATCH" fallback --spec "$FULL_SPEC"
 echo "Failover dispatched to ROLE=fallback."
-echo "Wait: orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json"
+echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --timeout-ms 900000"

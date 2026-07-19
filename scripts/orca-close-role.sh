@@ -50,8 +50,10 @@ if ! terminal_is_live "$HANDLE"; then
   exit 0
 fi
 
-echo "Closing $TARGET → $HANDLE"
-if orca terminal close --terminal "$HANDLE" --json >/dev/null 2>&1; then
+echo "Closing $TARGET → $HANDLE (tab)"
+# Prefer --tab so the whole sub-session leaves the sidebar (not just the pane).
+if orca terminal close --terminal "$HANDLE" --tab --json >/dev/null 2>&1 \
+  || orca terminal close --terminal "$HANDLE" --json >/dev/null 2>&1; then
   echo "Closed $HANDLE"
 else
   echo "Close returned non-zero for $HANDLE (treating as ok — may already be gone)"

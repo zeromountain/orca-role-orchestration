@@ -266,7 +266,7 @@ write_managed "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md" "PLAYBOOK.md"
 write_managed "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md" "SCRIPTS.md"
 write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.example.json"
 
-for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh; do
+for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh; do
   write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
 
@@ -274,7 +274,7 @@ done
 # Never touch the skill package's own scripts/ when installing into the skill repo itself.
 OLD_SCRIPTS_DIR="$ROOT/scripts"
 if [[ "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
-  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh; do
+  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh; do
     if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
       # Skip if this is the skill source file (same path as SCRIPTS_SRC)
       if [[ "$OLD_SCRIPTS_DIR/$s" -ef "$SCRIPTS_SRC/$s" ]]; then

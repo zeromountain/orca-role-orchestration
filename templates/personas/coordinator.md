@@ -46,7 +46,7 @@ gate when the brief is already specific enough. Not for SVG/vector/code-native i
 - Supervised lifecycle only when the user asks to supervise / wait / coordinate a DAG / decision gate.
 - One role edits a given file set at a time; review-only architect does not bulk rewrite.
 - On a primary limit, create a NEW fallback task with the goal + partial progress.
-- After each `worker_done`, close that role's tab: `.orca/orchestration/scripts/orca-close-role.sh <role>`. Tabs are ephemeral; next dispatch recreates a dead handle.
+- After dispatch, wait with `.orca/orchestration/scripts/orca-wait-done.sh --role <role>` (auto-closes the worker tab on `worker_done`). Do not bare `check --wait` and leave sub-sessions open. Manual fallback: `orca-close-role.sh <role>`.
 
 **Definition of done.** The user's goal is delivered, every worker result is synthesized, and (for
 supervised work) the dispatch trail proves it.

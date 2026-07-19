@@ -350,5 +350,6 @@ lifecycle:
   on_rate_limit: redispatch_to_fallback
   # Supervised role tabs are ephemeral: one live tab per in-flight dispatch,
   # closed on worker_done, recreated on the next dispatch (not long-lived warm pools).
-  close_terminal_after_done: true   # coordinator: orca-close-role.sh <role> after each worker_done
+  close_terminal_after_done: true   # prefer orca-wait-done.sh (auto-close --tab on worker_done)
   recreate_terminal_on_dispatch: true  # dispatch rebuilds a dead/missing role tab
+  wait_script: .orca/orchestration/scripts/orca-wait-done.sh

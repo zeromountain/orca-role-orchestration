@@ -54,15 +54,16 @@ Only when user asks to supervise / coordinate / wait / DAG:
 .orca/orchestration/scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 
-orca orchestration check --wait \
-  --types worker_done,escalation,decision_gate \
-  --timeout-ms 900000 --json
+# Preferred: wait + auto-close completed worker tab
+.orca/orchestration/scripts/orca-wait-done.sh --role thrifty --timeout-ms 900000
 
-# On each worker_done — close that role tab (ephemeral workers):
-.orca/orchestration/scripts/orca-close-role.sh <role>
+# Or one-shot dispatch+wait+close:
+.orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec "…" --wait
 ```
 
-Role tabs are **ephemeral**: closed on `worker_done`, recreated automatically on the next dispatch if the handle is dead/missing.
+Role tabs are **ephemeral**: `orca-wait-done.sh` closes the worker tab on `worker_done` (uses `orca terminal close --tab`). Next dispatch recreates a dead/missing handle automatically.
+
+Do **not** use bare `orca orchestration check --wait` for role workers unless you also close — orphaned sub-sessions linger.
 
 Timeout / `count:0` = checkpoint, not failure if terminal still working.
 

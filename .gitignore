@@ -8,3 +8,6 @@
 
 # Orca local terminal handles
 .orca/orchestration/handles.json
+
+# Orca dispatch close ledger (local)
+.orca/orchestration/dispatch-ledger.jsonl

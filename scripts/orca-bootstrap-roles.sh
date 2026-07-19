@@ -110,5 +110,6 @@ print(json.dumps(data["roles"], indent=2))
 PY
 
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
-echo "After each worker_done: .orca/orchestration/scripts/orca-close-role.sh <role>"
+echo "After dispatch wait with: .orca/orchestration/scripts/orca-wait-done.sh --role <role>"
+echo "  (auto-closes worker tab on worker_done; or use dispatch --wait)"
 echo "Limit failover: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec \"...\""

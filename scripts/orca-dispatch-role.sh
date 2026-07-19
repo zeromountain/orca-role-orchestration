@@ -4,8 +4,8 @@
 #   .orca/orchestration/scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
 #   .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 #
-# Role tabs are ephemeral: after worker_done the coordinator should
-# orca-close-role.sh <role>. This script recreates a dead/missing terminal.
+# Role tabs are ephemeral: wait with orca-wait-done.sh (or --wait) so worker
+# tabs auto-close on worker_done. This script recreates a dead/missing terminal.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -18,18 +18,24 @@ ROLE=""
 SPEC=""
 SPEC_FILE=""
 DEPS="[]"
+WAIT_DONE=0
+TIMEOUT_MS=900000
 WORKTREE="active"
 PROJECT_NAME="$(basename "$ROOT")"
+LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
 
 usage() {
   cat <<'EOF'
 Usage:
   orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "text"
   orca-dispatch-role.sh <role> --spec-file file.md [--deps '["task_id"]']
+  orca-dispatch-role.sh <role> --spec "…" --wait [--timeout-ms N]
 
 fallback = Antigravity Gemini 3.5 Flash (Medium) for rate/session limits.
 Recreates the role terminal if the stored handle is dead/missing.
-After worker_done, coordinator should: orca-close-role.sh <role>
+--wait runs orca-wait-done.sh after inject (auto-closes the worker tab on worker_done).
+Without --wait, prefer:
+  .orca/orchestration/scripts/orca-wait-done.sh --role <role>
 EOF
 }
 
@@ -41,6 +47,8 @@ while [[ $# -gt 0 ]]; do
     --spec) SPEC="${2:?}"; shift 2 ;;
     --spec-file) SPEC_FILE="${2:?}"; shift 2 ;;
     --deps) DEPS="${2:?}"; shift 2 ;;
+    --wait) WAIT_DONE=1; shift ;;
+    --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
   esac
@@ -117,9 +125,41 @@ echo "Waiting for worker tui-idle…"
 orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
 
 echo "Dispatching (inject)…"
-orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json
-echo "Dispatched. Wait with:"
-echo "  orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json"
+DISPATCH_JSON="$(orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json)"
+printf '%s\n' "$DISPATCH_JSON"
+DISPATCH_ID="$(printf '%s' "$DISPATCH_JSON" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+r=d.get("result") or d
+disp=r.get("dispatch") or r
+print(disp.get("id") or disp.get("dispatch_id") or "")
+' 2>/dev/null || true)"
+
+# Ledger for wait-done auto-close (taskId → handle/role)
+python3 - "$LEDGER_FILE" "$TASK_ID" "$DISPATCH_ID" "$ROLE" "$HANDLE" <<'PY'
+import json, sys, datetime, os
+path, task_id, dispatch_id, role, handle = sys.argv[1:6]
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+row = {
+    "taskId": task_id,
+    "dispatchId": dispatch_id or None,
+    "role": role,
+    "handle": handle,
+    "status": "dispatched",
+    "dispatchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+with open(path, "a") as f:
+    f.write(json.dumps(row) + "\n")
+print(f"ledger += {role} {task_id} → {handle}", file=sys.stderr)
+PY
+
+if [[ "$WAIT_DONE" -eq 1 ]]; then
+  echo "Waiting for worker_done (auto-close on completion)…"
+  exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE"
+fi
+
+echo "Dispatched. Prefer wait+auto-close:"
+echo "  .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE --timeout-ms $TIMEOUT_MS"
 echo "  orca orchestration dispatch-show --task $TASK_ID --json"
-echo "On worker_done close the tab:"
+echo "Manual close (if not using wait-done):"
 echo "  .orca/orchestration/scripts/orca-close-role.sh $ROLE"
