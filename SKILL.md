@@ -58,6 +58,11 @@ orca-role-orchestration/
     plugin.json                # Codex plugin identity (skills: "./", hooks: {})
   .agents/plugins/
     marketplace.json           # Codex marketplace catalog (source url "./")
+  commands/                    # Claude Code slash commands (auto-discovered)
+    install.md bootstrap.md dispatch.md wait.md fallback.md close.md
+  prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
+    orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
+    orca-fallback.md orca-close.md
   scripts/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
@@ -88,6 +93,21 @@ Resolve the skill root from this file’s directory. A conventional installation
 /plugin marketplace add zeromountain/orca-role-orchestration
 /plugin install orca-role-orchestration@orca-role-orchestration
 ```
+
+Slash commands ship with the plugin (namespace `orca-role-orchestration`):
+
+| Claude Code | Codex | Script |
+|-------------|-------|--------|
+| `/orca-role-orchestration:install` | `/orca-install` | `install-to-project.sh` |
+| `/orca-role-orchestration:bootstrap` | `/orca-bootstrap` | `orca-bootstrap-roles.sh` |
+| `/orca-role-orchestration:dispatch <role> <task>` | `/orca-dispatch` | `orca-dispatch-role.sh` |
+| `/orca-role-orchestration:wait` | `/orca-wait` | `orca-wait-done.sh` |
+| `/orca-role-orchestration:fallback <role> <goal>` | `/orca-fallback` | `orca-fallback-on-limit.sh` |
+| `/orca-role-orchestration:close <role>` | `/orca-close` | `orca-close-role.sh` (emergency) |
+
+Claude Code auto-discovers `commands/` from the plugin root. Codex plugin manifests carry
+no prompt field, so `install-skill.sh` symlinks `prompts/*.md` into `$CODEX_HOME/prompts/`
+(run it once after `codex plugin add` to get the Codex slash commands).
 
 Namespaced skill: `/orca-role-orchestration:…`. Manifests: `.claude-plugin/plugin.json` + `marketplace.json` (`source: "./"`).
 
@@ -126,6 +146,7 @@ codex plugin add orca-role-orchestration@orca-role-orchestration
 ```bash
 ./scripts/install-skill.sh
 # or: curl -fsSL …/install-skill.sh | bash
+# remove: ./scripts/install-skill.sh --uninstall   # drops our symlinks; keeps the checkout
 ```
 
 **Project scaffold** — same command for first install and every update:
