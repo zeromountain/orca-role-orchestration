@@ -30,7 +30,7 @@ roles:
   architect:
     handle_title: role-opus-architect
     agent: claude
-    model: claude-opus-4-8
+    model: claude-opus-5
     effort: high
     persona_file: personas/architect.md
     persona_summary: >-
@@ -127,11 +127,87 @@ roles:
       - map code
       - explore
 
+  ui:
+    handle_title: role-agy-ui
+    agent: antigravity
+    cli: agy
+    model: "Gemini 3.6 Flash (Medium)"
+    effort: medium
+    persona_file: personas/ui.md
+    persona_summary: >-
+      The Set Designer — own the user-visible surface; draft fast and cheap;
+      route every draft back to architect for approval; never change system structure.
+    owns:
+      - UI / UX surface work and frontend visual implementation
+      - layout, spacing, typography, color, motion, component states
+      - design-system conformance and reuse
+      - lightweight design drafts: wireframes, mockups, visual spikes, copy passes
+      - visual accessibility (contrast, focus order, labels)
+    does_not:
+      - system architecture, data flow, API / schema contracts (→ architect)
+      - approving its own drafts (→ architect gate, always)
+      - hard multi-file backend implementation (→ executor)
+      - acting as the rate/session-limit safety net (→ fallback)
+    route_keywords:
+      - ui
+      - ux
+      - frontend visual
+      - layout
+      - spacing
+      - typography
+      - styling
+      - css
+      - component look
+      - design system
+      - mockup
+      - wireframe
+      - design draft
+      - visual spike
+      - responsive
+      - contrast
+    notes: |
+      Shares the agy CLI and the Gemini 3.6 Flash (Medium) quota with `fallback`.
+      Never fail ui over to fallback (same provider, same limit) — use thrifty instead.
+
+  reviewer:
+    handle_title: role-opus-reviewer
+    agent: claude
+    model: claude-opus-5
+    effort: high
+    persona_file: personas/reviewer.md
+    persona_summary: >-
+      The Gatekeeper — final pre-merge gate only; APPROVE or BLOCK with evidence;
+      never implement, never take over day-to-day review.
+    owns:
+      - the single pre-merge final approval on a completed, already-reviewed change
+      - a binary APPROVE / BLOCK verdict with file:line evidence
+    does_not:
+      - day-to-day / in-flight review (→ architect keeps this entirely)
+      - planning, architecture, or design (→ architect)
+      - any edit at all, including a one-line fix (→ executor / ui)
+      - being primary for anything except the final gate
+    route_keywords:
+      - final gate
+      - pre-merge
+      - merge approval
+      - ship approval
+      - final review
+      - sign-off
+      - release gate
+    entry_condition: |
+      Dispatch reviewer ONLY when all hold: implementation complete, its own
+      verification green, architect's in-flight findings resolved. Otherwise
+      reviewer returns BLOCK "not gate-ready" without reviewing.
+    notes: |
+      Shares the claude CLI and the claude-opus-5 quota with `architect`. If
+      architect is session-limited, reviewer very likely is too — defer the gate
+      rather than downgrade it to a weaker model.
+
   fallback:
     handle_title: role-agy-fallback
     agent: antigravity
     cli: agy
-    model: "Gemini 3.5 Flash (Medium)"
+    model: "Gemini 3.6 Flash (Medium)"
     effort: medium
     persona_file: personas/fallback.md
     persona_summary: >-
@@ -204,10 +280,22 @@ routing_table:
   - match: verification
     when: "typecheck, build, test, integrate"
     primary: executor
+  - match: ui_surface_work
+    when: "UI / UX, frontend visuals, layout, styling, component look-and-feel, contrast"
+    primary: ui
+    secondary: architect
+  - match: ui_draft
+    when: "Cheap first-pass wireframe / mockup / visual spike / copy pass"
+    primary: ui
+    secondary: architect
   - match: dual_review
     when: "High stakes ship gate"
     primary: architect
     secondary: executor
+  - match: final_merge_gate
+    when: "Change complete + verified + architect findings resolved; about to merge/ship"
+    primary: reviewer
+    terminal: true
 
 dags:
   feature_plan_execute_review:
@@ -314,11 +402,58 @@ dags:
 
           Done: final path(s) + short prompt used + built-in vs CLI mode.
 
+  ui_feature:
+    description: User-visible feature — surface first, architect-approved
+    steps:
+      - id: draft
+        role: ui
+        deps: []
+        spec_template: |
+          ROLE=ui. Produce a DRAFT ONLY of the user-visible surface for:
+          {{user_goal}}
+          Cover default / loading / empty / error states, responsive behaviour,
+          contrast + focus order. Reuse the existing design system.
+          No architecture, schema, or API changes.
+          Output: surface spec + the exact files an implementation would touch.
+          Label it DRAFT — needs architect approval.
+      - id: approve
+        role: architect
+        deps: [draft]
+        spec_template: |
+          ROLE=architect (approval gate). Approve, amend, or reject this design draft:
+          {{draft_result}}
+          Judge structural impact, contract impact, and feasibility.
+          Output an approved surface spec, or a rejection with the reason.
+      - id: implement
+        role: ui
+        deps: [approve]
+        spec_template: |
+          ROLE=ui. Implement ONLY the approved surface spec:
+          {{approve_result}}
+          Stay in the listed files. No architecture changes.
+          Run the project's lint/typecheck and report the output.
+      - id: review
+        role: architect
+        deps: [implement]
+
+  final_merge_gate:
+    description: Terminal pre-merge approval — attach to any flow, never run standalone
+    steps:
+      - id: gate
+        role: reviewer
+        deps: []
+        spec_template: |
+          ROLE=reviewer (FINAL GATE, review-only). VERDICT: APPROVE or VERDICT: BLOCK.
+          Preconditions: complete, verified, architect findings resolved — if any is
+          unmet, BLOCK as "not gate-ready" without reviewing further.
+          BLOCK needs blocking findings with file:line evidence, why each blocks,
+          a fix path, and who fixes it. Never edit a file.
+
 limit_failover:
   enabled: true
   target_role: fallback
   agent: antigravity
-  model: "Gemini 3.5 Flash (Medium)"
+  model: "Gemini 3.6 Flash (Medium)"
   detect_patterns:
     # Mirrors scripts/orca-fallback-on-limit.sh LIMIT_RE (doc only; script is authoritative)
     - "session limit"

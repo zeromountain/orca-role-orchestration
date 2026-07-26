@@ -6,10 +6,12 @@
 role_meta() {
   # $1=role → title<TAB>model<TAB>agent
   case "$1" in
-    architect) printf '%s\t%s\t%s\n' "role-opus-architect" "claude-opus-4-8" "claude" ;;
+    architect) printf '%s\t%s\t%s\n' "role-opus-architect" "claude-opus-5" "claude" ;;
     executor)  printf '%s\t%s\t%s\n' "role-sol-executor"   "gpt-5.6-sol"     "codex" ;;
     thrifty)   printf '%s\t%s\t%s\n' "role-grok-thrifty"   "grok-4.5"        "grok" ;;
-    fallback)  printf '%s\t%s\t%s\n' "role-agy-fallback"   "Gemini 3.5 Flash (Medium)" "antigravity" ;;
+    ui)        printf '%s\t%s\t%s\n' "role-agy-ui"         "Gemini 3.6 Flash (Medium)" "antigravity" ;;
+    reviewer)  printf '%s\t%s\t%s\n' "role-opus-reviewer"  "claude-opus-5"   "claude" ;;
+    fallback)  printf '%s\t%s\t%s\n' "role-agy-fallback"   "Gemini 3.6 Flash (Medium)" "antigravity" ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
 }
@@ -18,7 +20,7 @@ role_launch_cmd() {
   # $1=role → CLI launch command string
   case "$1" in
     architect)
-      printf '%s\n' 'claude --model claude-opus-4-8 --dangerously-skip-permissions'
+      printf '%s\n' 'claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     executor)
       printf '%s\n' 'codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
@@ -26,8 +28,14 @@ role_launch_cmd() {
     thrifty)
       printf '%s\n' 'grok --model grok-4.5 --permission-mode bypassPermissions'
       ;;
+    ui)
+      printf '%s\n' 'agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      ;;
+    reviewer)
+      printf '%s\n' 'claude --model claude-opus-5 --dangerously-skip-permissions'
+      ;;
     fallback)
-      printf '%s\n' 'agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions'
+      printf '%s\n' 'agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
@@ -38,6 +46,8 @@ role_fallback_body() {
     architect) printf '%s\n' "Own architecture, judgment, high-risk review, long-horizon plans. Prefer plans/reviews over bulk implementation." ;;
     executor)  printf '%s\n' "Own hard implementation, terminal loops, verification, final integration. Execute approved plans end-to-end." ;;
     thrifty)   printf '%s\n' "Own small tickets, maps, research, prototypes, high-volume low-risk edits. Escalate design risk." ;;
+    ui)        printf '%s\n' "Own the user-visible surface and cheap design drafts. Every draft returns to architect for approval. Never change system structure." ;;
+    reviewer)  printf '%s\n' "FINAL PRE-MERGE GATE ONLY. Return APPROVE or BLOCK with file:line evidence. Never edit. architect keeps day-to-day review." ;;
     fallback)  printf '%s\n' "Rate/session-limit safety net. Continue interrupted tasks with smallest viable progress." ;;
     *) return 1 ;;
   esac
@@ -125,12 +135,19 @@ handles_set() {
 import json, sys, datetime, os
 path, role, handle = sys.argv[1:4]
 meta = {
-    "architect": {"title": "role-opus-architect", "model": "claude-opus-4-8", "agent": "claude"},
+    "architect": {"title": "role-opus-architect", "model": "claude-opus-5", "agent": "claude"},
     "executor":  {"title": "role-sol-executor",   "model": "gpt-5.6-sol",     "agent": "codex"},
     "thrifty":   {"title": "role-grok-thrifty",   "model": "grok-4.5",        "agent": "grok"},
+    "ui":        {
+        "title": "role-agy-ui",
+        "model": "Gemini 3.6 Flash (Medium)",
+        "agent": "antigravity",
+        "cli": "agy",
+    },
+    "reviewer":  {"title": "role-opus-reviewer",  "model": "claude-opus-5",   "agent": "claude"},
     "fallback":  {
         "title": "role-agy-fallback",
-        "model": "Gemini 3.5 Flash (Medium)",
+        "model": "Gemini 3.6 Flash (Medium)",
         "agent": "antigravity",
         "cli": "agy",
     },
