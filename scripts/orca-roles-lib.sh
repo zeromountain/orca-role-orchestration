@@ -121,23 +121,110 @@ print(disp.get("status") or "unknown")
 }
 
 create_role() {
-  local title="$1" command="$2" json handle
+  # $1=title $2=command $3=role (optional; recorded in the journal only — may
+  #   be empty/unknown, e.g. orca-bootstrap-roles.sh's direct 2-arg calls)
+  #
+  # On success: prints the handle on stdout, returns 0.
+  # On failure to find a handle in the create response: returns 1 with
+  # nothing on stdout. It does this via an explicit check, NOT by raising —
+  # the old code's `raise SystemExit("no handle…")` relied on that exception
+  # propagating up through `set -e` to stop the caller, but under this
+  # repo's bash (3.2.57, macOS default — no `inherit_errexit`), a
+  # command-substitution subshell always runs with errexit OFF regardless of
+  # the parent's `set -e`. Verified empirically: `handle="$(create_role …)"`
+  # inside `ensure_terminal` did NOT abort on that SystemExit — it silently
+  # continued with handle="", which `handles_set` then wrote into
+  # handles.json, and a later `orca terminal send --terminal ""` fell back to
+  # the CLI's "active terminal" — i.e. the exact observed bug where a seed
+  # landed in the coordinator's own session. So every step from here on
+  # checks status explicitly (`||`, `if !`) instead of trusting propagation.
+  #
+  # The raw create response is journaled to $ORCH/terminal-journal.jsonl
+  # BEFORE this function decides success/failure, in the same python process
+  # that parses it (not two separate steps), so a parse problem can never
+  # skip the write, and a journal I/O problem can never suppress an
+  # otherwise-successful handle. A null `handle` next to a non-null `raw` in
+  # that journal is the signal an orphan sweep looks for: a terminal was
+  # created (raw response exists) but its handle was never recorded anywhere.
+  local title="$1" command="$2" role="${3:-}" journal_file raw handle handle_scratch
   echo "→ Creating $title" >&2
-  json="$(orca terminal create --worktree "$WORKTREE" --title "$title" --command "$command" --json)"
-  handle="$(printf '%s' "$json" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-r=d.get("result") or d
-h=r.get("handle") or (r.get("terminal") or {}).get("handle") or d.get("handle")
-if not h:
-    raise SystemExit("no handle in terminal create response")
-print(h)
-')"
+  raw="$(orca terminal create --worktree "$WORKTREE" --title "$title" --command "$command" --json)" || raw=""
+  journal_file="${ORCH:-.}/terminal-journal.jsonl"
+  mkdir -p "$(dirname "$journal_file")" 2>/dev/null || true
+  # The python heredoc below writes ITS OWN stdout to a scratch file via a
+  # plain `>` redirect, then a separate trivial `$(cat …)` reads it back —
+  # it is deliberately NOT `handle="$(python3 … <<'PY' … PY)"`. On this
+  # repo's bash (3.2.57, macOS default), a quoted-delimiter heredoc (`<<'PY'`)
+  # nested directly inside a `$(...)` command substitution can break the
+  # substitution's own paren-matching if the heredoc body's quote/paren
+  # counts aren't globally even — even though the body is supposed to be
+  # fully literal. Confirmed empirically on this bash: a heredoc body
+  # containing nothing but a stray "don't" (one unmatched apostrophe) is
+  # enough to make `bash -n` fail with "unexpected EOF looking for matching
+  # `)'" several lines later, with no error located anywhere near the actual
+  # apostrophe. `handles_get`/`handles_set` below never hit this because
+  # their heredocs run as plain (uncaptured) commands, never inside `$(...)`.
+  handle_scratch="${journal_file}.handle.$$"
+  python3 - "$journal_file" "$role" "$title" "$raw" <<'PY' >"$handle_scratch"
+import json, sys, datetime
+
+path, role, title, raw = sys.argv[1:5]
+try:
+    parsed = json.loads(raw) if raw else None
+except Exception:
+    parsed = None
+
+handle = ""
+if isinstance(parsed, dict):
+    result = parsed.get("result") or parsed
+    if isinstance(result, dict):
+        handle = (
+            result.get("handle")
+            or (result.get("terminal") or {}).get("handle")
+            or parsed.get("handle")
+            or ""
+        )
+
+row = {
+    "role": role or None,
+    "title": title,
+    "raw": parsed if parsed is not None else raw,
+    "handle": handle or None,
+    "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+# A journal I/O problem is a second, independent failure. It must not
+# masquerade as "no handle in the create response" by suppressing a handle
+# that was parsed successfully, so this warns instead of gating on it.
+try:
+    with open(path, "a") as f:
+        f.write(json.dumps(row) + "\n")
+except Exception as exc:
+    print(f"create_role: could not append {path}: {exc}", file=sys.stderr)
+
+print(handle)
+PY
+  handle="$(cat "$handle_scratch" 2>/dev/null)"
+  rm -f "$handle_scratch" 2>/dev/null
+  if [[ -z "$handle" ]]; then
+    echo "create_role: no handle in terminal create response for '$title' (role=${role:-unknown}) — the terminal may exist but is untracked; see $journal_file (handle=null) for the raw response" >&2
+    return 1
+  fi
   orca terminal rename --terminal "$handle" --title "$title" --json >/dev/null 2>&1 || true
   echo "  handle=$handle" >&2
   printf '%s\n' "$handle"
 }
 
+# Intentionally unchanged: still warns and returns 0 on a tui-idle timeout
+# rather than failing hard. Two reasons this is in scope, not a leftover:
+# (1) orca-bootstrap-roles.sh calls this as a bare top-level statement for
+#     each of the 4 primary roles (lines 66-69) — making it fail loud would
+#     abort bootstrap for all subsequent roles over one role's harmless
+#     90s timeout, a regression for ordinary dispatch of all 6 roles; and
+# (2) handles_set now runs before this (see ensure_terminal), so the handle
+#     is already durable by the time this runs, and seed()'s own send/
+#     read-back verification independently catches a terminal that never
+#     actually became usable. Neither of the two "what must become true"
+#     requirements this task is scoped to depends on this function's status.
 wait_idle() {
   orca terminal wait --terminal "$1" --for tui-idle --timeout-ms 90000 --json >/dev/null 2>&1 \
     || echo "  (warn) tui-idle wait timed out for $1" >&2
@@ -182,13 +269,97 @@ EOF
 }
 
 seed() {
-  local handle="$1" role="$2" model="$3" fallback_body="$4" body
+  # $1=handle $2=role $3=model $4=fallback_body
+  #
+  # Verifies its own send instead of discarding the result: (a) refuses a
+  # target that isn't shaped like a real terminal handle, (b) requires the
+  # send call to structurally report success, (c) confirms the exact handle
+  # is still a live, readable terminal right after sending. Any of these
+  # failing is echoed to stderr and returns 1 — never swallowed. seed_text's
+  # output itself is untouched by any of this (non-debater seed text is
+  # byte-frozen).
+  local handle="$1" role="$2" model="$3" fallback_body="$4"
+  local body text send_json accepted read_ok attempt read_json marker
+
+  case "$handle" in
+    term_*) ;;
+    *)
+      echo "seed: refusing to send — '$handle' is not a term_*-shaped terminal handle (role=$role). This guard exists because an empty/blank --terminal previously fell back to the CLI's active terminal, i.e. a seed misdelivered to an unrelated session." >&2
+      return 1
+      ;;
+  esac
+
   if body="$(persona_body "$role")" && [[ -n "${body// }" ]]; then
     : # use full persona file
   else
     body="$fallback_body"
   fi
-  orca terminal send --terminal "$handle" --text "$(seed_text "$role" "$model" "$body")" --enter --json >/dev/null
+  text="$(seed_text "$role" "$model" "$body")"
+
+  send_json="$(orca terminal send --terminal "$handle" --text "$text" --enter --json)"
+  if [[ -z "${send_json// }" ]]; then
+    echo "seed: orca terminal send produced no output for $handle (role=$role) — treating as failed" >&2
+    return 1
+  fi
+  accepted="$(printf '%s' "$send_json" | python3 -c '
+import json, sys
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("false")
+    raise SystemExit(0)
+r = d.get("result") or d
+s = r.get("send") or r
+ok = s.get("accepted")
+if ok is None:
+    ok = d.get("ok")
+print("true" if ok else "false")
+')"
+  if [[ "$accepted" != "true" ]]; then
+    echo "seed: send not accepted for $handle (role=$role): $send_json" >&2
+    return 1
+  fi
+
+  # Confirm arrival by reading the terminal back. The hard gate is
+  # structural only — the exact handle is still a live, queryable terminal
+  # right after the send — not a match on the literal sent text: the target
+  # is a full-screen TUI agent (claude/codex/grok/agy) that redraws its own
+  # scrollback, so asserting on rendered content would race that redraw and
+  # be flaky. A short marker check below is a soft, non-fatal signal only.
+  read_ok=1
+  for attempt in 1 2 3; do
+    read_json="$(orca terminal read --terminal "$handle" --limit 200 --json 2>/dev/null)" || read_json=""
+    if [[ -n "${read_json// }" ]] && printf '%s' "$read_json" | python3 -c '
+import json, sys
+
+h = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+r = (d.get("result") or {}).get("terminal") or {}
+sys.exit(0 if (d.get("ok") and r.get("handle") == h and isinstance(r.get("tail"), list)) else 1)
+' "$handle"; then
+      read_ok=0
+      break
+    fi
+    [[ "$attempt" -lt 3 ]] && sleep 0.5
+  done
+  if [[ "$read_ok" -ne 0 ]]; then
+    echo "seed: could not confirm $handle is still a live, readable terminal after send (role=$role) — seed may not have landed" >&2
+    return 1
+  fi
+
+  # Soft, best-effort confirmation only: an info note (not a failure) if the
+  # seed's own opening marker isn't visible yet — the agent's TUI may have
+  # already redrawn past it by the time we read.
+  marker="ROLE=$role"
+  if ! printf '%s' "$read_json" | grep -qF "$marker"; then
+    echo "seed: (info) marker '$marker' not visible yet in $handle's tail — not a failure, TUI may have redrawn already" >&2
+  fi
+
+  return 0
 }
 
 handles_get() {
@@ -256,32 +427,91 @@ PY
 }
 
 terminal_is_live() {
-  # $1=handle → 0 if present & connected in terminal list
-  orca terminal list --json 2>/dev/null | python3 -c '
+  # $1=handle → 0 definitely live / 1 definitely not live / 2 could not
+  # determine. Callers must treat 2 as "leave it alone": never recreate,
+  # never assume gone, on the strength of an inconclusive check — only exit
+  # 1 (definite dead) should ever be actioned as "gone". Previously any
+  # non-zero (including a failed `orca terminal list`) read as "dead", so a
+  # transient list failure could make ensure_terminal spin up a duplicate
+  # terminal for a role whose original was still running.
+  local handle="$1" list_json rc=0
+  list_json="$(orca terminal list --json 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 || -z "${list_json// }" ]]; then
+    return 2
+  fi
+  printf '%s' "$list_json" | python3 -c '
 import json, sys
+
 h = sys.argv[1]
-ts = (json.load(sys.stdin).get("result") or {}).get("terminals") or []
-sys.exit(0 if any(t.get("handle") == h and t.get("connected") for t in ts) else 1)
-' "$1"
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+if d.get("ok") is False:
+    sys.exit(2)
+result = d.get("result")
+if not isinstance(result, dict):
+    sys.exit(2)
+terminals = result.get("terminals")
+if not isinstance(terminals, list):
+    sys.exit(2)
+sys.exit(0 if any(t.get("handle") == h and t.get("connected") for t in terminals) else 1)
+' "$handle"
 }
 
 ensure_terminal() {
-  # $1=role → guaranteed-live handle on stdout
-  local role="$1" handle title model agent
+  # $1=role → guaranteed-live handle on stdout.
+  # Contract: stdout carries a handle ONLY when it is confirmed created,
+  # durably recorded in $HANDLES_FILE, and seeded. Any failure along the way
+  # returns 1 with nothing on stdout; recovery state (if any) lives in
+  # $HANDLES_FILE and terminal-journal.jsonl, never only in this function's
+  # local variables — so a seed failure still leaves a closable terminal.
+  local role="$1" handle title model agent live_rc=0
   handle="$(handles_get "$HANDLES_FILE" "$role")"
-  if [[ -n "$handle" ]] && terminal_is_live "$handle"; then
-    printf '%s\n' "$handle"
-    return 0
-  fi
   if [[ -n "$handle" ]]; then
-    echo "Role $role handle $handle is dead/missing — recreating…" >&2
+    terminal_is_live "$handle" || live_rc=$?
+    case "$live_rc" in
+      0)
+        printf '%s\n' "$handle"
+        return 0
+        ;;
+      2)
+        # Could not determine — never treat "undetermined" as "dead": that
+        # is exactly how a live terminal used to get a duplicate created
+        # alongside it.
+        echo "Role $role handle $handle: liveness undetermined (orca terminal list unavailable) — leaving it alone, not recreating" >&2
+        printf '%s\n' "$handle"
+        return 0
+        ;;
+      *)
+        echo "Role $role handle $handle is dead — recreating…" >&2
+        ;;
+    esac
   else
     echo "Role $role has no handle — creating…" >&2
   fi
+
   IFS=$'\t' read -r title model agent < <(role_meta "$role")
-  handle="$(create_role "$title" "$(role_launch_cmd "$role")")"
+  handle="$(create_role "$title" "$(role_launch_cmd "$role")" "$role")" || {
+    echo "ensure_terminal: create_role failed for role=$role — see terminal-journal.jsonl for the raw create response" >&2
+    return 1
+  }
+
+  # Durable before anything that can fail: a wait_idle timeout or a seed
+  # failure below must still leave this handle closable via
+  # handles_get → terminal_is_live → close, instead of leaking an untracked
+  # bypass-permissions session.
+  if ! handles_set "$HANDLES_FILE" "$role" "$handle"; then
+    echo "ensure_terminal: handles_set failed to record handle=$handle for role=$role — terminal exists but is NOT durably tracked in $HANDLES_FILE (see terminal-journal.jsonl)" >&2
+    return 1
+  fi
+
   wait_idle "$handle"
-  seed "$handle" "$role" "$model" "$(role_fallback_body "$role")"
-  handles_set "$HANDLES_FILE" "$role" "$handle"
+
+  if ! seed "$handle" "$role" "$model" "$(role_fallback_body "$role")"; then
+    echo "ensure_terminal: seed failed for role=$role handle=$handle — handle is recorded in $HANDLES_FILE so it can still be closed/retried; not printing it as a ready handle" >&2
+    return 1
+  fi
+
   printf '%s\n' "$handle"
 }

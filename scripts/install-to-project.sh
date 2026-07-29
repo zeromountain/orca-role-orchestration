@@ -327,7 +327,7 @@ PY
 GI="$ROOT/.gitignore"
 touch "$GI"
 gi_added=0
-for entry in '.orca/orchestration/handles.json' '.orca/orchestration/debates/'; do
+for entry in '.orca/orchestration/handles.json' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl'; do
   if ! grep -qF "$entry" "$GI" 2>/dev/null; then
     if [[ "$gi_added" -eq 0 ]]; then
       printf '\n# Orca local runtime state\n' >> "$GI"

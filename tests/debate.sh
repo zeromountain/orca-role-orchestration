@@ -480,6 +480,339 @@ assert G1_readme "grep -q 'orca-debate.sh' \"$ROOT/README.md\""
 assert G1_playbook_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/templates/PLAYBOOK.md\""
 assert G1_skill_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/SKILL.md\""
 
+
+# ============================================================================
+# Task 1 (terminal lifecycle): H-series. All use a stubbed `orca` on PATH
+# prepended inside a subshell — never the real runtime — so this file's
+# "Pure: no Orca runtime required" claim keeps holding. Each block gets its
+# own $tmpdir subdirectory so ORCH/HANDLES_FILE/journal state never bleeds
+# across blocks. ensure_terminal/create_role/seed are called directly as
+# functions (not through a wrapper script) since orca-roles-lib.sh is already
+# sourced above; wrapping each call in a subshell (rather than a bare
+# top-level statement or bare `$(...)` assignment) is what keeps a
+# deliberately-failing call from tripping this file's own `set -e` — the
+# same masking concern the R5/D5/E2/E4/F1/F4 blocks above already document,
+# just applied to library functions instead of external scripts.
+# ============================================================================
+
+# --- H1 (Step 1): a create response with no handle still leaves a journal
+# line (raw non-null, handle null) — proving the pre-fix code left nothing
+# is done once, outside this file, against a scratch copy of the original
+# orca-roles-lib.sh (see task-1-report.md); a permanent regression test here
+# can only assert the fixed file's behavior, since this file sources the
+# fixed library, not the historical one.
+h1_dir="$tmpdir/h1"
+mkdir -p "$h1_dir/bin" "$h1_dir/orch"
+cat > "$h1_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"title":"no-handle-here"}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h1_dir/bin/orca"
+
+h1_rc=0
+(
+  export PATH="$h1_dir/bin:$PATH"
+  WORKTREE=active
+  ORCH="$h1_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$h1_dir/stdout.log" 2>"$h1_dir/stderr.log" || h1_rc=$?
+
+h1_journal="$h1_dir/orch/terminal-journal.jsonl"
+assert H1_ensure_terminal_fails "[[ \"$h1_rc\" -ne 0 ]]"
+assert H1_journal_written "[[ -s \"$h1_journal\" ]]"
+assert H1_journal_handle_null \
+  "python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])[\"handle\"])' \"$h1_journal\" | grep -qx None"
+assert H1_journal_raw_nonnull \
+  "python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])[\"raw\"] is not None)' \"$h1_journal\" | grep -qx True"
+assert H1_handles_not_written "[[ ! -f \"$h1_dir/orch/handles.json\" ]]"
+assert H1_stdout_empty "[[ ! -s \"$h1_dir/stdout.log\" ]]"
+
+# --- H2 (Step 2): a send failure still leaves the handle in handles.json,
+# and reports on stderr rather than being swallowed.
+h2_dir="$tmpdir/h2"
+mkdir -p "$h2_dir/bin" "$h2_dir/orch"
+cat > "$h2_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_h2fail"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send") echo "stub: simulated send failure" >&2; exit 1 ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_h2fail","connected":true}]}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h2_dir/bin/orca"
+
+h2_rc=0
+(
+  export PATH="$h2_dir/bin:$PATH"
+  WORKTREE=active
+  ORCH="$h2_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$h2_dir/stdout.log" 2>"$h2_dir/stderr.log" || h2_rc=$?
+
+assert H2_ensure_terminal_fails "[[ \"$h2_rc\" -ne 0 ]]"
+assert H2_handle_in_handles_json "grep -q term_h2fail \"$h2_dir/orch/handles.json\""
+assert H2_stderr_not_swallowed "grep -qi seed \"$h2_dir/stderr.log\""
+assert H2_stdout_not_a_ready_handle "! grep -q term_h2fail \"$h2_dir/stdout.log\""
+
+# --- H3: a handles_set failure (simulated via HANDLES_FILE pointing at a
+# directory, so python's own open(path) raises) must be caught explicitly —
+# ensure_terminal must fail loud and never reach seed at all. This protects
+# the "durable before anything that can fail" ordering itself, not just its
+# most obvious failure mode (seed).
+h3_dir="$tmpdir/h3"
+mkdir -p "$h3_dir/bin"
+mkdir -p "$h3_dir/orch/handles.json"
+cat > "$h3_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_h3"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send")
+    touch "$ORCA_H3_MARKER_DIR/send-was-called"
+    echo '{"ok":true,"result":{"send":{"handle":"term_h3","accepted":true}}}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h3_dir/bin/orca"
+
+h3_rc=0
+(
+  export PATH="$h3_dir/bin:$PATH"
+  export ORCA_H3_MARKER_DIR="$h3_dir"
+  WORKTREE=active
+  ORCH="$h3_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$h3_dir/stdout.log" 2>"$h3_dir/stderr.log" || h3_rc=$?
+
+assert H3_ensure_terminal_fails "[[ \"$h3_rc\" -ne 0 ]]"
+assert H3_stderr_mentions_handles_set "grep -qi handles_set \"$h3_dir/stderr.log\""
+assert H3_seed_never_called "[[ ! -f \"$h3_dir/send-was-called\" ]]"
+
+# --- H4 (Step 3, unit level): terminal_is_live's three states.
+h4_dir="$tmpdir/h4"
+mkdir -p "$h4_dir/bin"
+
+cat > "$h4_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminals":[{"handle":"term_live","connected":true}]}}'
+exit 0
+ORCASTUB
+chmod +x "$h4_dir/bin/orca"
+h4a_rc=0
+( export PATH="$h4_dir/bin:$PATH"; terminal_is_live term_live ) || h4a_rc=$?
+assert H4_live_is_0 "[[ \"$h4a_rc\" -eq 0 ]]"
+
+cat > "$h4_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminals":[{"handle":"term_other","connected":true}]}}'
+exit 0
+ORCASTUB
+chmod +x "$h4_dir/bin/orca"
+h4b_rc=0
+( export PATH="$h4_dir/bin:$PATH"; terminal_is_live term_missing ) || h4b_rc=$?
+assert H4_dead_is_1 "[[ \"$h4b_rc\" -eq 1 ]]"
+
+cat > "$h4_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo "boom" >&2
+exit 3
+ORCASTUB
+chmod +x "$h4_dir/bin/orca"
+h4c_rc=0
+( export PATH="$h4_dir/bin:$PATH"; terminal_is_live term_whatever ) || h4c_rc=$?
+assert H4_command_failure_is_2 "[[ \"$h4c_rc\" -eq 2 ]]"
+
+cat > "$h4_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo 'not json at all {{{'
+exit 0
+ORCASTUB
+chmod +x "$h4_dir/bin/orca"
+h4d_rc=0
+( export PATH="$h4_dir/bin:$PATH"; terminal_is_live term_whatever ) || h4d_rc=$?
+assert H4_malformed_json_is_2 "[[ \"$h4d_rc\" -eq 2 ]]"
+
+# --- H5 (Step 3, integration): ensure_terminal must NOT create a second
+# terminal for a role that already has a handle when liveness is
+# undetermined. Pre-fix reproduction (this exact stub against a scratch copy
+# of the pre-fix library DID call `terminal create` and overwrite the
+# existing handle) is recorded in task-1-report.md.
+h5_dir="$tmpdir/h5"
+mkdir -p "$h5_dir/bin" "$h5_dir/orch"
+cat > "$h5_dir/orch/handles.json" <<'JSON'
+{"version":1,"roles":{"architect":{"handle":"term_h5existing"}},"architect":"term_h5existing"}
+JSON
+cat > "$h5_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create")
+    touch "$ORCA_H5_MARKER_DIR/create-was-called"
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_h5_SHOULD_NOT_EXIST"}}}'
+    ;;
+  "terminal list") echo "simulated list failure" >&2; exit 5 ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h5_dir/bin/orca"
+
+h5_rc=0
+(
+  export PATH="$h5_dir/bin:$PATH"
+  export ORCA_H5_MARKER_DIR="$h5_dir"
+  WORKTREE=active
+  ORCH="$h5_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$h5_dir/stdout.log" 2>"$h5_dir/stderr.log" || h5_rc=$?
+
+assert H5_ensure_terminal_succeeds "[[ \"$h5_rc\" -eq 0 ]]"
+assert H5_returns_existing_handle "grep -qx term_h5existing \"$h5_dir/stdout.log\""
+assert H5_no_duplicate_create "[[ ! -f \"$h5_dir/create-was-called\" ]]"
+assert H5_handles_json_unchanged \
+  "grep -q term_h5existing \"$h5_dir/orch/handles.json\" && ! grep -q SHOULD_NOT_EXIST \"$h5_dir/orch/handles.json\""
+
+# --- H6 (Step 4a): seed refuses a target that isn't term_*-shaped, with a
+# distinct message, and never calls `orca` at all.
+h6_dir="$tmpdir/h6"
+mkdir -p "$h6_dir/bin"
+cat > "$h6_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+touch "$ORCA_H6_MARKER_DIR/orca-was-called"
+echo '{"ok":true}'
+exit 0
+ORCASTUB
+chmod +x "$h6_dir/bin/orca"
+
+if h6_err="$(
+  export PATH="$h6_dir/bin:$PATH"
+  export ORCA_H6_MARKER_DIR="$h6_dir"
+  seed "not-a-term-handle" architect claude-opus-5 "fallback body" 2>&1
+)"; then
+  h6_rc=0
+else
+  h6_rc=$?
+fi
+assert H6_seed_refuses "[[ \"$h6_rc\" -ne 0 ]]"
+assert H6_distinct_message "printf '%s' \"\$h6_err\" | grep -qF 'term_*-shaped'"
+assert H6_orca_never_called "[[ ! -f \"$h6_dir/orca-was-called\" ]]"
+
+# --- H7 (Step 4b/4c): seed treats an unaccepted send, and a failed
+# read-back, as failures — not just a nonzero `orca terminal send` exit.
+h7_dir="$tmpdir/h7"
+mkdir -p "$h7_dir/bin"
+
+cat > "$h7_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_h7","accepted":false}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h7_dir/bin/orca"
+if h7a_err="$(
+  export PATH="$h7_dir/bin:$PATH"
+  seed "term_h7" architect claude-opus-5 "body" 2>&1
+)"; then h7a_rc=0; else h7a_rc=$?; fi
+assert H7_not_accepted_fails "[[ \"$h7a_rc\" -ne 0 ]]"
+assert H7_not_accepted_message "printf '%s' \"\$h7a_err\" | grep -qi 'not accepted'"
+
+cat > "$h7_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_h7b","accepted":true}}}' ;;
+  "terminal read") echo "read failed" >&2; exit 9 ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h7_dir/bin/orca"
+if h7b_err="$(
+  export PATH="$h7_dir/bin:$PATH"
+  seed "term_h7b" architect claude-opus-5 "body" 2>&1
+)"; then h7b_rc=0; else h7b_rc=$?; fi
+assert H7_readback_failure_fails "[[ \"$h7b_rc\" -ne 0 ]]"
+assert H7_readback_message "printf '%s' \"\$h7b_err\" | grep -qi 'could not confirm'"
+
+# --- H8: full happy-path ensure_terminal — the regression net for ordinary
+# dispatch of the six real roles. Also proves the exact bytes handed to
+# `orca terminal send` for a non-debater role are byte-identical to
+# seed_text()'s own output (non-debater seed text is required to stay
+# byte-frozen; this checks the wiring, not just the generator function).
+h8_dir="$tmpdir/h8"
+mkdir -p "$h8_dir/bin" "$h8_dir/orch"
+cat > "$h8_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_h8happy"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send")
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --text) printf '%s' "$2" > "$ORCA_H8_MARKER_DIR/sent-text.txt"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    echo '{"ok":true,"result":{"send":{"handle":"term_h8happy","accepted":true}}}'
+    ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_h8happy","tail":["ROLE=architect on model claude-opus-5"]}}}' ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_h8happy","connected":true}]}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$h8_dir/bin/orca"
+
+h8_rc=0
+(
+  unset PROJECT_NAME CONSTRAINTS
+  export PATH="$h8_dir/bin:$PATH"
+  export ORCA_H8_MARKER_DIR="$h8_dir"
+  WORKTREE=active
+  ORCH="$h8_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$h8_dir/stdout.log" 2>"$h8_dir/stderr.log" || h8_rc=$?
+
+assert H8_happy_path_succeeds "[[ \"$h8_rc\" -eq 0 ]]"
+assert H8_returns_handle "grep -qx term_h8happy \"$h8_dir/stdout.log\""
+assert H8_handles_json_has_handle "grep -q term_h8happy \"$h8_dir/orch/handles.json\""
+assert H8_journal_has_handle \
+  "python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])[\"handle\"])' \"$h8_dir/orch/terminal-journal.jsonl\" | grep -qx term_h8happy"
+EXPECTED_H8_TEXT="$(unset PROJECT_NAME CONSTRAINTS; seed_text architect claude-opus-5 "$(role_fallback_body architect)")"
+assert H8_sent_text_byte_exact \
+  "diff -q <(printf '%s' \"\$EXPECTED_H8_TEXT\") \"$h8_dir/sent-text.txt\" >/dev/null"
+
+# --- H9: the terminal journal is gitignored the same way handles.json is —
+# a behavioral check (real installer run, fresh project + idempotent
+# re-run), not a grep of the installer's own source, matching this repo's
+# existing T9_gitignore/T9_gitignore_no_dup pattern for handles.json/debates.
+# install-to-project.sh is pure bash+python (no `orca` runtime needed), so
+# this keeps the "no runtime required" contract.
+h9_root="$tmpdir/h9-project"
+mkdir -p "$h9_root"
+"$ROOT/scripts/install-to-project.sh" --project-root "$h9_root" --project-name h9-test >/dev/null 2>&1
+assert H9_gitignore_has_journal "grep -qF '.orca/orchestration/terminal-journal.jsonl' \"$h9_root/.gitignore\""
+"$ROOT/scripts/install-to-project.sh" --project-root "$h9_root" --project-name h9-test >/dev/null 2>&1
+h9_count=$(grep -cF '.orca/orchestration/terminal-journal.jsonl' "$h9_root/.gitignore" 2>/dev/null || true)
+assert H9_gitignore_no_dup "[[ \"$h9_count\" -eq 1 ]]"
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

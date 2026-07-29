@@ -49,13 +49,25 @@ if [[ -z "$TASK_ID" || -z "$HANDLE" ]]; then
 fi
 
 close_handle() {
-  local h="$1"
+  local h="$1" live_rc=0
   if [[ -z "$h" || "$h" != term_* ]]; then
     return 0
   fi
-  if ! terminal_is_live "$h" 2>/dev/null; then
+  # terminal_is_live's 3-state contract: 0 live / 1 definitely dead / 2 could
+  # not determine. Only a definite dead short-circuits here — an
+  # undetermined result must NOT be treated as "already gone" (the reap loop
+  # decided to close based on the dispatch's own status, not on this check;
+  # an inconclusive `orca terminal list` shouldn't override that). The close
+  # attempt below is the same idempotent call already used for a
+  # confirmed-live handle and already tolerates one that turns out to be
+  # gone, so falling through on "undetermined" is safe either way.
+  terminal_is_live "$h" 2>/dev/null || live_rc=$?
+  if [[ "$live_rc" -eq 1 ]]; then
     echo "reap: $h already gone"
     return 0
+  fi
+  if [[ "$live_rc" -eq 2 ]]; then
+    echo "reap: $h liveness undetermined (orca terminal list unavailable) — attempting close anyway"
   fi
   echo "reap: closing $h (tab)"
   if orca terminal close --terminal "$h" --tab --json >/dev/null 2>&1 \

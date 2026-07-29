@@ -46,9 +46,23 @@ if [[ -z "${HANDLE// }" ]]; then
   exit 0
 fi
 
-if ! terminal_is_live "$HANDLE"; then
+# terminal_is_live's 3-state contract: 0 live / 1 definitely dead / 2 could
+# not determine. Only a definite dead short-circuits here — an undetermined
+# result must NOT be treated as "already gone" (that's the same mistake that
+# used to let ensure_terminal spin up a duplicate terminal). Note this is a
+# different question from ensure_terminal's "leave it alone, don't recreate":
+# here the caller explicitly asked to close, and the close attempt below is
+# the same idempotent call already used for a confirmed-live handle — it
+# already tolerates a handle that turns out to be gone (see the trailing
+# else branch), so falling through on "undetermined" is safe either way.
+CLOSE_LIVE_RC=0
+terminal_is_live "$HANDLE" || CLOSE_LIVE_RC=$?
+if [[ "$CLOSE_LIVE_RC" -eq 1 ]]; then
   echo "Handle $HANDLE already gone (ok)"
   exit 0
+fi
+if [[ "$CLOSE_LIVE_RC" -eq 2 ]]; then
+  echo "Handle $HANDLE liveness undetermined (orca terminal list unavailable) — attempting close anyway" >&2
 fi
 
 echo "Closing $TARGET → $HANDLE (tab)"

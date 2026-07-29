@@ -13,3 +13,6 @@
 
 # Orca local runtime state
 .orca/orchestration/debates/
+
+# Orca local runtime state
+.orca/orchestration/terminal-journal.jsonl
