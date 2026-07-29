@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap role workers: architect (Opus 4.8), executor (Sol), thrifty (Grok 4.5),
-# fallback (agy Gemini 3.5 Flash Medium).
+# Bootstrap the four primary role workers. Models come from orca-roles-lib.sh
+# (role_meta / role_launch_cmd) — never hardcode them here.
 # Tabs are ephemeral after supervised worker_done (coordinator closes; dispatch recreates).
 set -euo pipefail
 
@@ -68,46 +68,42 @@ wait_idle "$SOL_HANDLE"
 wait_idle "$GROK_HANDLE"
 wait_idle "$FALLBACK_HANDLE"
 
-seed "$ARCH_HANDLE" architect "Claude Opus 4.8" "$(role_fallback_body architect)"
-seed "$SOL_HANDLE" executor "GPT-5.6 Sol" "$(role_fallback_body executor)"
-seed "$GROK_HANDLE" thrifty "Grok 4.5" "$(role_fallback_body thrifty)"
-seed "$FALLBACK_HANDLE" fallback "Antigravity Gemini 3.5 Flash (Medium)" "$(role_fallback_body fallback)"
+seed "$ARCH_HANDLE"     architect "$(role_meta architect | cut -f2)" "$(role_fallback_body architect)"
+seed "$SOL_HANDLE"      executor  "$(role_meta executor  | cut -f2)" "$(role_fallback_body executor)"
+seed "$GROK_HANDLE"     thrifty   "$(role_meta thrifty   | cut -f2)" "$(role_fallback_body thrifty)"
+seed "$FALLBACK_HANDLE" fallback  "$(role_meta fallback  | cut -f2)" "$(role_fallback_body fallback)"
 
-python3 - "$HANDLES_FILE" "$ARCH_HANDLE" "$SOL_HANDLE" "$GROK_HANDLE" "$FALLBACK_HANDLE" "$WORKTREE" <<'PY'
-import json, sys, datetime
-path, arch, sol, grok, fallback, wt = sys.argv[1:7]
-data = {
-  "version": 1,
-  "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-  "worktree": wt,
-  "architect": arch,
-  "executor": sol,
-  "thrifty": grok,
-  "fallback": fallback,
-  "roles": {
-    "architect": {"handle": arch, "title": "role-opus-architect", "model": "claude-opus-4-8", "agent": "claude"},
-    "executor":  {"handle": sol,  "title": "role-sol-executor",   "model": "gpt-5.6-sol",     "agent": "codex"},
-    "thrifty":   {"handle": grok, "title": "role-grok-thrifty",   "model": "grok-4.5",        "agent": "grok"},
-    "fallback":  {
-      "handle": fallback, "title": "role-agy-fallback",
-      "model": "Gemini 3.5 Flash (Medium)", "agent": "antigravity", "cli": "agy",
-    },
-  },
-  "limit_failover": {
+python3 - "$HANDLES_FILE" "$WORKTREE" <<'PY'
+import json, os, sys, datetime
+path, worktree = sys.argv[1:3]
+data = {"version": 1, "worktree": worktree, "roles": {}}
+if os.path.exists(path):
+    try:
+        loaded = json.load(open(path))
+        if isinstance(loaded, dict):
+            data = loaded
+            data["worktree"] = worktree
+    except Exception:
+        pass
+data.setdefault("roles", {})
+data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+data["routing_ssot"] = ".orca/orchestration/roles.yaml"
+data["playbook"] = ".orca/orchestration/PLAYBOOK.md"
+data["limit_failover"] = {
     "enabled": True,
     "target_role": "fallback",
-    "model": "Gemini 3.5 Flash (Medium)",
     "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
-  },
-  "routing_ssot": ".orca/orchestration/roles.yaml",
-  "playbook": ".orca/orchestration/PLAYBOOK.md",
 }
 with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
-print(f"Wrote {path}")
-print(json.dumps(data["roles"], indent=2))
 PY
+
+handles_set "$HANDLES_FILE" architect "$ARCH_HANDLE"
+handles_set "$HANDLES_FILE" executor  "$SOL_HANDLE"
+handles_set "$HANDLES_FILE" thrifty   "$GROK_HANDLE"
+handles_set "$HANDLES_FILE" fallback  "$FALLBACK_HANDLE"
+echo "Wrote $HANDLES_FILE"
 
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
 echo "After dispatch: worker tabs auto-close (background reaper + worker AUTO-CLOSE)."

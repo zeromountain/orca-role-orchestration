@@ -112,6 +112,39 @@ rm -rf "$legacy"
 # --- T8 no secrets ---
 assert T8_no_secrets "! grep -rE '(BEGIN .*PRIVATE KEY|sk-[A-Za-z0-9]{20,})' \"$ORCH\" >/dev/null 2>&1"
 
+# --- T9 debate scaffold ---
+assert T9_script_debate "[[ -x \"$ORCH/scripts/orca-debate.sh\" ]]"
+assert T9_script_round "[[ -x \"$ORCH/scripts/orca-debate-round.sh\" ]]"
+assert T9_script_lib "[[ -f \"$ORCH/scripts/orca-debate-lib.sh\" ]]"
+assert T9_personas "[[ -f \"$ORCH/personas/debater_claude.md\" && -f \"$ORCH/personas/debater_gemini.md\" ]]"
+assert T9_roles_yaml "grep -q 'debater_claude' \"$ORCH/roles.yaml\""
+assert T9_routing "grep -q 'idea_debate' \"$ORCH/roles.yaml\""
+assert T9_gitignore "grep -q '.orca/orchestration/debates' \"$tmpdir/.gitignore\""
+assert T9_no_round_prompts "! grep -q 'Weakest link' \"$ORCH/roles.yaml\""
+
+# T9_gitignore_no_dup: $ORCH's gitignore has been through T1 (fresh), T2 (re-run),
+# T3, T4, T5 (fork), T6 (--reset) by this point in the script — a real idempotency
+# check across many re-runs, not just the single re-run T2 covers for other files.
+gi_debate_count=$(grep -c '.orca/orchestration/debates/' "$tmpdir/.gitignore" 2>/dev/null || true)
+assert T9_gitignore_no_dup "[[ \"$gi_debate_count\" -eq 1 ]]"
+
+# --- T10 role metadata is single-sourced ---
+assert T10_bootstrap_no_stale "! grep -qE 'claude-opus-4-8|Gemini 3\\.5' \"$ORCH/scripts/orca-bootstrap-roles.sh\""
+
+# T10_agents_no_stale: the brief's original assertion checked $tmpdir/AGENTS.md
+# (== $ORCH/../../AGENTS.md), but T1's install target never has an AGENTS.md —
+# the installer only appends to one that already exists (install-to-project.sh
+# "Optional AGENTS.md snippet" step) — so `! grep ... nonexistent-file` is
+# vacuously true even before any fix, and the brief's trailing `|| true` makes
+# it doubly unfalsifiable. Exercise the real append path instead: seed a stub
+# AGENTS.md in a fresh project root, install for real, check the roster.
+agentsdir="$(mktemp -d)"
+printf '# Test Project\n' > "$agentsdir/AGENTS.md"
+"$INSTALL" --project-root "$agentsdir" --project-name agents-test >/tmp/install-t10.out
+assert T10_agents_no_stale "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$agentsdir/AGENTS.md\""
+assert T10_agents_debater "grep -q 'debater_' \"$agentsdir/AGENTS.md\""
+rm -rf "$agentsdir"
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then
