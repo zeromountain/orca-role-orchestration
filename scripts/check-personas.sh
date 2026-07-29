@@ -5,7 +5,13 @@
 set -euo pipefail
 
 DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)/templates/personas}"
-ROLES=(architect executor thrifty fallback coordinator)
+# Every persona: H1 + non-empty STANCE (the parts the scripts consume).
+ALL_ROLES=(architect executor thrifty ui reviewer fallback coordinator
+           debater_claude debater_codex debater_grok debater_gemini)
+# Nine-section skeleton. ui/reviewer use a different, later structure by design.
+SKELETON_ROLES=(architect executor thrifty fallback coordinator
+                debater_claude debater_codex debater_grok debater_gemini)
+
 SECTIONS=(
   '**Who you are.**'
   '**Mission.**'
@@ -18,8 +24,16 @@ SECTIONS=(
   '**Never.**'
 )
 
+is_skeleton_role() {
+  local role="$1" r
+  for r in "${SKELETON_ROLES[@]}"; do
+    [[ "$r" == "$role" ]] && return 0
+  done
+  return 1
+}
+
 fail=0
-for role in "${ROLES[@]}"; do
+for role in "${ALL_ROLES[@]}"; do
   f="$DIR/$role.md"
   if [[ ! -f "$f" ]]; then
     echo "MISSING: $f"; fail=1; continue
@@ -31,11 +45,13 @@ for role in "${ROLES[@]}"; do
   if [[ -z "${stance// }" ]]; then
     echo "EMPTY STANCE: $f"; fail=1
   fi
-  for s in "${SECTIONS[@]}"; do
-    if ! grep -Fq "$s" "$f"; then
-      echo "MISSING SECTION [$s]: $f"; fail=1
-    fi
-  done
+  if is_skeleton_role "$role"; then
+    for s in "${SECTIONS[@]}"; do
+      if ! grep -Fq "$s" "$f"; then
+        echo "MISSING SECTION [$s]: $f"; fail=1
+      fi
+    done
+  fi
 done
 
 if [[ "$fail" -eq 0 ]]; then
