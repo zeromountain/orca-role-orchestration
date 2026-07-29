@@ -228,6 +228,118 @@ S3="$(debate_spec converge grok "$tmpdir" 3 "$tmpdir/round-3/grok.md" C "$TOPIC"
 assert D7_conv_paths "printf '%s' \"\$S3\" | grep -q 'round-3/critique-'"
 assert D7_conv_head  "printf '%s' \"\$S3\" | grep -q '## Dissent'"
 
+# --- E1 round script dry-run (no Orca runtime touched) ---
+ROUND="$ROOT/scripts/orca-debate-round.sh"
+DEB="$tmpdir/debate"
+mkdir -p "$DEB"
+printf 'TOPIC_E1\n' > "$DEB/topic.md"
+
+assert E1_exec "[[ -x \"$ROUND\" ]]"
+assert E1_needs_args "! \"$ROUND\" >/dev/null 2>&1"
+
+OUT="$("$ROUND" --dir "$DEB" --round 1 --phase propose --dry-run 2>&1)"
+assert E1_dry_four   "[[ \"\$(printf '%s' \"\$OUT\" | grep -c '^===== debater_')\" == '4' ]]"
+assert E1_dry_topic  "printf '%s' \"\$OUT\" | grep -q TOPIC_E1"
+assert E1_dry_nodisp "! printf '%s' \"\$OUT\" | grep -q 'Creating task'"
+assert E1_dry_subset "[[ \"\$(\"$ROUND\" --dir \"$DEB\" --round 1 --phase propose --debaters claude,grok --dry-run 2>&1 | grep -c '^===== debater_')\" == '2' ]]"
+
+# --- E2 collection + quorum, with dispatch and polling stubbed ---
+STUB="$tmpdir/stubbin"
+mkdir -p "$STUB"
+cat > "$STUB/orca-dispatch-role.sh" <<'SH'
+#!/usr/bin/env bash
+# stub: echo a task id, write the debater's output file from the spec's target path
+role="$1"; shift
+spec=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --spec) spec="$2"; shift 2 ;; *) shift ;; esac
+done
+target="$(printf '%s' "$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+mkdir -p "$(dirname "$target")"
+{
+  echo "# stub"
+  echo "## Prior art"
+  echo "## Proposals"
+  echo "- Weakest link: stub"
+  echo "## Directions I deliberately rejected"
+} > "$target"
+echo "task_id=task_${role}"
+SH
+chmod +x "$STUB/orca-dispatch-role.sh"
+
+DEB2="$tmpdir/debate2"
+mkdir -p "$DEB2"
+printf 'TOPIC_E2\n' > "$DEB2/topic.md"
+ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
+ORCA_DEBATE_STATUS_STUB=completed \
+"$ROUND" --dir "$DEB2" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1
+assert E2_files "[[ -f \"$DEB2/round-1/claude.md\" && -f \"$DEB2/round-1/gemini.md\" ]]"
+assert E2_manifest "[[ -f \"$DEB2/round-1/manifest.json\" ]]"
+assert E2_anon "[[ -f \"$DEB2/round-2/proposal-A.md\" ]]"
+assert E2_map "[[ -f \"$DEB2/round-2/label-map.json\" ]]"
+
+# quorum failure: stub reports failed for everyone
+DEB3="$tmpdir/debate3"
+mkdir -p "$DEB3"
+printf 'TOPIC_E3\n' > "$DEB3/topic.md"
+# The round script exits 2 here by design, so the call must be if-guarded:
+# tests/debate.sh runs under `set -e`, which would otherwise abort the suite.
+if ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
+   ORCA_DEBATE_STATUS_STUB=failed \
+   "$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1; then
+  QUORUM_RC=0
+else
+  QUORUM_RC=$?
+fi
+assert E2_quorum_exit "[[ $QUORUM_RC -eq 2 ]]"
+assert E2_quorum_no_anon "[[ ! -f \"$DEB3/round-2/proposal-A.md\" ]]"
+
+# --- E4 a single dispatcher failure is forfeited, not fatal ---
+# Regression for `tid=$(dispatch | awk ...)` under `set -euo pipefail`: if the
+# real dispatcher exits non-zero mid-fanout, pipefail makes that assignment's
+# exit status non-zero and (per the same `local`-vs-bare-assignment rule
+# documented in orca-debate-lib.sh's debate_lint) a bare `tid=$(...)` is NOT
+# exempt from `set -e` the way a `local tid=$(...)` would be — so the whole
+# round script would abort mid-fanout instead of forfeiting just that debater.
+cat > "$STUB/orca-dispatch-role-fail1.sh" <<'SH'
+#!/usr/bin/env bash
+# stub: same as orca-dispatch-role.sh, but debater_codex's dispatch fails outright.
+role="$1"; shift
+spec=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --spec) spec="$2"; shift 2 ;; *) shift ;; esac
+done
+if [[ "$role" == "debater_codex" ]]; then
+  echo "stub: simulated dispatcher failure" >&2
+  exit 1
+fi
+target="$(printf '%s' "$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+mkdir -p "$(dirname "$target")"
+{
+  echo "# stub"
+  echo "## Prior art"
+  echo "## Proposals"
+  echo "- Weakest link: stub"
+  echo "## Directions I deliberately rejected"
+} > "$target"
+echo "task_id=task_${role}"
+SH
+chmod +x "$STUB/orca-dispatch-role-fail1.sh"
+
+DEB4="$tmpdir/debate4"
+mkdir -p "$DEB4"
+printf 'TOPIC_E4\n' > "$DEB4/topic.md"
+# Quorum (3 of 4) should still be met, so the round script is expected to exit 0 —
+# but capture the real exit code rather than assuming it, since a regression here
+# would abort the whole script, not merely flip 0 to 2.
+E4_RC=0
+ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role-fail1.sh" \
+ORCA_DEBATE_STATUS_STUB=completed \
+"$ROUND" --dir "$DEB4" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1 || E4_RC=$?
+assert E4_survives_fail   "[[ $E4_RC -eq 0 ]]"
+assert E4_others_present  "[[ -f \"$DEB4/round-1/claude.md\" && -f \"$DEB4/round-1/gemini.md\" && -f \"$DEB4/round-1/grok.md\" ]]"
+assert E4_forfeit_missing "[[ ! -s \"$DEB4/round-1/codex.md\" ]]"
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1
