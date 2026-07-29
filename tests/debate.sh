@@ -55,20 +55,44 @@ assert R4_body_included    "seed_text architect claude-opus-5 'MARKER_BODY' | gr
 
 # --- R5 dispatch/close role whitelists ---
 DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
-CLOSE="$ROOT/scripts/orca-close-role.sh"
 
-# orca-dispatch-role.sh checks handles.json before the role whitelist (by design —
-# an accepted role must still fail on missing handles.json). The real repo has no
-# handles.json, so a direct invocation never reaches the whitelist check at all —
-# a real invocation would exit on the handles error for every role, junk or not.
-# Sandbox a copy with a stub handles.json so the whitelist is actually exercised,
-# without ever touching the real Orca CLI: with no --spec, an accepted role exits
-# cleanly at "--spec or --spec-file required" before any orca/python3 call.
+# Both role-whitelist scripts are sandboxed into separate directories under
+# $tmpdir before being invoked here, so this file's "Pure: no Orca runtime
+# required" claim (see top of file) holds unconditionally rather than merely
+# by accident of the checkout's current state. Concretely:
+#
+#   orca-dispatch-role.sh checks handles.json *before* its role whitelist (by
+#   design — an accepted role must still fail on missing handles.json). A
+#   direct invocation against the real repo (which has no handles.json) would
+#   hit that check for every role, junk or accepted, and never reach the
+#   whitelist at all. dispatch_sandbox gets a STUB handles.json one level up
+#   so the whitelist is actually exercised — safely, since with no --spec an
+#   accepted role still exits cleanly at "--spec or --spec-file required"
+#   before any orca/python3 call.
+#
+#   orca-close-role.sh checks its whitelist *before* handles.json, so an
+#   accepted role in a direct invocation would fall through to handles_get →
+#   terminal_is_live → `orca terminal close`, i.e. it would make real calls
+#   into a live, functional `orca` CLI the moment a handles.json exists at the
+#   repo root (e.g. after `orca-bootstrap-roles.sh` runs) — latent today only
+#   because that file happens to be absent. close_sandbox deliberately gets
+#   NO handles.json, so an accepted role stops at the script's own "No
+#   .../handles.json — nothing to close (ok)" branch and never reaches
+#   handles_get or any orca call, regardless of what exists at the real repo
+#   root.
+#
+# The two sandboxes are separate directories (not shared) precisely because
+# one needs a stub handles.json and the other must never have one.
 dispatch_sandbox="$tmpdir/dispatch-sandbox/scripts"
 mkdir -p "$dispatch_sandbox"
 cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$dispatch_sandbox/"
 echo '{}' >"$tmpdir/dispatch-sandbox/handles.json"
 DISPATCH_SANDBOXED="$dispatch_sandbox/orca-dispatch-role.sh"
+
+close_sandbox="$tmpdir/close-sandbox/scripts"
+mkdir -p "$close_sandbox"
+cp "$ROOT/scripts/orca-close-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$close_sandbox/"
+CLOSE_SANDBOXED="$close_sandbox/orca-close-role.sh"
 
 # Capture output and exit status separately from the grep check. Under
 # `set -o pipefail` (this file), a script that legitimately exits 1 on its error
@@ -76,7 +100,7 @@ DISPATCH_SANDBOXED="$dispatch_sandbox/orca-dispatch-role.sh"
 # leading `!`, falsely flip) whatever grep actually matched. Capturing first and
 # grepping the captured string keeps the assertion honest.
 r5_dispatch_junk_out="$("$DISPATCH_SANDBOXED" not_a_role 2>&1 || true)"
-r5_close_junk_out="$("$CLOSE" not_a_role 2>&1 || true)"
+r5_close_junk_out="$("$CLOSE_SANDBOXED" not_a_role 2>&1 || true)"
 
 # Unknown roles must be rejected with the role error, not a handles error.
 assert R5_dispatch_rejects_junk \
@@ -88,7 +112,7 @@ assert R5_close_rejects_junk \
 # (dispatch: missing --spec; close: missing handles.json) — never "role must be".
 for r in ui reviewer debater_claude debater_codex debater_grok debater_gemini; do
   d_out="$("$DISPATCH_SANDBOXED" "$r" 2>&1 || true)"
-  c_out="$("$CLOSE" "$r" 2>&1 || true)"
+  c_out="$("$CLOSE_SANDBOXED" "$r" 2>&1 || true)"
   assert "R5_dispatch_accepts_$r" \
     "! printf '%s' \"\$d_out\" | grep -q 'role must be'"
   assert "R5_close_accepts_$r" \
