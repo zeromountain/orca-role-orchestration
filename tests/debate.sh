@@ -340,6 +340,57 @@ assert E4_survives_fail   "[[ $E4_RC -eq 0 ]]"
 assert E4_others_present  "[[ -f \"$DEB4/round-1/claude.md\" && -f \"$DEB4/round-1/gemini.md\" && -f \"$DEB4/round-1/grok.md\" ]]"
 assert E4_forfeit_missing "[[ ! -s \"$DEB4/round-1/codex.md\" ]]"
 
+# --- F1 driver argument handling and preflight ---
+DRIVER="$ROOT/scripts/orca-debate.sh"
+assert F1_exec "[[ -x \"$DRIVER\" ]]"
+assert F1_needs_topic "! \"$DRIVER\" >/dev/null 2>&1"
+assert F1_help "\"$DRIVER\" --help | grep -q -- '--judge'"
+
+# A roster that cannot reach three seats must abort before creating anything.
+FEW_OUT="$("$DRIVER" --topic 'x' --debaters claude --dry-run 2>&1 || true)"
+assert F1_min_roster "printf '%s' \"\$FEW_OUT\" | grep -q 'Fewer than 3'"
+assert F1_preflight_probes "grep -q 'command -v' \"$DRIVER\""
+
+# Capture rc and output separately, then grep the captured string. A direct
+# `"$DRIVER" ... | grep ...` here would run under this file's `set -o
+# pipefail`: the driver correctly exits non-zero for --rounds 9, and pipefail
+# reports THAT exit status for the whole pipeline even when grep matches on
+# the right — the same masking gotcha the R5/D5 blocks above already document
+# and work around (confirmed by direct reproduction: a fake driver that exits
+# 1 after printing the target substring makes an unguarded `driver | grep -q
+# pattern` assertion report FAIL 100% of the time, regardless of whether the
+# substring was actually present). Written as a direct pipe, this assertion
+# could never pass no matter how correct --rounds validation is.
+f1_rounds_rc=0
+f1_rounds_out="$("$DRIVER" --topic 'x' --rounds 9 2>&1)" || f1_rounds_rc=$?
+assert F1_rounds_bounded "[[ \"\$f1_rounds_rc\" -ne 0 ]] && printf '%s' \"\$f1_rounds_out\" | grep -q 'must be 1, 2, or 3'"
+
+# --- F2 dry-run wiring ---
+OUT2="$("$DRIVER" --topic 'Local First Note App' --dir-root "$tmpdir/debates" --dry-run 2>&1)"
+assert F2_slug   "printf '%s' \"\$OUT2\" | grep -q 'local-first-note-app'"
+assert F2_topic  "[[ -f \"$tmpdir/debates/local-first-note-app/topic.md\" ]]"
+assert F2_rounds "[[ \"\$(printf '%s' \"\$OUT2\" | grep -c 'ROUND')\" -ge 3 ]]"
+assert F2_slug_override "\"$DRIVER\" --topic 'x' --slug custom-slug --dir-root \"$tmpdir/debates\" --dry-run >/dev/null 2>&1 && [[ -d \"$tmpdir/debates/custom-slug\" ]]"
+
+# --- F3 transcript assembly is pure and testable ---
+# A dedicated dir (not $tmpdir/debate4, already owned by the E4 block above)
+# — reusing that path would silently mix this fixture with E4's leftover
+# round-1/round-2 files (label-map.json, proposal-*.md, gemini.md, grok.md);
+# harmless to these specific assertions since the transcript builder filters
+# proposal-*/critique-* and the greps below don't assert absence-of-content,
+# but there's no reason to depend on that and every reason to keep F3 isolated.
+DEBF3="$tmpdir/debate-f3"
+mkdir -p "$DEBF3/round-1" "$DEBF3/round-3"
+printf 'TOPIC_F3\n' > "$DEBF3/topic.md"
+printf '# a\nAAA\n' > "$DEBF3/round-1/claude.md"
+printf '# b\nBBB\n' > "$DEBF3/round-3/grok.md"
+source "$ROOT/scripts/orca-debate-lib.sh"
+"$DRIVER" --build-transcript "$DEBF3" >/dev/null 2>&1
+assert F3_transcript "[[ -f \"$DEBF3/transcript.md\" ]]"
+assert F3_has_topic  "grep -q TOPIC_F3 \"$DEBF3/transcript.md\""
+assert F3_has_both   "grep -q AAA \"$DEBF3/transcript.md\" && grep -q BBB \"$DEBF3/transcript.md\""
+assert F3_attributed "grep -q 'claude' \"$DEBF3/transcript.md\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1
