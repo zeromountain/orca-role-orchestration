@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Unit tests for the debate library and role-library additions.
 # Pure: no Orca runtime required.
-set -uo pipefail
+set -euo pipefail
+# assert() runs its command as an `if` condition, which -e never trips on.
+# Any other command expected to fail must be if-guarded (see the quorum test).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0
