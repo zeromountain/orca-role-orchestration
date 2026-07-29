@@ -128,6 +128,97 @@ assert R6_usage_persist "printf '%s' \"\$r6_usage_out\" | grep -q -- '--persist'
 # pre-existing --no-reap branch already contains that literal substring).
 assert R6_persist_implies_noreap "grep -q -- '--persist).*NO_REAP=1' \"$DISPATCH\""
 
+# `source` is a POSIX "special builtin": under `set -e`, its own file-not-found
+# failure kills the whole script immediately, bypassing `|| true` and even an
+# `if source ...; then` guard (verified against this repo's bash 3.2). So this
+# checks existence first and never calls `source` on a path that isn't there.
+# shellcheck source=../scripts/orca-debate-lib.sh
+if [[ -f "$ROOT/scripts/orca-debate-lib.sh" ]]; then
+  source "$ROOT/scripts/orca-debate-lib.sh"
+fi
+
+# --- D1 name mapping ---
+assert D1_role_key   "[[ \"\$(debate_role_key grok)\" == 'debater_grok' ]]"
+assert D1_short      "[[ \"\$(debate_short_name debater_gemini)\" == 'gemini' ]]"
+assert D1_default    "[[ \"\$DEBATERS_DEFAULT\" == 'claude,codex,grok,gemini' ]]"
+
+# --- D2 slugify ---
+assert D2_spaces  "[[ \"\$(debate_slugify 'Local First Note App')\" == 'local-first-note-app' ]]"
+assert D2_punct   "[[ \"\$(debate_slugify 'A/B: test!!')\" == 'a-b-test' ]]"
+assert D2_empty   "[[ \"\$(debate_slugify '!!!')\" == 'debate' ]]"
+
+# --- D3 label map ---
+MAP="$tmpdir/round-2/label-map.json"
+debate_label_map_create "$MAP" "claude,codex,grok,gemini" >/dev/null
+assert D3_file    "[[ -f \"$MAP\" ]]"
+assert D3_claude  "[[ \"\$(debate_label_of \"$MAP\" claude)\" == 'A' ]]"
+assert D3_gemini  "[[ \"\$(debate_label_of \"$MAP\" gemini)\" == 'D' ]]"
+# stable across calls
+debate_label_map_create "$MAP" "gemini,grok,codex,claude" >/dev/null
+assert D3_stable  "[[ \"\$(debate_label_of \"$MAP\" claude)\" == 'A' ]]"
+
+# --- D4 anonymize ---
+# Body placeholders deliberately avoid the substring "claude"/"grok" — the H1
+# line is what identifies the author and gets dropped; if the body placeholder
+# itself contained the debater's name, D4_name_gone could never pass even with
+# correct H1-only redaction, since it greps the body, not just the H1.
+mkdir -p "$tmpdir/round-1"
+printf '# R1 proposal — claude (Principle & risk)\n\nBODY_TEXT_ONE\n' > "$tmpdir/round-1/claude.md"
+printf '# R1 proposal — grok (Contrarian)\n\nBODY_TEXT_TWO\n' > "$tmpdir/round-1/grok.md"
+debate_anonymize "$MAP" "$tmpdir/round-1" "$tmpdir/round-2" proposal >/dev/null
+assert D4_a_exists  "[[ -f \"$tmpdir/round-2/proposal-A.md\" ]]"
+assert D4_c_exists  "[[ -f \"$tmpdir/round-2/proposal-C.md\" ]]"
+assert D4_body_kept "grep -q BODY_TEXT_ONE \"$tmpdir/round-2/proposal-A.md\""
+assert D4_name_gone "! grep -qi 'claude' \"$tmpdir/round-2/proposal-A.md\""
+assert D4_missing_skipped "[[ ! -f \"$tmpdir/round-2/proposal-B.md\" ]]"
+
+# --- D5 lint ---
+GOOD="$tmpdir/good.md"
+cat > "$GOOD" <<'MD'
+# x
+## Prior art
+## Proposals
+- Weakest link: yes
+## Directions I deliberately rejected
+MD
+BAD="$tmpdir/bad.md"
+printf '## Proposals\n' > "$BAD"
+assert D5_good_passes "debate_lint \"$GOOD\" propose >/dev/null"
+assert D5_bad_fails   "! debate_lint \"$BAD\" propose >/dev/null"
+# debate_lint returns 1 by design here (see file header), so under this file's
+# `set -o pipefail` a direct `debate_lint ... | grep ...` pipeline is poisoned:
+# pipefail reports the pipeline's status as non-zero (from debate_lint) even
+# when grep matches, exactly the gotcha the R5 block above already documents
+# and works around. So capture stderr first (guarded with `|| true` since the
+# call is expected to fail), then grep the captured text — matching the R5
+# pattern instead of piping directly.
+d5_bad_report="$(debate_lint "$BAD" propose 2>&1 || true)"
+assert D5_bad_reports "printf '%s' \"\$d5_bad_report\" | grep -q 'Prior art'"
+
+# --- D6 manifest ---
+MAN="$tmpdir/manifest.json"
+debate_manifest_append "$MAN" claude task_1 completed ok
+debate_manifest_append "$MAN" grok task_2 failed forfeit
+assert D6_two_rows "[[ \"\$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' \"$MAN\")\" == '2' ]]"
+assert D6_flag     "python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[1][\"flags\"])' \"$MAN\" | grep -q forfeit"
+
+# --- D7 spec builders ---
+TOPIC="$tmpdir/topic.md"
+printf 'TOPIC_MARKER\n' > "$TOPIC"
+S1="$(debate_spec propose claude "$tmpdir" 1 "$tmpdir/round-1/claude.md" A "$TOPIC")"
+assert D7_propose_topic  "printf '%s' \"\$S1\" | grep -q TOPIC_MARKER"
+assert D7_propose_out    "printf '%s' \"\$S1\" | grep -q 'round-1/claude.md'"
+assert D7_propose_head   "printf '%s' \"\$S1\" | grep -q '## Prior art'"
+assert D7_propose_source "printf '%s' \"\$S1\" | grep -q '미검증'"
+assert D7_propose_ro     "printf '%s' \"\$S1\" | grep -q 'Never run git commit'"
+S2="$(debate_spec critique codex "$tmpdir" 2 "$tmpdir/round-2/codex.md" B "$TOPIC")"
+assert D7_crit_paths "printf '%s' \"\$S2\" | grep -q 'round-2/proposal-'"
+assert D7_crit_own   "printf '%s' \"\$S2\" | grep -q 'Proposal B is your own'"
+assert D7_crit_head  "printf '%s' \"\$S2\" | grep -q '## Ranking'"
+S3="$(debate_spec converge grok "$tmpdir" 3 "$tmpdir/round-3/grok.md" C "$TOPIC")"
+assert D7_conv_paths "printf '%s' \"\$S3\" | grep -q 'round-3/critique-'"
+assert D7_conv_head  "printf '%s' \"\$S3\" | grep -q '## Dissent'"
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1
