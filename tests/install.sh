@@ -117,8 +117,14 @@ assert T9_script_debate "[[ -x \"$ORCH/scripts/orca-debate.sh\" ]]"
 assert T9_script_round "[[ -x \"$ORCH/scripts/orca-debate-round.sh\" ]]"
 assert T9_script_lib "[[ -f \"$ORCH/scripts/orca-debate-lib.sh\" ]]"
 assert T9_personas "[[ -f \"$ORCH/personas/debater_claude.md\" && -f \"$ORCH/personas/debater_gemini.md\" ]]"
-assert T9_roles_yaml "grep -q 'debater_claude' \"$ORCH/roles.yaml\""
-assert T9_routing "grep -q 'idea_debate' \"$ORCH/roles.yaml\""
+# Scope each grep to the section it names. A bare file-wide grep passes on a
+# partial rollback, because dags.idea_debate independently contains both
+# literals — the role block and the routing entry could both be gone while
+# the assertion still reported green.
+assert T9_roles_yaml \
+  "awk '/^roles:/,/^routing_table:/' \"$ORCH/roles.yaml\" | grep -q 'debater_claude:'"
+assert T9_routing \
+  "awk '/^routing_table:/,/^dags:/' \"$ORCH/roles.yaml\" | grep -q 'match: idea_debate'"
 assert T9_gitignore "grep -q '.orca/orchestration/debates' \"$tmpdir/.gitignore\""
 assert T9_no_round_prompts "! grep -q 'Weakest link' \"$ORCH/roles.yaml\""
 
