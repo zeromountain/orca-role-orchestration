@@ -365,6 +365,18 @@ f1_rounds_rc=0
 f1_rounds_out="$("$DRIVER" --topic 'x' --rounds 9 2>&1)" || f1_rounds_rc=$?
 assert F1_rounds_bounded "[[ \"\$f1_rounds_rc\" -ne 0 ]] && printf '%s' \"\$f1_rounds_out\" | grep -q 'must be 1, 2, or 3'"
 
+# --- F4 an unknown debater name is diagnosed, not a silent crash ---
+# role_launch_cmd exits 1 for a name it doesn't recognize; a bare
+# `cli=$(role_launch_cmd ... | awk ...)` in the preflight loop would let that
+# non-zero status kill the whole driver under set -euo pipefail, before
+# preflight can report anything (reproduced: exit 1, zero output, for a typo
+# in --debaters). Capture rc and output separately, then grep the captured
+# string — same masking gotcha as F1_rounds_bounded above.
+f4_rc=0
+f4_out="$("$DRIVER" --topic 'x' --debaters claude,codex,bogus --dry-run 2>&1)" || f4_rc=$?
+assert F4_unknown_named   "printf '%s' \"\$f4_out\" | grep -q 'bogus'"
+assert F4_unknown_aborts  "[[ \"\$f4_rc\" -ne 0 ]] && printf '%s' \"\$f4_out\" | grep -q 'Fewer than 3'"
+
 # --- F2 dry-run wiring ---
 OUT2="$("$DRIVER" --topic 'Local First Note App' --dir-root "$tmpdir/debates" --dry-run 2>&1)"
 assert F2_slug   "printf '%s' \"\$OUT2\" | grep -q 'local-first-note-app'"
@@ -390,6 +402,61 @@ assert F3_transcript "[[ -f \"$DEBF3/transcript.md\" ]]"
 assert F3_has_topic  "grep -q TOPIC_F3 \"$DEBF3/transcript.md\""
 assert F3_has_both   "grep -q AAA \"$DEBF3/transcript.md\" && grep -q BBB \"$DEBF3/transcript.md\""
 assert F3_attributed "grep -q 'claude' \"$DEBF3/transcript.md\""
+
+# --- F5 SIGTERM actually stops the driver (regression for the split trap) ---
+# The brief's original code shared one handler across EXIT/INT/TERM
+# (`trap cleanup EXIT INT TERM`) with a cleanup() that never calls exit. In
+# bash, a trap on a terminating signal whose handler does not itself call
+# exit does not stop the script — execution resumes after the interrupted
+# command. Concretely: the round loop's `if ! orca-debate-round.sh ...; then
+# ...; break; fi` treats that resumed, unsignaled completion as ordinary
+# success/failure and keeps going, so a merged trap would let the *dry-run*
+# path reach its own unconditional `exit 0` after finishing all 3 rounds —
+# regardless of when the signal arrived. The fix (this repo's current code)
+# splits INT/TERM into their own traps that call `exit` directly, which both
+# truncates remaining execution and still fires the EXIT trap exactly once
+# (verified separately on bash 3.2.57).
+#
+# SIGINT cannot be used to observe this: a non-interactive shell sets SIGINT
+# to ignored for an asynchronous (`&`) child, so `kill -INT` on a backgrounded
+# script is a no-op there. SIGTERM has no such special-case and is what a
+# supervising coordinator would actually send, so it is used here.
+#
+# Do not signal against a script whose current foreground child is one long
+# sleep — bash defers a pending trap until that foreground command returns,
+# which would hide the very difference this test exists to catch. Instead,
+# poll the driver's own redirected output for proof that round 1 is already
+# in flight (so the trap is registered and there is a real round loop to
+# interrupt), then send SIGTERM immediately. This makes the assertions below
+# robust to scheduling jitter: with the fix, the process always exits 143 and
+# never reaches round 3 no matter which moment within round 1 it lands on;
+# with the merged-trap regression, it always exits 0 and always reaches round
+# 3, because the signal never actually interrupts anything. Verified directly
+# (3 runs each, both shapes) before writing this as a permanent assertion.
+F5_LOG="$tmpdir/f5-term.log"
+: > "$F5_LOG"
+"$DRIVER" --topic 'sigterm test' --dir-root "$tmpdir/debates-f5" --dry-run \
+  >"$F5_LOG" 2>&1 &
+f5_pid=$!
+
+f5_waited_ms=0
+while ! grep -q '=== ROUND 1' "$F5_LOG" 2>/dev/null; do
+  if ! kill -0 "$f5_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.02
+  f5_waited_ms=$((f5_waited_ms + 20))
+  if [[ "$f5_waited_ms" -ge 5000 ]]; then
+    break
+  fi
+done
+kill -TERM "$f5_pid" 2>/dev/null || true
+
+f5_rc=0
+wait "$f5_pid" 2>/dev/null || f5_rc=$?
+
+assert F5_sigterm_exit_143 "[[ \"\$f5_rc\" -eq 143 ]]"
+assert F5_sigterm_stops    "! grep -q '=== ROUND 3' \"$F5_LOG\""
 
 echo
 echo "Results: $pass passed, $fail failed"

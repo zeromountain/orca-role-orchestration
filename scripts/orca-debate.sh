@@ -124,8 +124,15 @@ IFS=','
 for short in $DEBATERS; do
   [[ -z "${short// }" ]] && continue
   role="$(debate_role_key "$short")"
-  cli="$(role_launch_cmd "$role" 2>/dev/null | awk '{print $1}')"
-  if command -v "$cli" >/dev/null 2>&1; then
+  # role_launch_cmd exits 1 for a name it doesn't recognize (e.g. a typo in
+  # --debaters). Under set -euo pipefail a bare `cli=$(role_launch_cmd ... |
+  # awk ...)` would let that non-zero status kill the whole driver right here
+  # — silently, before preflight can report anything. `|| cli=""` keeps this
+  # a normal "drop from the roster" case instead of a crash.
+  cli="$(role_launch_cmd "$role" 2>/dev/null | awk '{print $1}')" || cli=""
+  if [[ -z "$cli" ]]; then
+    echo "(warn) $short: unrecognized debater — dropping from the roster" >&2
+  elif command -v "$cli" >/dev/null 2>&1; then
     AVAILABLE="${AVAILABLE:+$AVAILABLE,}$short"
   else
     echo "(warn) $role: CLI '$cli' not found on PATH — dropping from the roster" >&2
