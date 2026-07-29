@@ -1711,7 +1711,14 @@ cleanup() {
     "$HERE/orca-close-role.sh" "$(debate_role_key "$short")" >/dev/null 2>&1 || true
   done
 }
-trap cleanup EXIT INT TERM
+# A shared handler for EXIT+INT+TERM is WRONG here: a signal handler that does
+# not itself exit lets execution RESUME after the interrupted command, so on
+# Ctrl-C cleanup closes all four tabs and the debate then keeps dispatching into
+# dead terminals, running cleanup a second time at EXIT and reporting status 0.
+# Verified empirically. Split it: EXIT does the work, signals just exit.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 phase_for_round() {
   case "$1" in
