@@ -82,7 +82,9 @@ Create `tests/debate.sh`:
 #!/usr/bin/env bash
 # Unit tests for the debate library and role-library additions.
 # Pure: no Orca runtime required.
-set -uo pipefail
+set -euo pipefail
+# assert() runs its command as an `if` condition, which -e never trips on.
+# Any other command expected to fail must be if-guarded (see the quorum test).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 pass=0
@@ -322,19 +324,49 @@ git commit -m "feat: add debater role metadata and persistent-tab primitives"
 - Consumes: `is_debater` from Task 1 (not directly — personas are data).
 - Produces: persona files readable by `persona_body()`; each contains an H1 and `<!-- STANCE: … -->` used by `orca-dispatch-role.sh`.
 
-- [ ] **Step 1: Extend the persona linter to cover every shipped role**
+- [ ] **Step 1: Split the persona linter into two tiers**
 
-In `scripts/check-personas.sh`, replace line 8:
+`ui.md` and `reviewer.md` were added later and use a different section skeleton
+(`## Owns` / `## Does NOT` / `## Output contract` / `## Collaboration` / `## Escalation`)
+than the original five (`**Who you are.**` … nine bold sections). Both skeletons carry a valid
+H1 and `STANCE` line — and H1 plus `STANCE` are the only parts the scripts actually consume
+(`persona_body()` strips the H1; `orca-dispatch-role.sh` greps the `STANCE` line).
+
+So the linter gets two tiers: universal checks for every persona, and the nine-section skeleton
+only for the roles that use it. This gives `ui`/`reviewer` real coverage without rewriting two
+shipped personas — whose bodies are seeded verbatim into workers, so rewriting them would change
+those roles' behavior — and it records the two-skeleton reality in code instead of leaving it
+implicit.
+
+In `scripts/check-personas.sh`, replace the single `ROLES=(…)` array at line 8 with two arrays,
+and restructure the loop so the skeleton check runs only for skeleton roles:
 
 ```bash
-ROLES=(architect executor thrifty ui reviewer fallback coordinator
-       debater_claude debater_codex debater_grok debater_gemini)
+# Every persona: H1 + non-empty STANCE (the parts the scripts consume).
+ALL_ROLES=(architect executor thrifty ui reviewer fallback coordinator
+           debater_claude debater_codex debater_grok debater_gemini)
+# Nine-section skeleton. ui/reviewer use a different, later structure by design.
+SKELETON_ROLES=(architect executor thrifty fallback coordinator
+                debater_claude debater_codex debater_grok debater_gemini)
+
+is_skeleton_role() {
+  local role="$1" r
+  for r in "${SKELETON_ROLES[@]}"; do
+    [[ "$r" == "$role" ]] && return 0
+  done
+  return 1
+}
 ```
+
+Then iterate `ALL_ROLES` for the existence, H1, and STANCE checks, and run the existing
+`SECTIONS` loop only when `is_skeleton_role "$role"` succeeds.
 
 - [ ] **Step 2: Run the linter to verify it fails**
 
 Run: `./scripts/check-personas.sh`
-Expected: FAIL — four `MISSING: …/personas/debater_*.md` lines, exit 1. (`ui.md` and `reviewer.md` already exist and should pass, proving the pre-existing gap is now covered.)
+Expected: FAIL — four `MISSING: …/personas/debater_*.md` lines, exit 1. `ui.md` and `reviewer.md`
+must PASS (they clear the universal tier and are exempt from the skeleton tier). If either fails,
+stop — the tier split is wrong.
 
 - [ ] **Step 3: Write `templates/personas/debater_claude.md`**
 
@@ -584,33 +616,46 @@ git commit -m "feat: add four debater personas and lint every shipped role"
 
 Append to `tests/debate.sh` before the results block:
 
-```bash
-# --- R5 dispatch/close role whitelists ---
-DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
-CLOSE="$ROOT/scripts/orca-close-role.sh"
+Four traps make the obvious version of these assertions worthless — or dangerous. Avoid all four:
 
-# Unknown roles must be rejected with the role error, not a handles error.
-assert R5_dispatch_rejects_junk \
-  "\"$DISPATCH\" not_a_role --spec x 2>&1 | grep -q 'role must be'"
-assert R5_close_rejects_junk \
-  "\"$CLOSE\" not_a_role 2>&1 | grep -q 'role must be'"
+1. **`pipefail` masks grep.** `tests/debate.sh` runs under `set -euo pipefail`, so in
+   `"$DISPATCH" bad_role 2>&1 | grep -q 'role must be'` the pipeline's status comes from the
+   script's exit 1, not from grep. The positive assertion always fails, and the negated form
+   (`! … | grep -q …`) passes for accepted **and** rejected roles alike — asserting nothing.
+   **Fix:** capture output first, then grep the captured string:
+   `out="$("$DISPATCH" bad_role 2>&1 || true)"` then
+   `assert … "printf '%s' \"\$out\" | grep -q 'role must be'"`.
+2. **The handles check runs before the whitelist check.** In the real repo there is no
+   `.orca/orchestration/handles.json`, so every role — junk or accepted — exits on the handles
+   error and the whitelist is never reached. **Fix:** copy `orca-dispatch-role.sh` and
+   `orca-roles-lib.sh` into a sandbox directory under `$tmpdir` with a stub `handles.json`
+   one level up, and invoke the copy. Omit `--spec` so an accepted role exits at
+   "--spec or --spec-file required" before any `orca` or `python3` call — still runtime-free.
+3. **`--help` alone never reaches the help branch.** `ROLE` is consumed as a required positional
+   before the option loop, so pass a placeholder role: `"$DISPATCH" dummy --help`.
+4. **`orca-close-role.sh` can close a real terminal from a test run.** In this source repo its
+   `ORCH` resolves to the repo root, so `HANDLES_FILE` is `$ROOT/handles.json`, and its role check
+   runs *before* its handles check. If that file ever exists with a live handle — one
+   `orca-bootstrap-roles.sh` run from the repo root is enough — an accepted role reaches
+   `terminal_is_live` and then `orca terminal close`. A file that declares itself runtime-free must
+   not be one stray file away from destroying a live tab. **Fix:** sandbox the close tests the same
+   way as the dispatch tests — copy `orca-close-role.sh` and `orca-roles-lib.sh` into `$tmpdir`
+   with no `handles.json` beside them, and invoke the copy.
 
-# Accepted roles get past the whitelist and fail later (missing handles.json).
-for r in ui reviewer debater_claude debater_codex debater_grok debater_gemini; do
-  assert "R5_dispatch_accepts_$r" \
-    "! \"$DISPATCH\" $r --spec x 2>&1 | grep -q 'role must be'"
-  assert "R5_close_accepts_$r" \
-    "! \"$CLOSE\" $r 2>&1 | grep -q 'role must be'"
-done
+Assert, using that shape:
 
-# --- R6 --persist is documented and parsed ---
-assert R6_usage_persist "\"$DISPATCH\" --help | grep -q -- '--persist'"
-assert R6_persist_implies_noreap "grep -q 'NO_REAP=1' \"$DISPATCH\""
-```
+- `R5_dispatch_rejects_junk` / `R5_close_rejects_junk` — a junk role produces `role must be`.
+- `R5_dispatch_accepts_<r>` / `R5_close_accepts_<r>` for each of
+  `ui reviewer debater_claude debater_codex debater_grok debater_gemini` — output does **not**
+  contain `role must be`.
+- `R6_usage_persist` — the usage text mentions `--persist`.
+- `R6_persist_implies_noreap` — `grep -q -- '--persist).*NO_REAP=1' "$DISPATCH"`. Grepping for a
+  bare `NO_REAP=1` would match the pre-existing `--no-reap` branch and assert nothing.
 
-`orca-dispatch-role.sh` exits 1 on a missing `handles.json` before touching the Orca CLI, so these
-assertions need no runtime. Run it from a directory where `.orca/orchestration/handles.json` does
-not exist — the skill repo itself qualifies.
+**Verify non-vacuity before moving on.** Copy the tree to a temp dir, delete `ui|reviewer` from
+the dispatch whitelist, and re-run: exactly `R5_dispatch_accepts_ui` and
+`R5_dispatch_accepts_reviewer` must fail while `R5_dispatch_rejects_junk` still passes. A test
+that cannot fail is not a test.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -715,8 +760,25 @@ git commit -m "feat: add --persist dispatch flag; fix ui/reviewer role whitelist
 
 Append to `tests/debate.sh` before the results block:
 
+Three traps in this block, all of which make an assertion lie. Avoid all three:
+
+1. **`source` of a missing file is fatal under `set -e`, even with `|| true`.** `source` is a
+   special builtin, so `source missing.sh 2>/dev/null || true` still aborts the suite — which is
+   exactly the RED state, when the library does not exist yet. Guard the source so the RED run can
+   actually report its failures (e.g. `[[ -f "$LIB" ]] && source "$LIB"`, or source it inside an
+   `if`).
+2. **Do not put a debater's name inside a fixture body.** `D4_name_gone` asserts the anonymized
+   copy contains no `claude`. If the fixture body is `BODY_CLAUDE`, that assertion can never pass
+   even with perfect H1-only redaction — the H1 is what identifies the author, and the body is
+   what gets kept. Use neutral placeholders (`BODY_TEXT_ONE`).
+3. **`debate_lint` writes to stderr and returns 1 by design.** `debate_lint f propose 2>/dev/null |
+   grep -q 'Prior art'` discards the very stream under test, and `pipefail` then takes the
+   pipeline's status from `debate_lint`'s deliberate exit 1 rather than from grep. Capture first,
+   then grep the captured text: `out="$(debate_lint "$BAD" propose 2>&1 || true)"`.
+
 ```bash
 # shellcheck source=../scripts/orca-debate-lib.sh
+# NOTE: source is a special builtin — see trap 1 above; guard it for the RED run.
 source "$ROOT/scripts/orca-debate-lib.sh" 2>/dev/null || true
 
 # --- D1 name mapping ---
@@ -741,12 +803,12 @@ assert D3_stable  "[[ \"\$(debate_label_of \"$MAP\" claude)\" == 'A' ]]"
 
 # --- D4 anonymize ---
 mkdir -p "$tmpdir/round-1"
-printf '# R1 proposal — claude (Principle & risk)\n\nBODY_CLAUDE\n' > "$tmpdir/round-1/claude.md"
-printf '# R1 proposal — grok (Contrarian)\n\nBODY_GROK\n' > "$tmpdir/round-1/grok.md"
+printf '# R1 proposal — claude (Principle & risk)\n\nBODY_TEXT_ONE\n' > "$tmpdir/round-1/claude.md"
+printf '# R1 proposal — grok (Contrarian)\n\nBODY_TEXT_TWO\n' > "$tmpdir/round-1/grok.md"
 debate_anonymize "$MAP" "$tmpdir/round-1" "$tmpdir/round-2" proposal >/dev/null
 assert D4_a_exists  "[[ -f \"$tmpdir/round-2/proposal-A.md\" ]]"
 assert D4_c_exists  "[[ -f \"$tmpdir/round-2/proposal-C.md\" ]]"
-assert D4_body_kept "grep -q BODY_CLAUDE \"$tmpdir/round-2/proposal-A.md\""
+assert D4_body_kept "grep -q BODY_TEXT_ONE \"$tmpdir/round-2/proposal-A.md\""
 assert D4_name_gone "! grep -qi 'claude' \"$tmpdir/round-2/proposal-A.md\""
 assert D4_missing_skipped "[[ ! -f \"$tmpdir/round-2/proposal-B.md\" ]]"
 
@@ -763,7 +825,8 @@ BAD="$tmpdir/bad.md"
 printf '## Proposals\n' > "$BAD"
 assert D5_good_passes "debate_lint \"$GOOD\" propose >/dev/null"
 assert D5_bad_fails   "! debate_lint \"$BAD\" propose >/dev/null"
-assert D5_bad_reports "debate_lint \"$BAD\" propose 2>/dev/null | grep -q 'Prior art'"
+d5_bad_report="$(debate_lint "$BAD" propose 2>&1 || true)"
+assert D5_bad_reports "printf '%s' \"\$d5_bad_report\" | grep -q 'Prior art'"
 
 # --- D6 manifest ---
 MAN="$tmpdir/manifest.json"
@@ -1179,10 +1242,15 @@ assert E2_map "[[ -f \"$DEB2/round-2/label-map.json\" ]]"
 DEB3="$tmpdir/debate3"
 mkdir -p "$DEB3"
 printf 'TOPIC_E3\n' > "$DEB3/topic.md"
-ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
-ORCA_DEBATE_STATUS_STUB=failed \
-"$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1
-QUORUM_RC=$?
+# The round script exits 2 here by design, so the call must be if-guarded:
+# tests/debate.sh runs under `set -e`, which would otherwise abort the suite.
+if ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
+   ORCA_DEBATE_STATUS_STUB=failed \
+   "$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1; then
+  QUORUM_RC=0
+else
+  QUORUM_RC=$?
+fi
 assert E2_quorum_exit "[[ $QUORUM_RC -eq 2 ]]"
 assert E2_quorum_no_anon "[[ ! -f \"$DEB3/round-2/proposal-A.md\" ]]"
 ```
