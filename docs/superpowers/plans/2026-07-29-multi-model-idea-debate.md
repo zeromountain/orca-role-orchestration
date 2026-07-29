@@ -1821,8 +1821,14 @@ assert T9_script_debate "[[ -x \"$ORCH/scripts/orca-debate.sh\" ]]"
 assert T9_script_round "[[ -x \"$ORCH/scripts/orca-debate-round.sh\" ]]"
 assert T9_script_lib "[[ -f \"$ORCH/scripts/orca-debate-lib.sh\" ]]"
 assert T9_personas "[[ -f \"$ORCH/personas/debater_claude.md\" && -f \"$ORCH/personas/debater_gemini.md\" ]]"
-assert T9_roles_yaml "grep -q 'debater_claude' \"$ORCH/roles.yaml\""
-assert T9_routing "grep -q 'idea_debate' \"$ORCH/roles.yaml\""
+# Scope each grep to the section it names. A bare file-wide grep passes on a
+# partial rollback, because dags.idea_debate independently contains both
+# literals — the role block and the routing entry could both be gone while
+# the assertion still reported green.
+assert T9_roles_yaml \
+  "awk '/^roles:/,/^routing_table:/' \"$ORCH/roles.yaml\" | grep -q 'debater_claude:'"
+assert T9_routing \
+  "awk '/^routing_table:/,/^dags:/' \"$ORCH/roles.yaml\" | grep -q 'match: idea_debate'"
 assert T9_gitignore "grep -q '.orca/orchestration/debates' \"$tmpdir/.gitignore\""
 assert T9_no_round_prompts "! grep -q 'Weakest link' \"$ORCH/roles.yaml\""
 
@@ -2095,6 +2101,8 @@ git commit -m "feat: wire debate roles into routing, installer, and bootstrap me
 **Files:**
 - Create: `commands/debate.md`, `prompts/orca-debate.md`
 - Modify: `SKILL.md`, `README.md`, `references/model-roles.md`, `templates/PLAYBOOK.md`, `templates/SCRIPTS.md`
+- Modify (stale-model sweep, added after Task 7 exposed the drift): `scripts/orca-fallback-on-limit.sh`,
+  `templates/handles.example.json`, `templates/personas/architect.md`, `templates/personas/fallback.md`
 
 **Interfaces:**
 - Consumes: the CLI surface from Tasks 5-6.
@@ -2263,6 +2271,29 @@ to `docs/ideas/`.
 In `references/model-roles.md`, correct the stale model names and add a "Debate lenses" table
 mapping each provider to its lens (principle & risk / feasibility / contrarian & market /
 demand & user) with the one-line reason each lens matches that model's strengths.
+
+- [ ] **Step 7b: Sweep the remaining stale model strings**
+
+Task 7 routed `orca-bootstrap-roles.sh` through the library but its allowlist left four other
+shipped artifacts carrying `claude-opus-4-8` / `Opus 4.8` / `Gemini 3.5`:
+
+- **`scripts/orca-fallback-on-limit.sh`** — the serious one. Line 93 hardcodes
+  `agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions` as a **live launch
+  command**, and lines 108-131 repeat the model in the handles JSON and the operator messages.
+  This is the same single-source violation Task 7 just fixed in bootstrap: replace the hardcoded
+  command with `role_launch_cmd fallback` and the model strings with `role_meta fallback | cut -f2`
+  (the script already sources `orca-roles-lib.sh`). A stale launch command does not just misreport
+  — it starts the wrong model, or none.
+- **`templates/handles.example.json`** — three stale model values.
+- **`templates/personas/architect.md:1`** and **`templates/personas/fallback.md:1`** — the H1 lines
+  name the old models. `persona_body()` strips the H1 before seeding, so this is cosmetic, but it
+  is the first line a human reads when editing a persona.
+
+Add a repo-wide guard to `tests/install.sh` so this cannot regress: assert that no file under
+`scripts/`, `templates/`, or the repo-root docs matches `claude-opus-4-8|Opus 4\.8|Gemini 3\.5`.
+Exclude `docs/superpowers/` (historical specs and plans record what was true when written) and
+`tests/install.sh` itself (its legacy-migration fixture at line 92 deliberately contains
+`claude-opus-4-8` to exercise the migration path, and the guard's own pattern would self-match).
 
 - [ ] **Step 8: Run tests to verify they pass**
 
