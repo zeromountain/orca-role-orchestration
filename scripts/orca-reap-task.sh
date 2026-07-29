@@ -96,20 +96,6 @@ except Exception:
 PY
 }
 
-dispatch_status() {
-  orca orchestration dispatch-show --task "$TASK_ID" --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("unknown")
-    raise SystemExit(0)
-r = d.get("result") or d
-disp = r.get("dispatch") or r
-print(disp.get("status") or "unknown")
-' 2>/dev/null || echo "unknown"
-}
-
 echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 POLL_S="$(python3 -c "print(max(1, int($POLL_MS)/1000))")"
@@ -122,7 +108,7 @@ while true; do
     exit 0
   fi
 
-  STATUS="$(dispatch_status)"
+  STATUS="$(dispatch_status "$TASK_ID")"
   case "$STATUS" in
     completed|failed)
       echo "reap: task $TASK_ID status=$STATUS — closing worker"
