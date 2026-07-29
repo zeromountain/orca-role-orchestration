@@ -95,9 +95,19 @@ debate_required_headings() {
 
 debate_lint() {
   # $1=file $2=phase. Prints each missing heading to stderr; exit 1 if any missing.
-  local file="$1" phase="$2" missing=0 heading
+  local file="$1" phase="$2" missing=0 heading headings
   if [[ ! -s "$file" ]]; then
     echo "missing or empty: $file" >&2
+    return 1
+  fi
+  # Capture into a variable and test the result directly in the `if`, rather
+  # than `local headings="$(...)"` — combining `local` with an assignment
+  # collapses the command substitution's exit status into `local`'s own
+  # (always 0), which would silently re-introduce the fail-open bug this
+  # guards against. An unrecognized phase must fail closed, matching
+  # debate_spec's handling of the same bad input.
+  if ! headings="$(debate_required_headings "$phase")"; then
+    echo "unknown phase: $phase" >&2
     return 1
   fi
   while IFS= read -r heading; do
@@ -106,7 +116,7 @@ debate_lint() {
       missing=1
     fi
   done <<EOF
-$(debate_required_headings "$phase")
+$headings
 EOF
   return "$missing"
 }

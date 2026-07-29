@@ -195,6 +195,15 @@ assert D5_bad_fails   "! debate_lint \"$BAD\" propose >/dev/null"
 d5_bad_report="$(debate_lint "$BAD" propose 2>&1 || true)"
 assert D5_bad_reports "printf '%s' \"\$d5_bad_report\" | grep -q 'Prior art'"
 
+# An unrecognized phase must fail closed (debate_required_headings returns 1
+# with zero output; a lint that doesn't check that exit status would see an
+# empty heading list, run its while-loop zero times, and rubber-stamp "clean"
+# for a file it never examined). GOOD is heading-complete for every real
+# phase, so the only way either of these can fail is the phase check itself.
+assert D5_bad_phase_fails "! debate_lint \"$GOOD\" totally_bogus_phase >/dev/null 2>/dev/null"
+d5_bad_phase_out="$(debate_lint "$GOOD" totally_bogus_phase 2>&1 || true)"
+assert D5_bad_phase_reports "printf '%s' \"\$d5_bad_phase_out\" | grep -q 'totally_bogus_phase'"
+
 # --- D6 manifest ---
 MAN="$tmpdir/manifest.json"
 debate_manifest_append "$MAN" claude task_1 completed ok
