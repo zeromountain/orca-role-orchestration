@@ -1,32 +1,42 @@
 ---
 name: orca-role-orchestration
 description: >
-  Install and run Orca multi-model role orchestration: Claude Opus 4.8 (architect),
-  GPT-5.6 Sol via Codex (executor), Grok 4.5 (thrifty), Antigravity Gemini 3.5 Flash
-  Medium (fallback on rate/session limits). Raster image generation/edit routes to
-  executor with Codex $imagegen; if the image brief is ambiguous, ask the user first.
-  Use whenever the user wants model role separation in Orca Agent IDE, multi-model
-  routing, role workers, bootstrap roles, dispatch by role, plan-execute-review DAGs,
-  image generation / imagegen / 이미지 생성, limit failover to agy/Gemini Flash,
+  Install and run Orca multi-model role orchestration: Claude Opus 5 (architect,
+  reviewer), GPT-5.6 Sol via Codex (executor), Grok 4.5 (thrifty), Antigravity
+  Gemini 3.6 Flash Medium (ui, fallback on rate/session limits). Raster image
+  generation/edit routes to executor with Codex $imagegen; if the image brief is
+  ambiguous, ask the user first. Also runs a four-model idea debate (Claude, Codex,
+  Grok, Gemini propose, critique anonymously, and converge on a niche) for
+  brainstorming and idea refinement. Use whenever the user wants model role
+  separation in Orca Agent IDE, multi-model routing, role workers, bootstrap roles,
+  dispatch by role, plan-execute-review DAGs, image generation / imagegen /
+  이미지 생성, limit failover to agy/Gemini Flash, multi-model debate, idea debate,
   or mentions Opus/Sol/Grok role split, orca-role-orchestration, /orca-role-orchestration,
-  "역할 오케스트레이션", "모델별 역할 분리", "architect executor thrifty", or
-  "fallback Gemini Flash". Prefer this skill over ad-hoc multi-agent setup when work
-  should be routed by model strengths. Complements the generic `orchestration` skill
-  (lifecycle primitives) with a concrete four-role playbook and installable scaffold.
+  "역할 오케스트레이션", "모델별 역할 분리", "architect executor thrifty",
+  "fallback Gemini Flash", "아이디어 토론", "브레인스토밍", "아이디어 구체화", or
+  "니치 찾기". Prefer this skill over ad-hoc multi-agent setup when work should be
+  routed by model strengths. Complements the generic `orchestration` skill
+  (lifecycle primitives) with a concrete role playbook and installable scaffold.
 ---
 
 # Orca Role Orchestration
 
-Portable four-role setup for Orca Agent IDE. Coordinator routes work by model strength; workers report `worker_done` under supervised dispatch.
+Portable six-role setup for Orca Agent IDE, plus a four-model idea-debate mode. Coordinator routes work by model strength; workers report `worker_done` under supervised dispatch.
 
 ## Roles (fixed)
 
 | Role | Model | Launch |
 |------|-------|--------|
-| **architect** | Claude Opus 4.8 | `claude --model claude-opus-4-8 --dangerously-skip-permissions` |
+| **architect** | Claude Opus 5 | `claude --model claude-opus-5 --dangerously-skip-permissions` |
 | **executor** | GPT-5.6 Sol | `codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox` |
 | **thrifty** | Grok 4.5 | `grok --model grok-4.5 --permission-mode bypassPermissions` |
-| **fallback** | Gemini 3.5 Flash (Medium) | `agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions` |
+| **ui** | Gemini 3.6 Flash (Medium) | `agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions` |
+| **reviewer** | Claude Opus 5 | `claude --model claude-opus-5 --dangerously-skip-permissions` |
+| **fallback** | Gemini 3.6 Flash (Medium) | `agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions` |
+| **debater_{claude,codex,grok,gemini}** | one seat per provider | debate only — read-only, never implements |
+
+Bootstrap starts the four primaries (architect/executor/thrifty/fallback); `ui`, `reviewer`,
+and the `debater_*` seats are created lazily on their first dispatch.
 
 Principle: **Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.**
 
@@ -59,10 +69,10 @@ orca-role-orchestration/
   .agents/plugins/
     marketplace.json           # Codex marketplace catalog (source url "./")
   commands/                    # Claude Code slash commands (auto-discovered)
-    install.md bootstrap.md dispatch.md wait.md fallback.md close.md
+    install.md bootstrap.md dispatch.md wait.md fallback.md debate.md close.md
   prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
     orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
-    orca-fallback.md orca-close.md
+    orca-fallback.md orca-debate.md orca-close.md
   scripts/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
@@ -73,12 +83,16 @@ orca-role-orchestration/
     orca-wait-done.sh          # optional blocking wait
     orca-roles-lib.sh          # shared role meta / create / seed
     orca-fallback-on-limit.sh
+    orca-debate.sh              # drive a 3-round four-model idea debate
+    orca-debate-round.sh        # one debate round: fan out, poll, collect, lint
+    orca-debate-lib.sh          # debate helpers + round prompts (sourced)
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
     roles.yaml                 # managed routing (always refreshed)
     project_hints.yaml         # user-owned (create once)
-    personas/                  # architect|executor|thrifty|fallback|coordinator .md
-  tests/install.sh
+    personas/                  # architect|executor|thrifty|ui|reviewer|fallback
+                                # |coordinator|debater_{claude,codex,grok,gemini} .md
+  tests/install.sh tests/debate.sh
   references/model-roles.md
 ```
 
@@ -103,6 +117,7 @@ Slash commands ship with the plugin (namespace `orca-role-orchestration`):
 | `/orca-role-orchestration:dispatch <role> <task>` | `/orca-dispatch` | `orca-dispatch-role.sh` |
 | `/orca-role-orchestration:wait` | `/orca-wait` | `orca-wait-done.sh` |
 | `/orca-role-orchestration:fallback <role> <goal>` | `/orca-fallback` | `orca-fallback-on-limit.sh` |
+| `/orca-role-orchestration:debate <topic>` | `/orca-debate` | `orca-debate.sh` |
 | `/orca-role-orchestration:close <role>` | `/orca-close` | `orca-close-role.sh` (emergency) |
 
 Claude Code auto-discovers `commands/` from the plugin root. Codex plugin manifests carry
@@ -228,6 +243,32 @@ Timeout / `count:0` = checkpoint, not failure. Tab close does not depend on this
 
 If user says hand off / 넘겨줘 without supervise language: do **not** task-create/dispatch/check. Use `orca terminal send` or non-lifecycle worktree handoff only. See generic `orchestration` skill ownership rules.
 
+### E) Idea debate (four models argue an idea into a niche)
+
+When the user wants to research and sharpen an idea rather than build something:
+
+```bash
+.orca/orchestration/scripts/orca-debate.sh --topic "<the idea or question>"
+```
+
+Three rounds, four models in parallel each round:
+
+| Round | Phase | What each model does |
+|---|---|---|
+| R1 | propose | Researches prior art, proposes 2-3 ideas, names its own weakest link |
+| R2 | critique | Attacks the other three proposals **anonymized**, ranks them, proposes merges |
+| R3 | converge | Narrows to 1-2 niche candidates with kill conditions and a first experiment |
+
+Proposals circulate under labels (Proposal A-D), never model names — a model that knows
+"Opus wrote this" defers instead of arguing.
+
+Outputs: `.orca/orchestration/debates/<slug>/transcript.md` (local, gitignored). Then write the
+decision to `docs/ideas/<date>-<slug>.md` with `## Decision` / `## Runner-up` / `## Dissent`,
+or pass `--judge architect` to have a separate Opus tab write it.
+
+Debaters are **read-only**: their only writable path is their own round output file. Quorum is 3 —
+if two or more fail, the round stops. Round prompt text lives in `scripts/orca-debate-lib.sh`.
+
 ## Routing cheat sheet
 
 | User need | Role |
@@ -236,10 +277,14 @@ If user says hand off / 넘겨줘 without supervise language: do **not** task-cr
 | Hard implement, debug, typecheck/build, close PR unit | executor |
 | Raster image generate/edit (Codex `$imagegen`) | executor |
 | Small fix, map code, research, code prototype | thrifty |
+| UI/UX surface, layout, styling, visual draft | ui |
+| Final pre-merge gate (after architect sign-off) | reviewer |
+| Idea research, brainstorm, find a niche | debate driver |
 | Primary hit session/rate/quota limit | fallback |
 
 Standard DAG: `architect(plan) → executor|thrifty(impl) → architect(review-only)`.
 Image DAG: clarity gate → `executor` (`$imagegen`) only.
+UI DAG: `ui(draft) → architect(approve) → ui(implement) → architect(review)`.
 Cost ladder: `thrifty → executor → architect`.
 
 ## Image generation (Codex `$imagegen`)

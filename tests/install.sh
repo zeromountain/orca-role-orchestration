@@ -151,6 +151,29 @@ assert T10_agents_no_stale "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$agentsdir/AG
 assert T10_agents_debater "grep -q 'debater_' \"$agentsdir/AGENTS.md\""
 rm -rf "$agentsdir"
 
+# --- T11 repo-wide stale-model regression guard ---
+# Task 7 fixed the same single-source violation in orca-bootstrap-roles.sh
+# (T10 above); Task 8 swept the rest of the shipped repo. This asserts it can't
+# quietly come back. Two exclusions, deliberately narrow:
+#   - docs/superpowers/  historical specs and plans that record what was true
+#     when they were written; rewriting them would falsify the project history,
+#     not fix a bug.
+#   - tests/install.sh   this file. It carries the legacy-migration fixture at
+#     line ~92 (a deliberate `claude-opus-4-8` that exercises the pre-refresh
+#     migration path — see T7) and the guard pattern's own literals a few lines
+#     below would otherwise match this very assertion.
+# `git grep` (not a raw recursive grep) so this only ever sees tracked files —
+# no .git internals, no local build/test scratch — and pathspec `:(exclude)`
+# scopes out just those two paths, nothing else.
+STALE_RE='claude-opus-4-8|Opus 4[.]8|Gemini 3[.]5'
+stale_hits="$(git -C "$ROOT" grep -InE "$STALE_RE" -- \
+  ':(exclude)docs/superpowers' ':(exclude)tests/install.sh' 2>/dev/null || true)"
+if [[ -n "$stale_hits" ]]; then
+  echo "  stale model strings found outside the excluded paths:" >&2
+  echo "$stale_hits" | sed 's/^/    /' >&2
+fi
+assert T11_no_stale_models "[[ -z \"\$stale_hits\" ]]"
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then

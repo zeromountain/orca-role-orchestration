@@ -458,6 +458,28 @@ wait "$f5_pid" 2>/dev/null || f5_rc=$?
 assert F5_sigterm_exit_143 "[[ \"\$f5_rc\" -eq 143 ]]"
 assert F5_sigterm_stops    "! grep -q '=== ROUND 3' \"$F5_LOG\""
 
+# --- G1 documentation surface ---
+# Positive checks target strings that do not exist anywhere in these docs today
+# (verified: no file below mentions the debate driver or the debate mode before
+# Task 8's docs land), so each one only goes green once the real documentation
+# is written — not merely because the file exists.
+assert G1_cmd "[[ -f \"$ROOT/commands/debate.md\" ]]"
+assert G1_prompt "[[ -f \"$ROOT/prompts/orca-debate.md\" ]]"
+assert G1_skill_mode "grep -q 'orca-debate.sh' \"$ROOT/SKILL.md\""
+assert G1_skill_keywords "grep -q '아이디어 토론' \"$ROOT/SKILL.md\""
+assert G1_playbook "grep -q 'orca-debate.sh' \"$ROOT/templates/PLAYBOOK.md\""
+assert G1_scripts_doc "grep -q 'orca-debate-round.sh' \"$ROOT/templates/SCRIPTS.md\""
+assert G1_readme "grep -q 'orca-debate.sh' \"$ROOT/README.md\""
+# Stale model strings must be gone from shipped docs. The grep patterns below
+# are written with a doubled backslash before each dot on purpose: it collapses
+# to a single escaped dot at eval time (correct regex), but the raw source text
+# of this line never spells the stale model name as one contiguous run of
+# characters — so the repo-wide stale-string guard added to tests/install.sh
+# (T11) does not trip on this very line. Confirmed empirically with the guard's
+# own pattern run directly against this file.
+assert G1_playbook_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/templates/PLAYBOOK.md\""
+assert G1_skill_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/SKILL.md\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

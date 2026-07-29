@@ -1,15 +1,21 @@
 # Orca Role Orchestration
 
-An installable Agent Skill and project scaffold for routing Orca Agent IDE work across four model-specific roles.
+An installable Agent Skill and project scaffold for routing Orca Agent IDE work across six model-specific roles, plus a four-model idea-debate mode.
 
 | Role | Default model | Best for |
 |---|---|---|
-| `architect` | Claude Opus 4.8 | Architecture, planning, high-risk review |
+| `architect` | Claude Opus 5 | Architecture, planning, high-risk review |
 | `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
 | `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
-| `fallback` | Gemini 3.5 Flash (Medium) via `agy` | Continuity after rate or session limits |
+| `ui` | Gemini 3.6 Flash (Medium) via `agy` | User-visible surface drafts, always routed back to architect for approval |
+| `reviewer` | Claude Opus 5 | Final pre-merge gate only — APPROVE/BLOCK, never implements |
+| `fallback` | Gemini 3.6 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
-The defaults are intentionally opinionated. Launch commands live in `scripts/orca-bootstrap-roles.sh` (not `roles.yaml`). Edit that script if you need different model IDs or CLI flags.
+Bootstrap starts the four primaries (`architect`/`executor`/`thrifty`/`fallback`); `ui` and
+`reviewer` tabs are created on their first dispatch. The idea-debate mode below adds four more
+read-only `debater_*` seats, one per provider.
+
+The defaults are intentionally opinionated. Launch commands live in `scripts/orca-roles-lib.sh` (`role_meta` / `role_launch_cmd`), not `roles.yaml` — edit that library if you need different model IDs or CLI flags.
 
 ## Prerequisites
 
@@ -128,6 +134,18 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 ```
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
+
+## Idea debate
+
+Four models argue an idea into a niche direction — propose, critique each other anonymously,
+then converge:
+
+```bash
+.orca/orchestration/scripts/orca-debate.sh --topic "your idea or open question"
+```
+
+Transcript lands in `.orca/orchestration/debates/<slug>/` (gitignored); the decision document goes
+to `docs/ideas/`.
 
 ## Security
 

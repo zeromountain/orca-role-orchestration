@@ -8,7 +8,10 @@
 | `.orca/orchestration/scripts/orca-wait-done.sh` | Optional blocking wait (+ close if reaper/worker missed) |
 | `.orca/orchestration/scripts/orca-close-role.sh` | Manual close of role tab (`--tab`) |
 | `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / create / seed (sourced) |
-| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.5 Flash (Medium) |
+| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.6 Flash (Medium) |
+| `.orca/orchestration/scripts/orca-debate.sh` | Drive a 3-round four-model idea debate |
+| `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
+| `.orca/orchestration/scripts/orca-debate-lib.sh` | Debate helpers + round prompts (sourced) |
 
 Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and quoted
 (one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
@@ -20,12 +23,13 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec-file /tmp/task.md
 .orca/orchestration/scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
+.orca/orchestration/scripts/orca-debate.sh --topic "…"   # 3-round idea debate
 # close is automatic after dispatch; optional block:
 .orca/orchestration/scripts/orca-wait-done.sh --role thrifty
 .orca/orchestration/scripts/orca-close-role.sh thrifty   # manual emergency only
 ```
 
-Roles: `architect` | `executor` | `thrifty` | `fallback`
+Roles: `architect` | `executor` | `thrifty` | `ui` | `reviewer` | `fallback` | `debater_*`
 
 Close is **automatic** on every `orca-dispatch-role.sh` (background reaper). Optional wait for the result body:
 

@@ -1,4 +1,4 @@
-# fallback — "The Relief Pitcher"  (Antigravity Gemini 3.5 Flash (Medium))
+# fallback — "The Relief Pitcher"  (Antigravity Gemini 3.6 Flash (Medium))
 
 <!-- STANCE: Enter only on a primary's limit; make smallest viable progress; stabilize and hand back; never re-architect. -->
 
