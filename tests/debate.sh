@@ -53,6 +53,57 @@ assert R4_debater_stays    "seed_text debater_grok grok-4.5 'body' | grep -q 'st
 assert R4_normal_closes    "seed_text architect claude-opus-5 'body' | grep -q 'terminal close'"
 assert R4_body_included    "seed_text architect claude-opus-5 'MARKER_BODY' | grep -q 'MARKER_BODY'"
 
+# --- R5 dispatch/close role whitelists ---
+DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
+CLOSE="$ROOT/scripts/orca-close-role.sh"
+
+# orca-dispatch-role.sh checks handles.json before the role whitelist (by design —
+# an accepted role must still fail on missing handles.json). The real repo has no
+# handles.json, so a direct invocation never reaches the whitelist check at all —
+# a real invocation would exit on the handles error for every role, junk or not.
+# Sandbox a copy with a stub handles.json so the whitelist is actually exercised,
+# without ever touching the real Orca CLI: with no --spec, an accepted role exits
+# cleanly at "--spec or --spec-file required" before any orca/python3 call.
+dispatch_sandbox="$tmpdir/dispatch-sandbox/scripts"
+mkdir -p "$dispatch_sandbox"
+cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$dispatch_sandbox/"
+echo '{}' >"$tmpdir/dispatch-sandbox/handles.json"
+DISPATCH_SANDBOXED="$dispatch_sandbox/orca-dispatch-role.sh"
+
+# Capture output and exit status separately from the grep check. Under
+# `set -o pipefail` (this file), a script that legitimately exits 1 on its error
+# path would otherwise dominate the pipeline's exit status and mask (or, behind a
+# leading `!`, falsely flip) whatever grep actually matched. Capturing first and
+# grepping the captured string keeps the assertion honest.
+r5_dispatch_junk_out="$("$DISPATCH_SANDBOXED" not_a_role 2>&1 || true)"
+r5_close_junk_out="$("$CLOSE" not_a_role 2>&1 || true)"
+
+# Unknown roles must be rejected with the role error, not a handles error.
+assert R5_dispatch_rejects_junk \
+  "printf '%s' \"\$r5_dispatch_junk_out\" | grep -q 'role must be'"
+assert R5_close_rejects_junk \
+  "printf '%s' \"\$r5_close_junk_out\" | grep -q 'role must be'"
+
+# Accepted roles get past the whitelist and fail later for an unrelated reason
+# (dispatch: missing --spec; close: missing handles.json) — never "role must be".
+for r in ui reviewer debater_claude debater_codex debater_grok debater_gemini; do
+  d_out="$("$DISPATCH_SANDBOXED" "$r" 2>&1 || true)"
+  c_out="$("$CLOSE" "$r" 2>&1 || true)"
+  assert "R5_dispatch_accepts_$r" \
+    "! printf '%s' \"\$d_out\" | grep -q 'role must be'"
+  assert "R5_close_accepts_$r" \
+    "! printf '%s' \"\$c_out\" | grep -q 'role must be'"
+done
+
+# --- R6 --persist is documented and parsed ---
+# ROLE is a required positional arg consumed before the option loop, so bare
+# `--help` (no role) never reaches the -h|--help branch; use a placeholder role.
+r6_usage_out="$("$DISPATCH" dummy --help 2>&1 || true)"
+assert R6_usage_persist "printf '%s' \"\$r6_usage_out\" | grep -q -- '--persist'"
+# Tied to the --persist branch itself (not just any NO_REAP=1 in the file — the
+# pre-existing --no-reap branch already contains that literal substring).
+assert R6_persist_implies_noreap "grep -q -- '--persist).*NO_REAP=1' \"$DISPATCH\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

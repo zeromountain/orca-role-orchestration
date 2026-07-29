@@ -20,6 +20,7 @@ SPEC_FILE=""
 DEPS="[]"
 WAIT_DONE=0
 NO_REAP=0
+PERSIST=0
 TIMEOUT_MS=900000
 REAP_TIMEOUT_MS=3600000
 WORKTREE="active"
@@ -30,15 +31,17 @@ REAPER_DIR="$ORCH/reapers"
 usage() {
   cat <<'EOF'
 Usage:
-  orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "text"
+  orca-dispatch-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}> --spec "text"
   orca-dispatch-role.sh <role> --spec-file file.md [--deps '["task_id"]']
-  orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--timeout-ms N]
+  orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--persist] [--timeout-ms N]
 
 By default a background reaper auto-closes the worker tab when the dispatch
 completes or fails (no coordinator action required).
 
   --wait      Also block on orca-wait-done.sh (optional; reaper still runs unless --no-reap)
   --no-reap   Disable automatic background close (tabs will linger unless closed elsewhere)
+  --persist   Keep the worker tab open after worker_done (implies --no-reap).
+              For multi-round flows (debate) where the caller closes tabs itself.
   --timeout-ms  Timeout for --wait only (default 900000). Reaper default lifetime 1h.
 EOF
 }
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --deps) DEPS="${2:?}"; shift 2 ;;
     --wait) WAIT_DONE=1; shift ;;
     --no-reap) NO_REAP=1; shift ;;
+    --persist) PERSIST=1; NO_REAP=1; shift ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
@@ -65,8 +69,9 @@ if [[ ! -f "$HANDLES_FILE" ]]; then
 fi
 
 case "$ROLE" in
-  architect|executor|thrifty|fallback) ;;
-  *) echo "role must be architect|executor|thrifty|fallback" >&2; exit 1 ;;
+  architect|executor|thrifty|ui|reviewer|fallback) ;;
+  debater_claude|debater_codex|debater_grok|debater_gemini) ;;
+  *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}" >&2; exit 1 ;;
 esac
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
@@ -102,24 +107,22 @@ if [[ -f "$PERSONA_FILE" ]]; then
   STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
 fi
 
-# Spec always carries auto-close contract so the worker also self-closes after worker_done.
-AUTO_CLOSE_BLOCK="
-AUTO-CLOSE (required, automatic):
-After you send worker_done exactly once, immediately run this shell command (do not skip):
-  orca terminal close --terminal ${HANDLE} --tab --json
-Your Orca terminal handle for this session is: ${HANDLE}
-Then stop. Do not poll orchestration. A background reaper also closes this tab if needed.
-"
+# Spec always carries a tail contract: auto-close (default) or stay-open (--persist).
+if [[ "$PERSIST" -eq 1 ]]; then
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" persist)"
+else
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" close)"
+fi
 
 if [[ -n "${STANCE// }" ]]; then
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 STANCE: $STANCE
 $SPEC
-$AUTO_CLOSE_BLOCK"
+$TAIL_BLOCK"
 else
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 $SPEC
-$AUTO_CLOSE_BLOCK"
+$TAIL_BLOCK"
 fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE"

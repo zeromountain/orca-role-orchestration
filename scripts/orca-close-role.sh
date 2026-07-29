@@ -14,7 +14,7 @@ HANDLES_FILE="$ORCH/handles.json"
 usage() {
   cat <<'EOF'
 Usage:
-  orca-close-role.sh <architect|executor|thrifty|fallback|term_*>
+  orca-close-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}|term_*>
 
 Closes the role's Orca terminal (kills PTY). Safe to call twice.
 Does not edit handles.json — next dispatch recreates via ensure_terminal.
@@ -30,8 +30,9 @@ if [[ "$TARGET" == term_* ]]; then
   HANDLE="$TARGET"
 else
   case "$TARGET" in
-    architect|executor|thrifty|fallback) ;;
-    *) echo "role must be architect|executor|thrifty|fallback|term_*" >&2; exit 1 ;;
+    architect|executor|thrifty|ui|reviewer|fallback) ;;
+    debater_claude|debater_codex|debater_grok|debater_gemini) ;;
+    *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}|term_*" >&2; exit 1 ;;
   esac
   if [[ ! -f "$HANDLES_FILE" ]]; then
     echo "No $HANDLES_FILE — nothing to close (ok)"
