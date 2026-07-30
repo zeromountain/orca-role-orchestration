@@ -2517,6 +2517,11 @@ assert PF1_never_creates_a_task "! printf '%s' \"\$pf1_out\" | grep -q '=== ROUN
 assert PF1_names_broken_seat "printf '%s' \"\$pf1_out\" | grep -q 'debater_codex'"
 assert PF1_shows_screen "printf '%s' \"\$pf1_out\" | grep -qi 'never became ready'"
 assert PF1_no_round_dir "[[ ! -d \"$pf1_root/pf1slug/round-1\" ]]"
+# Fix round 1 (Finding 2): the default roster is 4 debaters; dropping the
+# one broken seat (codex) leaves 3 — exactly quorum — so the message must
+# name --debaters as the viable remedy and give the concrete value.
+assert PF1_mentions_debaters_flag "printf '%s' \"\$pf1_out\" | grep -q -- '--debaters'"
+assert PF1_suggests_remaining_roster "printf '%s' \"\$pf1_out\" | grep -q -- '--debaters claude,grok,gemini'"
 
 # --- PF2 (Step 2): with every seat ready (no Q_UNREADY_TITLE/Q_STUCK_TITLE
 # set — the Q-series' own default stub behavior), the driver proceeds
@@ -2543,6 +2548,35 @@ assert PF2_preflight_passed "printf '%s' \"\$pf2_out\" | grep -q 'preflight: all
 # signal PF1 above also relies on.
 assert PF2_dispatches_normally "printf '%s' \"\$pf2_out\" | grep -q '=== ROUND 1'"
 assert PF2_round_produced_output "[[ -d \"$pf2_root/pf2slug/round-1\" ]]"
+
+# --- PF3 (Finding 2, the other branch): a 3-debater roster (exactly
+# quorum) where dropping the one broken seat would leave only 2 — NOT
+# viable via --debaters. The message must say so plainly rather than
+# suggesting a --debaters value that would just fail again at the earlier
+# "Fewer than 3 debater CLIs available" check (a wrong remedy is worse
+# than none — it wastes the user's next attempt too). ---
+pf3_root="$tmpdir/pf3-debates"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+export Q_UNREADY_TITLE="debate-sol"
+pf3_rc=0
+pf3_out="$("$Q_DRIVER" --topic "preflight should not oversell --debaters when quorum cannot survive it" \
+  --slug pf3slug --rounds 1 --debaters claude,codex,grok \
+  --dir-root "$pf3_root" --lock-ttl-seconds 1800 2>&1)" || pf3_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB Q_UNREADY_TITLE
+export PATH="$Q_OLD_PATH"
+
+assert PF3_aborts_nonzero "[[ \"$pf3_rc\" -ne 0 ]]"
+assert PF3_names_broken_seat "printf '%s' \"\$pf3_out\" | grep -q 'debater_codex'"
+assert PF3_says_not_viable "printf '%s' \"\$pf3_out\" | grep -qi 'NOT viable'"
+# The viable branch's own suggestion phrasing ("re-run with --debaters
+# <roster>") must NOT appear here — this checks the wrong-remedy risk
+# directly, not just "the word --debaters is absent" (it legitimately
+# appears in the NOT-viable explanation text too).
+assert PF3_does_not_suggest_a_debaters_value \
+  "! printf '%s' \"\$pf3_out\" | grep -q -- 're-run with --debaters'"
+assert PF3_no_round_dir "[[ ! -d \"$pf3_root/pf3slug/round-1\" ]]"
 
 # --- BC1 (Step 3): one seat (debater_codex again)'s CLOSE never verifies
 # (Q_STUCK_TITLE — "terminal list" reports it connected no matter how many
@@ -3574,6 +3608,156 @@ tg3_out="$(PATH="$tg3_dir/bin:$PATH" "$tg3_dir/scripts/orca-close-role.sh" archi
 assert TG3_stuck_close_exits_nonzero "[[ \"$tg3_rc\" -ne 0 ]]"
 assert TG3_stuck_close_reported_loudly \
   "printf '%s' \"\$tg3_out\" | grep -qi 'STILL LIVE'"
+
+# ----------------------------------------------------------------------------
+# RL-series (fix round 1, Finding 1): orca-reap-task.sh's dispatch-ledger.jsonl
+# must reflect what terminal_close_and_verify actually found, not always
+# "closed". Pre-fix, close_handle's own body ended on a `case` whose every
+# branch is a bare `echo`, so its return status was always 0 (an echo's own
+# exit code) regardless of $verify_rc — mark_ledger "closed" then ran
+# unconditionally at the call site no matter what the close actually did.
+# Sandboxed the same way as R5/TG2/TG3 above (own copy of the script +
+# orca-roles-lib.sh): LEDGER_FILE/HANDLES_FILE have no env override in
+# orca-reap-task.sh (ORCH is unconditionally recomputed from the script's
+# OWN on-disk location, `$(cd "$(dirname "$0")/.." && pwd)` — exporting ORCH
+# would be silently ignored), so this must never run against the real repo
+# root, and every sub-test below reuses the SAME copy (and therefore the
+# SAME fixed ORCH) rather than trying to override it per sub-test — only
+# the ledger's CONTENT and the stubbed `orca` binary vary between them.
+# ----------------------------------------------------------------------------
+rl_dir="$tmpdir/reap-ledger"
+mkdir -p "$rl_dir/scripts"
+cp "$ROOT/scripts/orca-reap-task.sh" "$ROOT/scripts/orca-roles-lib.sh" "$rl_dir/scripts/"
+RL_REAP="$rl_dir/scripts/orca-reap-task.sh"
+RL_LEDGER="$rl_dir/dispatch-ledger.jsonl"
+
+seed_rl_ledger() {
+  # $1=task_id $2=handle -> (re)writes $RL_LEDGER with exactly one row,
+  # status "dispatched" (mark_ledger is a documented no-op when no row
+  # matches the taskId — without seeding one first, a pre-fix-style
+  # demonstration would prove nothing: the ledger would stay untouched
+  # either way, which looks identical to "fixed" from the outside).
+  cat > "$RL_LEDGER" <<JSON
+{"taskId": "$1", "dispatchId": "dispatch_$1", "role": "thrifty", "handle": "$2", "status": "dispatched", "dispatchedAt": "2020-01-01T00:00:00+00:00"}
+JSON
+}
+
+rl_ledger_status() {
+  # $1=task_id -> that row's "status" field in $RL_LEDGER, or empty
+  python3 -c '
+import json, sys
+path, tid = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get("taskId") == tid:
+                print(row.get("status") or "")
+except Exception:
+    print("")
+' "$RL_LEDGER" "$1"
+}
+
+# --- RL1 (Finding 1's core proof): a close that is fired but NEVER actually
+# takes ("terminal list" reports the handle connected forever, no matter how
+# many times "terminal close" is called) must NOT leave dispatch-ledger.jsonl
+# saying "closed". ---
+rl1_dir="$tmpdir/rl1"
+mkdir -p "$rl1_dir/bin"
+cat > "$rl1_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration dispatch-show") echo '{"ok":true,"result":{"dispatch":{"status":"completed"}}}' ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_rl1_stuck","connected":true}]}}' ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$rl1_dir/bin/orca"
+seed_rl_ledger task_rl1 term_rl1_stuck
+rl1_rc=0
+rl1_out="$(
+  export PATH="$rl1_dir/bin:$PATH"
+  "$RL_REAP" --task task_rl1 --handle term_rl1_stuck --poll-ms 50 --timeout-ms 3000
+)" 2>&1 || rl1_rc=$?
+assert RL1_reap_exits_ok "[[ \"$rl1_rc\" -eq 0 ]]"
+assert RL1_reports_still_live "printf '%s' \"\$rl1_out\" | grep -qi 'STILL LIVE'"
+rl1_status="$(rl_ledger_status task_rl1)"
+assert RL1_ledger_not_closed "[[ \"$rl1_status\" != 'closed' ]]"
+assert RL1_ledger_says_close_failed "[[ \"$rl1_status\" == 'close_failed' ]]"
+
+# --- RL2 (happy path unaffected): a close that genuinely succeeds (stateful
+# stub — the handle is omitted from "terminal list" once actually closed,
+# same pattern as w_dir/bin/orca and o_bin_live elsewhere in this file) must
+# still leave the ledger saying "closed", proving this fix does not turn a
+# real success into a false alarm. ---
+rl2_dir="$tmpdir/rl2"
+mkdir -p "$rl2_dir/bin"
+cat > "$rl2_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration dispatch-show") echo '{"ok":true,"result":{"dispatch":{"status":"completed"}}}' ;;
+  "terminal list")
+    if grep -qx "term_rl2_ok" "$RL2_CLOSED_MARKER" 2>/dev/null; then
+      echo '{"ok":true,"result":{"terminals":[]}}'
+    else
+      echo '{"ok":true,"result":{"terminals":[{"handle":"term_rl2_ok","connected":true}]}}'
+    fi
+    ;;
+  "terminal close")
+    echo "term_rl2_ok" >> "$RL2_CLOSED_MARKER"
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$rl2_dir/bin/orca"
+: > "$rl_dir/rl2-closed.log"
+seed_rl_ledger task_rl2 term_rl2_ok
+rl2_rc=0
+rl2_out="$(
+  export PATH="$rl2_dir/bin:$PATH"
+  export RL2_CLOSED_MARKER="$rl_dir/rl2-closed.log"
+  "$RL_REAP" --task task_rl2 --handle term_rl2_ok --poll-ms 50 --timeout-ms 3000
+)" 2>&1 || rl2_rc=$?
+assert RL2_reap_exits_ok "[[ \"$rl2_rc\" -eq 0 ]]"
+assert RL2_reports_confirmed_gone "printf '%s' \"\$rl2_out\" | grep -q 'confirmed gone'"
+rl2_status="$(rl_ledger_status task_rl2)"
+assert RL2_ledger_says_closed "[[ \"$rl2_status\" == 'closed' ]]"
+
+# --- RL3 (undetermined path, the third of close_handle's three outcomes):
+# `orca terminal list` itself failing outright must leave a distinct,
+# unambiguous "close_undetermined" status — never "closed" (which would
+# claim confirmation that never happened) and never silently indistinguishable
+# from RL1's genuine failure. ---
+rl3_dir="$tmpdir/rl3"
+mkdir -p "$rl3_dir/bin"
+cat > "$rl3_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration dispatch-show") echo '{"ok":true,"result":{"dispatch":{"status":"completed"}}}' ;;
+  "terminal list") echo "simulated outage" >&2; exit 7 ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$rl3_dir/bin/orca"
+seed_rl_ledger task_rl3 term_rl3_unknown
+rl3_rc=0
+rl3_out="$(
+  export PATH="$rl3_dir/bin:$PATH"
+  "$RL_REAP" --task task_rl3 --handle term_rl3_unknown --poll-ms 50 --timeout-ms 3000
+)" 2>&1 || rl3_rc=$?
+assert RL3_reap_exits_ok "[[ \"$rl3_rc\" -eq 0 ]]"
+rl3_status="$(rl_ledger_status task_rl3)"
+assert RL3_ledger_says_undetermined "[[ \"$rl3_status\" == 'close_undetermined' ]]"
+assert RL3_ledger_not_closed "[[ \"$rl3_status\" != 'closed' ]]"
 
 # --- TG4/TG5/TG6: orca-bootstrap-roles.sh failure isolation. A dedicated
 # stub understands `terminal create` (echoes a handle derived from --title),

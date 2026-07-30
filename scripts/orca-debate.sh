@@ -562,8 +562,35 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
       lock_register_handle "$LOCK_FILE" "$preflight_handle" \
         || echo "(warn) could not register $preflight_handle with $LOCK_FILE — the watchdog owning that lock will not know about it until round 1's own dispatch registers it" >&2
     else
+      # Fix round 1 (Finding 2): naming the broken seat and showing its
+      # screen is not enough — the message must also tell the user the
+      # documented remedy exists and how to invoke it. --debaters already
+      # supports a reduced roster (the round's own quorum is 3), and
+      # dropping a seat must be the user's EXPLICIT choice via that flag,
+      # never a silent degradation this script decides on its own — hence
+      # computing and printing the exact value to pass, not just gesturing
+      # at "--debaters exists, see --help". Computed here, BEFORE restoring
+      # IFS to $OLD_IFS below, since $DEBATERS is comma-separated and this
+      # loop's own IFS=',' is what makes `for other in $DEBATERS` split it
+      # correctly — a mutation-worthy trap (the same class as the WORKTREE
+      # bug caught in review) is doing this computation after the IFS
+      # restore, where the whole roster would collapse into one word.
+      # remaining_count is tallied by counting what this loop actually kept
+      # (never derived from $COUNT arithmetic like "$COUNT - 1"), so it is
+      # self-consistent even if $DEBATERS ever contained a duplicate short
+      # name.
+      remaining="" remaining_count=0
+      for other in $DEBATERS; do
+        [[ "$other" == "$short" ]] && continue
+        remaining="${remaining:+$remaining,}$other"
+        remaining_count=$((remaining_count + 1))
+      done
       IFS="$OLD_IFS"
-      echo "Preflight FAILED: debater '$short' ($role_key) could not be made ready — see its terminal's screen state above (from ensure_terminal/seed's own diagnostics). Aborting BEFORE creating any orchestration task, so a bad seat costs seconds, not a round timeout." >&2
+      if [[ "$remaining_count" -ge 3 ]]; then
+        echo "Preflight FAILED: debater '$short' ($role_key) could not be made ready — see its terminal's screen state above (from ensure_terminal/seed's own diagnostics). Aborting BEFORE creating any orchestration task, so a bad seat costs seconds, not a round timeout. To proceed WITHOUT '$short' (the round's own quorum is 3, so this is a supported roster — note seats after '$short' in the roster were never reached, so this does not guarantee THEY are ready too): re-run with --debaters $remaining. Or fix '$short' and re-run unchanged." >&2
+      else
+        echo "Preflight FAILED: debater '$short' ($role_key) could not be made ready — see its terminal's screen state above (from ensure_terminal/seed's own diagnostics). Aborting BEFORE creating any orchestration task, so a bad seat costs seconds, not a round timeout. Dropping '$short' via --debaters is NOT viable here — it would leave fewer than 3 debaters (the round's own quorum), which orca-debate.sh already refuses before ever reaching preflight. Fix '$short' and re-run, or restart with --debaters naming at least 3 working CLIs." >&2
+      fi
       exit 1
     fi
   done

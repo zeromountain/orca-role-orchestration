@@ -89,9 +89,27 @@ close_handle() {
     1) echo "reap: ERROR — $h is STILL LIVE after a close attempt for task=$TASK_ID" ;;
     2) echo "reap: closed $h (close attempted; could not confirm it is gone — liveness undetermined)" ;;
   esac
+  # Fix round 1 (Finding 1): this function's own body used to end on the
+  # `case` above, whose every branch is a bare `echo` — meaning
+  # close_handle's return status was always 0 (an echo's own exit code)
+  # regardless of $verify_rc, no matter how loudly the "STILL LIVE" line
+  # above screamed. The caller then called mark_ledger "closed"
+  # unconditionally, so a close terminal_close_and_verify itself detected
+  # as having failed still landed as status:"closed" in
+  # dispatch-ledger.jsonl — the exact silent-success pattern Part B exists
+  # to eliminate, surviving in the one artifact that outlives the terminal
+  # output. Returning $verify_rc here is what lets the caller pick a ledger
+  # status that matches reality instead of always writing "closed".
+  return "$verify_rc"
 }
 
 mark_ledger() {
+  # $1=status. "closedAt"/"reaped" are written unconditionally regardless
+  # of which status is passed — they record that the reap CYCLE acted on
+  # this task at this moment, not that the close itself succeeded; only
+  # the "status" string carries that distinction (see the close_handle
+  # call site below for the three values this can now be: "closed",
+  # "close_failed", "close_undetermined").
   local status="$1"
   [[ -f "$LEDGER_FILE" ]] || return 0
   python3 - "$LEDGER_FILE" "$TASK_ID" "$status" <<'PY' 2>/dev/null || true
@@ -137,8 +155,20 @@ while true; do
   case "$STATUS" in
     completed|failed)
       echo "reap: task $TASK_ID status=$STATUS — closing worker"
-      close_handle "$HANDLE"
-      mark_ledger "closed"
+      # Fix round 1 (Finding 1): close_handle can now legitimately return
+      # 1 (still live) or 2 (undetermined), not just 0 — never call it
+      # bare under this script's `set -euo pipefail`, or a real close
+      # failure would kill the reaper mid-cycle instead of reaching
+      # mark_ledger at all. The `*)` arm is defensive only: close_handle's
+      # own contract is 0/1/2, matching terminal_close_and_verify.
+      close_rc=0
+      close_handle "$HANDLE" || close_rc=$?
+      case "$close_rc" in
+        0) mark_ledger "closed" ;;
+        1) mark_ledger "close_failed" ;;
+        2) mark_ledger "close_undetermined" ;;
+        *) mark_ledger "close_undetermined" ;;
+      esac
       exit 0
       ;;
     dispatched|pending|ready|running|unknown|"")
