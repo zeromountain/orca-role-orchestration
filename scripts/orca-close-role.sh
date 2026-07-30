@@ -62,15 +62,30 @@ if [[ "$CLOSE_LIVE_RC" -eq 1 ]]; then
   exit 0
 fi
 if [[ "$CLOSE_LIVE_RC" -eq 2 ]]; then
-  echo "Handle $HANDLE liveness undetermined (orca terminal list unavailable) — attempting close anyway" >&2
+  echo "Handle $HANDLE liveness undetermined (present but disconnected, or orca terminal list unavailable) — attempting close anyway" >&2
 fi
 
 echo "Closing $TARGET → $HANDLE (tab)"
-# Prefer --tab so the whole sub-session leaves the sidebar (not just the pane).
-if orca terminal close --terminal "$HANDLE" --tab --json >/dev/null 2>&1 \
-  || orca terminal close --terminal "$HANDLE" --json >/dev/null 2>&1; then
-  echo "Closed $HANDLE"
-else
-  echo "Close returned non-zero for $HANDLE (treating as ok — may already be gone)"
-fi
-exit 0
+# terminal_close_and_verify (orca-roles-lib.sh) does not just fire the close
+# call and trust its reported success — it re-checks terminal_is_live
+# afterward. A close that leaves the terminal still live is exactly the
+# defect this guards against (closes were previously reported as success
+# unconditionally), so that case is reported LOUDLY and this script exits
+# non-zero instead of silently swallowing it. Prefer --tab inside that
+# helper so the whole sub-session leaves the sidebar (not just the pane).
+VERIFY_RC=0
+terminal_close_and_verify "$HANDLE" || VERIFY_RC=$?
+case "$VERIFY_RC" in
+  0)
+    echo "Closed $HANDLE (confirmed gone)"
+    exit 0
+    ;;
+  1)
+    echo "ERROR: $HANDLE is STILL LIVE after a close attempt for $TARGET — close did not take effect" >&2
+    exit 1
+    ;;
+  2)
+    echo "Closed $HANDLE (close attempted; could not confirm it is gone — liveness undetermined, orca terminal list unavailable)"
+    exit 0
+    ;;
+esac

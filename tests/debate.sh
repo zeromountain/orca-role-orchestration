@@ -2959,6 +2959,221 @@ assert WD8c_never_closes_thrifty "[[ ! -f \"$wd8_dir/c/closed.log\" ]]"
 assert WD8c_kept_polling "[[ \"${wd8c_calls:-0}\" -ge 2 ]]"
 assert WD8c_logs_the_leftover "grep -q 'task=task_X' \"$wd8_dir/c.err\""
 
+# ----------------------------------------------------------------------------
+# TG (terminal-readiness-gate Task 1): distinguish "gone" from "cannot tell",
+# and isolate orca-bootstrap-roles.sh's per-role failures.
+#
+# Pre-fix reproductions for TG1/TG2/TG5 (a stubbed `orca` against the
+# UNMODIFIED code, run BEFORE any of this task's changes were made) are
+# recorded verbatim — command and output — in task-1-report.md; they are not
+# re-embedded here as git-history fixtures because this file's own convention
+# (see H5's comment above) is to record pre-fix repro in the report and let
+# these tests assert only the fixed behavior, with mutation checks (also in
+# the report) standing in for "does this test even fail without the fix".
+# ----------------------------------------------------------------------------
+
+# --- TG1: terminal_is_live must report "cannot tell" (2), not "definitely
+# not live" (1), for a handle that IS present in a successfully-retrieved
+# list but reports connected:false (a flap) — the exact defect A scenario.
+# H4 (above) already covers live/absent/list-failure/malformed-json; this is
+# the one combination H4 never exercised.
+tg1_dir="$tmpdir/tg1"
+mkdir -p "$tg1_dir/bin"
+cat > "$tg1_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminals":[{"handle":"term_tg_flap","connected":false}]}}'
+exit 0
+ORCASTUB
+chmod +x "$tg1_dir/bin/orca"
+tg1_rc=0
+( export PATH="$tg1_dir/bin:$PATH"; terminal_is_live term_tg_flap ) || tg1_rc=$?
+assert TG1_present_disconnected_is_cannot_tell "[[ \"$tg1_rc\" -eq 2 ]]"
+
+# --- TG2/TG3: orca-close-role.sh against a flapping handle. Sandboxed the
+# same way as R5's close_sandbox (own copy of the two files, own handles.json
+# — orca-close-role.sh checks its role whitelist before handles.json, and
+# once past it falls through to a real `orca` call, so this must not run
+# against the actual repo root).
+tg23_dir="$tmpdir/tg23"
+mkdir -p "$tg23_dir/scripts" "$tg23_dir/bin"
+cp "$ROOT/scripts/orca-close-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg23_dir/scripts/"
+cat > "$tg23_dir/handles.json" <<'JSON'
+{"version":1,"roles":{"architect":{"handle":"term_tg_flap"}},"architect":"term_tg_flap"}
+JSON
+cat > "$tg23_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_tg_flap","connected":false}]}}' ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tg23_dir/bin/orca"
+tg2_out="$(PATH="$tg23_dir/bin:$PATH" "$tg23_dir/scripts/orca-close-role.sh" architect 2>&1)"
+assert TG2_flapping_not_reported_already_gone \
+  "! printf '%s' \"\$tg2_out\" | grep -q 'already gone'"
+assert TG2_flapping_close_is_attempted \
+  "printf '%s' \"\$tg2_out\" | grep -q 'Closing architect'"
+
+# --- TG3: a close whose target is still live+connected immediately
+# afterward (the close call itself reported {"ok":true} but nothing actually
+# changed) must be reported LOUDLY and exit non-zero — never silently
+# swallowed as "may already be gone".
+tg3_dir="$tmpdir/tg3"
+mkdir -p "$tg3_dir/scripts" "$tg3_dir/bin"
+cp "$ROOT/scripts/orca-close-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg3_dir/scripts/"
+cat > "$tg3_dir/handles.json" <<'JSON'
+{"version":1,"roles":{"architect":{"handle":"term_tg_stuck"}},"architect":"term_tg_stuck"}
+JSON
+cat > "$tg3_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_tg_stuck","connected":true}]}}' ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tg3_dir/bin/orca"
+tg3_rc=0
+tg3_out="$(PATH="$tg3_dir/bin:$PATH" "$tg3_dir/scripts/orca-close-role.sh" architect 2>&1)" || tg3_rc=$?
+assert TG3_stuck_close_exits_nonzero "[[ \"$tg3_rc\" -ne 0 ]]"
+assert TG3_stuck_close_reported_loudly \
+  "printf '%s' \"\$tg3_out\" | grep -qi 'STILL LIVE'"
+
+# --- TG4/TG5/TG6: orca-bootstrap-roles.sh failure isolation. A dedicated
+# stub understands `terminal create` (echoes a handle derived from --title),
+# `terminal send` (fails for one specific handle only, everyone else
+# succeeds), and `terminal read` (echoes back the exact handle asked for, so
+# seed()'s read-back gate — which requires the handle in the response to
+# match — passes for every role whose send succeeded).
+tg_bootstrap_stub() {
+  # $1=bin_dir $2=fail_create_title (or "") $3=fail_send_title (or "")
+  local dir="$1" fail_create="$2" fail_send="$3"
+  cat > "$dir/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal create")
+    title=""
+    prev=""
+    for a in "\$@"; do
+      if [[ "\$prev" == "--title" ]]; then title="\$a"; fi
+      prev="\$a"
+    done
+    if [[ "\$title" == "$fail_create" && -n "$fail_create" ]]; then
+      echo "stub: simulated create failure for \$title" >&2
+      exit 1
+    fi
+    echo "{\\"ok\\":true,\\"result\\":{\\"terminal\\":{\\"handle\\":\\"term_\${title}\\"}}}"
+    ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send")
+    term=""
+    prev=""
+    for a in "\$@"; do
+      if [[ "\$prev" == "--terminal" ]]; then term="\$a"; fi
+      prev="\$a"
+    done
+    # Independent of handles.json (which is populated during the CREATE
+    # phase and would still show every handle even if the SEED phase aborted
+    # outright) — this is the only signal that the seed step itself was
+    # actually reached for a given handle, which is what TG4 needs to catch
+    # a regression back to "one role's seed failure aborts the rest".
+    [[ -n "\${TG_SEND_LOG:-}" ]] && printf '%s\n' "\$term" >> "\$TG_SEND_LOG"
+    if [[ "\$term" == "term_$fail_send" && -n "$fail_send" ]]; then
+      echo "stub: simulated send failure for \$term" >&2
+      exit 1
+    fi
+    echo '{"ok":true,"result":{"send":{"handle":"'"\$term"'","accepted":true}}}'
+    ;;
+  "terminal read")
+    term=""
+    prev=""
+    for a in "\$@"; do
+      if [[ "\$prev" == "--terminal" ]]; then term="\$a"; fi
+      prev="\$a"
+    done
+    echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","tail":[]}}}'
+    ;;
+  "status --json") echo '{"ok": true, "reachable": true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+  chmod +x "$dir/orca"
+}
+
+# TG4: seed fails for role-sol-executor (the 2nd of the 4 roles bootstrap
+# creates — architect, executor, thrifty, fallback, in that order). Every
+# role's terminal is still created; the failure must not strand roles 1's
+# already-durable handle, and roles 3/4 must still be attempted.
+tg4_dir="$tmpdir/tg4"
+mkdir -p "$tg4_dir/orch/scripts" "$tg4_dir/orch/bin"
+cp "$ROOT/scripts/orca-bootstrap-roles.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg4_dir/orch/scripts/"
+tg_bootstrap_stub "$tg4_dir/orch/bin" "" "role-sol-executor"
+tg4_send_log="$tg4_dir/send.log"
+: > "$tg4_send_log"
+tg4_rc=0
+(
+  cd "$tg4_dir"
+  export TG_SEND_LOG="$tg4_send_log"
+  PATH="$tg4_dir/orch/bin:$PATH" "$tg4_dir/orch/scripts/orca-bootstrap-roles.sh" --worktree active --project-name tg4
+) >"$tg4_dir/out.log" 2>"$tg4_dir/err.log" || tg4_rc=$?
+assert TG4_seed_failure_exits_nonzero "[[ \"$tg4_rc\" -ne 0 ]]"
+assert TG4_all_four_handles_recorded \
+  "python3 -c \"import json; d=json.load(open('$tg4_dir/orch/handles.json')); assert sorted(d['roles'].keys())==['architect','executor','fallback','thrifty'], d['roles'].keys()\""
+assert TG4_names_failed_role "grep -q 'executor' \"$tg4_dir/out.log\" \"$tg4_dir/err.log\""
+# The real, handles.json-independent proof that failure isolation (not a
+# lucky partial abort) is what happened: the seed step was actually REACHED
+# for the failing role itself, and for both roles after it.
+assert TG4_executor_seed_reached "grep -qx term_role-sol-executor \"$tg4_send_log\""
+assert TG4_thrifty_seed_attempted \
+  "grep -qx term_role-grok-thrifty \"$tg4_send_log\""
+assert TG4_fallback_seed_attempted \
+  "grep -qx term_role-agy-fallback \"$tg4_send_log\""
+
+# TG5: create_role itself fails for the 2nd role (thrifty/grok this time, to
+# exercise a DIFFERENT role than TG4) — roles 1, 3, and 4 must still be
+# created and durably recorded; the failed role must have no handle at all.
+tg5_dir="$tmpdir/tg5"
+mkdir -p "$tg5_dir/orch/scripts" "$tg5_dir/orch/bin"
+cp "$ROOT/scripts/orca-bootstrap-roles.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg5_dir/orch/scripts/"
+tg_bootstrap_stub "$tg5_dir/orch/bin" "role-grok-thrifty" ""
+tg5_rc=0
+(
+  cd "$tg5_dir"
+  PATH="$tg5_dir/orch/bin:$PATH" "$tg5_dir/orch/scripts/orca-bootstrap-roles.sh" --worktree active --project-name tg5
+) >"$tg5_dir/out.log" 2>"$tg5_dir/err.log" || tg5_rc=$?
+assert TG5_create_failure_exits_nonzero "[[ \"$tg5_rc\" -ne 0 ]]"
+assert TG5_names_failed_role "grep -q 'thrifty' \"$tg5_dir/out.log\" \"$tg5_dir/err.log\""
+assert TG5_architect_recorded "grep -q term_role-opus-architect \"$tg5_dir/orch/handles.json\""
+assert TG5_executor_recorded "grep -q term_role-sol-executor \"$tg5_dir/orch/handles.json\""
+assert TG5_fallback_recorded "grep -q term_role-agy-fallback \"$tg5_dir/orch/handles.json\""
+assert TG5_thrifty_has_no_handle \
+  "python3 -c \"import json; d=json.load(open('$tg5_dir/orch/handles.json')); v=d['roles'].get('thrifty',{}).get('handle'); assert not v, v\""
+
+# TG6: all-succeed path — regression guard that bootstrap's observable
+# end-state (all four handles recorded, exit 0, final messages) did not
+# change shape from this rewrite, even though the per-role loop now
+# interleaves handles_set into the create phase instead of batching it at
+# the very end (see task-1-report.md for the byte-level equality check
+# against the pre-fix script run against this exact fixture).
+tg6_dir="$tmpdir/tg6"
+mkdir -p "$tg6_dir/orch/scripts" "$tg6_dir/orch/bin"
+cp "$ROOT/scripts/orca-bootstrap-roles.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg6_dir/orch/scripts/"
+tg_bootstrap_stub "$tg6_dir/orch/bin" "" ""
+tg6_rc=0
+(
+  cd "$tg6_dir"
+  PATH="$tg6_dir/orch/bin:$PATH" "$tg6_dir/orch/scripts/orca-bootstrap-roles.sh" --worktree active --project-name tg6
+) >"$tg6_dir/out.log" 2>"$tg6_dir/err.log" || tg6_rc=$?
+assert TG6_all_succeed_exits_zero "[[ \"$tg6_rc\" -eq 0 ]]"
+assert TG6_all_succeed_says_done "grep -q '^Done\\.' \"$tg6_dir/out.log\""
+assert TG6_all_four_recorded \
+  "python3 -c \"import json; d=json.load(open('$tg6_dir/orch/handles.json')); assert sorted(d['roles'].keys())==['architect','executor','fallback','thrifty'], d['roles'].keys()\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

@@ -434,6 +434,18 @@ terminal_is_live() {
   # non-zero (including a failed `orca terminal list`) read as "dead", so a
   # transient list failure could make ensure_terminal spin up a duplicate
   # terminal for a role whose original was still running.
+  #
+  # "Could not determine" now ALSO covers a handle that IS present in a
+  # successfully-retrieved list but reports connected:false (a flap) — not
+  # just a list call that failed outright. Those are two different facts:
+  # absent from the list means the terminal is gone; present-but-momentarily-
+  # disconnected means we simply do not know yet. Observed live: a handle
+  # present with connected:false got reported as exit 1 ("definitely not
+  # live") by the old code, cleanup logged "already gone (ok)" and skipped
+  # closing it, and an immediate follow-up query on that same handle came
+  # back connected:true — the terminal, and its permission-bypass session,
+  # had never actually gone anywhere. Only an ABSENT handle is exit 1 now;
+  # present-but-disconnected is exit 2, same as an unreadable list.
   local handle="$1" list_json rc=0
   list_json="$(orca terminal list --json 2>/dev/null)" || rc=$?
   if [[ "$rc" -ne 0 || -z "${list_json// }" ]]; then
@@ -455,8 +467,63 @@ if not isinstance(result, dict):
 terminals = result.get("terminals")
 if not isinstance(terminals, list):
     sys.exit(2)
-sys.exit(0 if any(t.get("handle") == h and t.get("connected") for t in terminals) else 1)
+# Checked as three separate facts, in this order, rather than folded into
+# one boolean expression: a duplicate/stale entry for the same handle could
+# otherwise let a disconnected copy shadow a connected one depending on list
+# order. any(... and connected) is tried FIRST and independently of presence,
+# so a connected entry anywhere in the list still wins exit 0 regardless of
+# what any other same-handle entry says.
+if any(t.get("handle") == h and t.get("connected") for t in terminals):
+    sys.exit(0)
+if any(t.get("handle") == h for t in terminals):
+    sys.exit(2)
+sys.exit(1)
 ' "$handle"
+}
+
+terminal_close_and_verify() {
+  # $1=handle → attempts to close the terminal, then CONFIRMS it is actually
+  # gone instead of trusting the close call's own reported success. Returns:
+  #   0 = confirmed gone (terminal_is_live now reports 1, absent from the list)
+  #   1 = STILL LIVE after the close attempt — a real, loud failure. Never
+  #       swallowed: closes were previously reported as success unconditionally,
+  #       which is exactly how a permission-bypassed session could survive a
+  #       driver that believed it had cleaned up.
+  #   2 = could not confirm either way (liveness undetermined, e.g. `orca
+  #       terminal list` itself failed) — soft. Per terminal_is_live's own
+  #       contract, 2 is never proof of anything and callers must not treat
+  #       it as a hard failure.
+  #
+  # A successful close is not necessarily reflected in `orca terminal list`
+  # the instant the close call returns (the same kind of propagation lag
+  # seed()'s own read-back already retries around), so "still live" is only
+  # trusted as a genuine failure after a few short retries — one true
+  # negative read (rc=1, gone) or one inconclusive read (rc=2) is accepted
+  # immediately, without waiting out the rest of the retry budget, since
+  # neither of those needs re-checking.
+  local handle="$1" verify_rc=0 attempt
+  orca terminal close --terminal "$handle" --tab --json >/dev/null 2>&1 \
+    || orca terminal close --terminal "$handle" --json >/dev/null 2>&1 \
+    || true
+  for attempt in 1 2 3; do
+    verify_rc=0
+    terminal_is_live "$handle" || verify_rc=$?
+    [[ "$verify_rc" -ne 0 ]] && break
+    [[ "$attempt" -lt 3 ]] && sleep 0.5
+  done
+  case "$verify_rc" in
+    1)
+      return 0
+      ;;
+    0)
+      echo "terminal_close_and_verify: $handle is STILL LIVE after a close attempt (checked $attempt time(s)) — the close did not take effect" >&2
+      return 1
+      ;;
+    2)
+      echo "terminal_close_and_verify: could not confirm $handle is gone after the close attempt (liveness undetermined — present but disconnected, or orca terminal list unavailable)" >&2
+      return 2
+      ;;
+  esac
 }
 
 ensure_terminal() {
@@ -479,7 +546,7 @@ ensure_terminal() {
         # Could not determine — never treat "undetermined" as "dead": that
         # is exactly how a live terminal used to get a duplicate created
         # alongside it.
-        echo "Role $role handle $handle: liveness undetermined (orca terminal list unavailable) — leaving it alone, not recreating" >&2
+        echo "Role $role handle $handle: liveness undetermined (present but disconnected, or orca terminal list unavailable) — leaving it alone, not recreating" >&2
         printf '%s\n' "$handle"
         return 0
         ;;

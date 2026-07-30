@@ -58,21 +58,10 @@ fi
 
 echo "Bootstrapping role workers (worktree=$WORKTREE project=$PROJECT_NAME)…"
 
-ARCH_HANDLE="$(create_role "$(role_meta architect | cut -f1)" "$(role_launch_cmd architect)")"
-SOL_HANDLE="$(create_role "$(role_meta executor | cut -f1)" "$(role_launch_cmd executor)")"
-GROK_HANDLE="$(create_role "$(role_meta thrifty | cut -f1)" "$(role_launch_cmd thrifty)")"
-FALLBACK_HANDLE="$(create_role "$(role_meta fallback | cut -f1)" "$(role_launch_cmd fallback)")"
-
-wait_idle "$ARCH_HANDLE"
-wait_idle "$SOL_HANDLE"
-wait_idle "$GROK_HANDLE"
-wait_idle "$FALLBACK_HANDLE"
-
-seed "$ARCH_HANDLE"     architect "$(role_meta architect | cut -f2)" "$(role_fallback_body architect)"
-seed "$SOL_HANDLE"      executor  "$(role_meta executor  | cut -f2)" "$(role_fallback_body executor)"
-seed "$GROK_HANDLE"     thrifty   "$(role_meta thrifty   | cut -f2)" "$(role_fallback_body thrifty)"
-seed "$FALLBACK_HANDLE" fallback  "$(role_meta fallback  | cut -f2)" "$(role_fallback_body fallback)"
-
+# Stamp/normalize handles.json BEFORE any role is created, so the per-role
+# handles_set calls below (inside the create loop) always have a file to
+# read-modify-write against, and so this metadata (routing_ssot, playbook,
+# limit_failover) is present even if every subsequent role fails.
 python3 - "$HANDLES_FILE" "$WORKTREE" <<'PY'
 import json, os, sys, datetime
 path, worktree = sys.argv[1:3]
@@ -99,11 +88,82 @@ with open(path, "w") as f:
     f.write("\n")
 PY
 
-handles_set "$HANDLES_FILE" architect "$ARCH_HANDLE"
-handles_set "$HANDLES_FILE" executor  "$SOL_HANDLE"
-handles_set "$HANDLES_FILE" thrifty   "$GROK_HANDLE"
-handles_set "$HANDLES_FILE" fallback  "$FALLBACK_HANDLE"
+# Failure isolation (Task 1, defect C): the four primary roles are created,
+# waited-on, and seeded in three separate PHASES (not one role fully
+# end-to-end before the next starts) so all four terminals still boot
+# concurrently on the all-succeed path, exactly as before this fix — only
+# per-role handles_set is now pulled forward into the create phase, and every
+# per-role call that can fail is explicitly guarded instead of a bare
+# statement, so one role's failure can never abort the loop and strand
+# already-created terminals unrecorded (which is exactly what happened when
+# `seed` for role 2 died under `set -euo pipefail` with handles.json written
+# only at the very end). ROLES/HANDLES are plain bash 3.2 indexed arrays —
+# always exactly 4 elements, so expanding them under `set -u` is always safe;
+# FAILURES is a plain accumulated string (not an array) specifically because
+# it CAN be empty on the all-succeed path, and an empty array's "${arr[@]}"
+# expansion aborts some bash 3.2 builds under `set -u`.
+ROLES=(architect executor thrifty fallback)
+HANDLES=("" "" "" "")
+FAILURES=""
+FAIL_COUNT=0
+
+n_roles=${#ROLES[@]}
+i=0
+while [[ "$i" -lt "$n_roles" ]]; do
+  role="${ROLES[$i]}"
+  title="$(role_meta "$role" | cut -f1)"
+  cmd="$(role_launch_cmd "$role")"
+  if handle="$(create_role "$title" "$cmd" "$role")"; then
+    HANDLES[$i]="$handle"
+    if ! handles_set "$HANDLES_FILE" "$role" "$handle"; then
+      echo "bootstrap: handles_set failed to record handle=$handle for role=$role — terminal is live but NOT durably tracked in $HANDLES_FILE (see terminal-journal.jsonl); skipping wait/seed for this role" >&2
+      HANDLES[$i]=""
+      FAILURES="${FAILURES}  - $role: created (handle=$handle) but handles_set failed — terminal is live, untracked in $HANDLES_FILE, recorded in terminal-journal.jsonl
+"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+  else
+    echo "bootstrap: create_role failed for role=$role — see terminal-journal.jsonl for the raw create response" >&2
+    FAILURES="${FAILURES}  - $role: create_role failed — no terminal created
+"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
+  i=$((i + 1))
+done
+
+i=0
+while [[ "$i" -lt "$n_roles" ]]; do
+  if [[ -n "${HANDLES[$i]}" ]]; then
+    wait_idle "${HANDLES[$i]}"
+  fi
+  i=$((i + 1))
+done
+
+i=0
+while [[ "$i" -lt "$n_roles" ]]; do
+  role="${ROLES[$i]}"
+  handle="${HANDLES[$i]}"
+  if [[ -n "$handle" ]]; then
+    model="$(role_meta "$role" | cut -f2)"
+    if ! seed "$handle" "$role" "$model" "$(role_fallback_body "$role")"; then
+      echo "bootstrap: seed failed for role=$role handle=$handle — handle is recorded in $HANDLES_FILE so it can still be closed/retried" >&2
+      FAILURES="${FAILURES}  - $role: seed failed — handle=$handle IS recorded in $HANDLES_FILE (closable/retryable)
+"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+  fi
+  i=$((i + 1))
+done
+
 echo "Wrote $HANDLES_FILE"
+
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
+  echo "" >&2
+  echo "Bootstrap completed with $FAIL_COUNT failure(s):" >&2
+  printf '%s' "$FAILURES" >&2
+  echo "Handles for every role that WAS created are already recorded in $HANDLES_FILE. Re-run bootstrap to retry — ensure_terminal-based dispatch reuses any handle already on file." >&2
+  exit 1
+fi
 
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
 echo "After dispatch: worker tabs auto-close (background reaper + worker AUTO-CLOSE)."
