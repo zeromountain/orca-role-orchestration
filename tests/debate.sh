@@ -1007,20 +1007,46 @@ with open(path, "w") as f:
 PY
 }
 
+first_sorted_lock_pid() {
+  # $1=locks_dir -> the "pid" field of whichever *.json file
+  # sorted(glob.glob(...)) would visit FIRST. This is the exact traversal
+  # order orca-sweep-orphans.sh itself uses (see its stale_candidates
+  # construction), reproduced faithfully in python rather than
+  # reimplemented in bash, so this proves what the actual production code
+  # sees — not what a bash guess at sort order might.
+  python3 -c '
+import glob, json, os, sys
+locks_dir = sys.argv[1]
+files = sorted(glob.glob(os.path.join(locks_dir, "*.json")))
+print(json.load(open(files[0])).get("pid"))
+' "$1"
+}
+
 run_agg_ordering() {
-  # $1=label $2=dead_lock_filename $3=alive_lock_filename — filenames chosen
-  # by the caller so glob sort order (alphabetical) is controlled explicitly.
-  local label="$1" dead_name="$2" alive_name="$3"
+  # $1=label $2=file_a $3=pid_a $4=file_b $5=pid_b — writes exactly two
+  # stale locks with the EXACT (filename, owner pid) pairs given, both
+  # naming the shared handle. Deliberately no dead_name/alive_name
+  # parameter pair here: an earlier version of this test named parameters
+  # by ROLE ("dead_name", "alive_name") rather than by identity, and both
+  # call sites happened to pass the alphabetically-first filename as the
+  # "dead" parameter regardless of which label the case was given —
+  # meaning "dead_first" and "alive_first" wrote the identical fixture
+  # (dead pid always in the first-sorting file) under two different
+  # names, so the aggregation fix's ability to survive the alive-owner
+  # lock sorting first was never actually exercised. Taking the pid
+  # directly as an argument for each named file removes any place for
+  # that mismatch to hide.
+  local label="$1" file_a="$2" pid_a="$3" file_b="$4" pid_b="$5"
   rm -rf "$c_agg_orch/debate-locks"
   mkdir -p "$c_agg_orch/debate-locks"
-  lock_write "$c_agg_orch/debate-locks/$dead_name" "$c_dead_pid" "deadslug_$label" 5
-  lock_register_handle "$c_agg_orch/debate-locks/$dead_name" term_agg_shared
-  lock_merge_and_refresh "$c_agg_orch/debate-locks/$dead_name"
-  lock_write "$c_agg_orch/debate-locks/$alive_name" "$$" "aliveslug_$label" 5
-  lock_register_handle "$c_agg_orch/debate-locks/$alive_name" term_agg_shared
-  lock_merge_and_refresh "$c_agg_orch/debate-locks/$alive_name"
-  push_stale "$c_agg_orch/debate-locks/$dead_name"
-  push_stale "$c_agg_orch/debate-locks/$alive_name"
+  lock_write "$c_agg_orch/debate-locks/$file_a" "$pid_a" "slugA_$label" 5
+  lock_register_handle "$c_agg_orch/debate-locks/$file_a" term_agg_shared
+  lock_merge_and_refresh "$c_agg_orch/debate-locks/$file_a"
+  lock_write "$c_agg_orch/debate-locks/$file_b" "$pid_b" "slugB_$label" 5
+  lock_register_handle "$c_agg_orch/debate-locks/$file_b" term_agg_shared
+  lock_merge_and_refresh "$c_agg_orch/debate-locks/$file_b"
+  push_stale "$c_agg_orch/debate-locks/$file_a"
+  push_stale "$c_agg_orch/debate-locks/$file_b"
 
   : > "$c_agg_dir/closed-$label.log"
   (
@@ -1031,23 +1057,41 @@ run_agg_ordering() {
   ) >"$c_agg_dir/sweep-$label.out" 2>"$c_agg_dir/sweep-$label.err"
 }
 
-# dead_first: dead-owner lock sorts alphabetically before the alive-owner
-# lock — this is the exact reviewer repro (their "p_dead.json" / "q_alive.json").
-# Both modes checked: report-only (--close was not passed, so the close
-# marker is always empty regardless of correctness — the actual signal is
-# the reported text) and, separately below (C6), --close for real against
-# a stub. "WOULD CLOSE" appearing at all in this single-handle fixture can
-# only be about term_agg_shared.
-run_agg_ordering dead_first "aaa_dead.json" "zzz_alive.json"
+c_my_pid="$$"
+
+# dead_first: dead-owner lock ("aaa_dead.json") sorts alphabetically before
+# the alive-owner lock ("zzz_alive.json") — this is the exact reviewer
+# repro (their "p_dead.json" / "q_alive.json"). Both modes checked:
+# report-only (--close was not passed, so the close marker is always
+# empty regardless of correctness — the actual signal is the reported
+# text) and, separately below (C6), --close for real against a stub.
+# "WOULD CLOSE" appearing at all in this single-handle fixture can only be
+# about term_agg_shared.
+run_agg_ordering dead_first "aaa_dead.json" "$c_dead_pid" "zzz_alive.json" "$c_my_pid"
+c_dead_first_first_visited_pid="$(first_sorted_lock_pid "$c_agg_orch/debate-locks")"
+assert C4_dead_first_visits_dead_owner_first \
+  "[[ \"$c_dead_first_first_visited_pid\" == \"$c_dead_pid\" ]]"
 assert C4_agg_dead_first_not_closed "! grep -qx term_agg_shared \"$c_agg_dir/closed-dead_first.log\""
 assert C4_agg_dead_first_not_reported_would_close "! grep -q 'WOULD CLOSE' \"$c_agg_dir/sweep-dead_first.out\""
 assert C4_agg_dead_first_reason "grep -qi 'owner pid=.*still alive' \"$c_agg_dir/sweep-dead_first.out\""
 
-# alive_first: same two locks, reversed sort order.
-run_agg_ordering alive_first "aaa_alive.json" "zzz_dead.json"
+# alive_first: the SAME two (filename, pid) associations reversed — the
+# alive-owner lock ("aaa_alive.json") now sorts first, the dead-owner lock
+# ("zzz_dead.json") sorts second. Proven below (C4/C5's own visit-order
+# assertions) to be the actual opposite of dead_first's traversal, not
+# merely a different label on an identical fixture.
+run_agg_ordering alive_first "aaa_alive.json" "$c_my_pid" "zzz_dead.json" "$c_dead_pid"
+c_alive_first_first_visited_pid="$(first_sorted_lock_pid "$c_agg_orch/debate-locks")"
+assert C5_alive_first_visits_alive_owner_first \
+  "[[ \"$c_alive_first_first_visited_pid\" == \"$c_my_pid\" ]]"
 assert C5_agg_alive_first_not_closed "! grep -qx term_agg_shared \"$c_agg_dir/closed-alive_first.log\""
 assert C5_agg_alive_first_not_reported_would_close "! grep -q 'WOULD CLOSE' \"$c_agg_dir/sweep-alive_first.out\""
 assert C5_agg_alive_first_reason "grep -qi 'owner pid=.*still alive' \"$c_agg_dir/sweep-alive_first.out\""
+
+# The point of the whole exercise: the two scenarios' traversal orders are
+# genuinely each other's opposite, not the same fixture under two labels.
+assert C_orderings_are_genuinely_opposite \
+  "[[ \"$c_dead_first_first_visited_pid\" != \"$c_alive_first_first_visited_pid\" ]]"
 
 # --- C6: aggregation must not OVER-protect either — two stale locks
 # sharing a handle, BOTH owners confirmed dead, must still become a
