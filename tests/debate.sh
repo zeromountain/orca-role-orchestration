@@ -1419,21 +1419,29 @@ PY
 
 o_bin_live="$tmpdir/o-bin-live"
 mkdir -p "$o_bin_live"
+# Task 3, Part B fixture fix: "terminal list" used to report all nine
+# handles as connected:true UNCONDITIONALLY, forever, regardless of any
+# "terminal close" call made against them. Harmless before this task's fix
+# (close_handle_if_live never re-checked after closing — see O1's own
+# assertions below, which only ever checked that a close was ATTEMPTED, via
+# $O_CLOSE_MARKER, never that it was confirmed), but wrong once it does:
+# every real close in this fixture would now look like it failed. Made
+# stateful the same way as w_dir/bin/orca above — omit (not mark
+# connected:false; only absence gives "confirmed dead") a handle once
+# "terminal close" has been called against it, tracked via $O_CLOSE_MARKER
+# (already exported fresh per run below).
 cat > "$o_bin_live/orca" <<'ORCASTUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "terminal list")
-    echo '{"ok":true,"result":{"terminals":[
-      {"handle":"term_orphan_old","connected":true},
-      {"handle":"term_stale_candidate","connected":true},
-      {"handle":"term_unrelated","connected":true},
-      {"handle":"term_too_young","connected":true},
-      {"handle":"term_tracked","connected":true},
-      {"handle":"term_protected","connected":true},
-      {"handle":"term_owner_still_alive","connected":true},
-      {"handle":"term_stale_and_crosslocked","connected":true},
-      {"handle":"term_sidecar_only_protected","connected":true}
-    ]}}'
+    all="term_orphan_old term_stale_candidate term_unrelated term_too_young term_tracked term_protected term_owner_still_alive term_stale_and_crosslocked term_sidecar_only_protected"
+    entries=""
+    for h in $all; do
+      if ! grep -qx "$h" "$O_CLOSE_MARKER" 2>/dev/null; then
+        entries="${entries}${entries:+,}{\"handle\":\"$h\",\"connected\":true}"
+      fi
+    done
+    echo "{\"ok\":true,\"result\":{\"terminals\":[$entries]}}"
     ;;
   "terminal close")
     prev=""
@@ -1471,6 +1479,19 @@ assert O5_leaves_lock_protected "! grep -qx term_protected \"$o_close_marker_a\"
 assert O8_no_handle_reported "grep -q 'no-handle' \"$o_dir/sweep-a.out\""
 assert O8_no_crash_on_no_handle "grep -qi 'unclosable' \"$o_dir/sweep-a.out\""
 
+# Task 3, Part B: a close attempted via --close must now be CONFIRMED, not
+# just fired — close_handle_if_live re-checks after the close call
+# (terminal_close_and_verify) instead of returning the pre-close liveness
+# unconditionally. o_bin_live's "terminal list" is stateful (see its own
+# comment above), so a genuinely-closed handle is reported "closed
+# (confirmed gone)", never "STILL LIVE" — proving combination (was live,
+# close succeeded) end to end, through the real sweep script.
+assert CV1_close_confirmed_gone_journal_orphan \
+  "grep -q 'term_orphan_old.*closed (confirmed gone)' \"$o_dir/sweep-a.out\""
+assert CV1_close_confirmed_gone_stale_lock \
+  "grep -q 'term_stale_candidate.*closed (confirmed gone)' \"$o_dir/sweep-a.out\""
+assert CV1_summary_no_still_live "! grep -q 'still-live-after-close=[1-9]' \"$o_dir/sweep-a.out\""
+
 # Report-only (the sweeper's own default): the exact same candidates are
 # identified, but nothing is actually closed without --close.
 o_close_marker_default="$o_dir/closed-default.log"
@@ -1484,6 +1505,111 @@ o_rc_default=0
 assert O6_default_run_exit_ok "[[ \"$o_rc_default\" -eq 0 ]]"
 assert O6_default_report_only_no_close "[[ ! -s \"$o_close_marker_default\" ]]"
 assert O6_default_reports_would_close "grep -q 'WOULD CLOSE' \"$o_dir/sweep-default.out\""
+# do_close=0 + live is combination (4) of close_handle_if_live's four
+# cases (Task 3, Part B self-review) — the O6 assertions above already
+# cover it end to end: WOULD CLOSE is reported and no close is ever
+# attempted ($o_close_marker_default stays empty).
+
+# --- CV2 (Task 3, Part B, combination 3 of 4: was live, close attempted,
+# did NOT succeed): a dedicated single-candidate fixture whose "terminal
+# list" reports the handle connected no matter how many times "terminal
+# close" is called — the sweep-script-level analog of TG3's orca-close-
+# role.sh test. Must be reported LOUDLY (never silently counted as
+# resolved) and must still exit 0 (a stuck close is not a sweep crash). ---
+cv2_dir="$tmpdir/cv2-stuck-close"
+mkdir -p "$cv2_dir/orch/debate-locks"
+echo '{}' > "$cv2_dir/orch/handles.json"
+python3 - "$cv2_dir/orch/terminal-journal.jsonl" <<'PY'
+import json, sys, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+old = (now - datetime.timedelta(seconds=5000)).isoformat()
+row = {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_cv2_stuck", "createdAt": old}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(row) + "\n")
+PY
+cv2_bin="$tmpdir/cv2-bin"
+mkdir -p "$cv2_bin"
+cat > "$cv2_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_cv2_stuck","connected":true}]}}' ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$CV2_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$cv2_bin/orca"
+cv2_close_marker="$cv2_dir/closed.log"
+: > "$cv2_close_marker"
+cv2_rc=0
+(
+  export PATH="$cv2_bin:$PATH"
+  export CV2_CLOSE_MARKER="$cv2_close_marker"
+  "$SWEEP" --close --orch-dir "$cv2_dir/orch" --journal "$cv2_dir/orch/terminal-journal.jsonl" \
+    --handles-file "$cv2_dir/orch/handles.json" --locks-dir "$cv2_dir/orch/debate-locks"
+) >"$cv2_dir/sweep.out" 2>"$cv2_dir/sweep.err" || cv2_rc=$?
+assert CV2_run_exit_ok "[[ \"$cv2_rc\" -eq 0 ]]"
+assert CV2_close_was_attempted "grep -qx term_cv2_stuck \"$cv2_close_marker\""
+assert CV2_reports_still_live \
+  "grep -q 'term_cv2_stuck.*STILL LIVE after a close attempt' \"$cv2_dir/sweep.out\""
+assert CV2_summary_counts_still_live "grep -q 'still-live-after-close=1' \"$cv2_dir/sweep.out\""
+
+# --- CV3 (Task 3, Part B, combination 1 of 4: was NOT live to begin with):
+# a candidate that is already absent from "terminal list" on the very
+# FIRST check — terminal_is_live's own dead verdict (1) is trusted as-is
+# and no close is ever attempted (matching orca-close-role.sh's existing
+# precedent of skipping the close call outright on a confirmed-dead
+# pre-check). ---
+cv3_dir="$tmpdir/cv3-already-gone"
+mkdir -p "$cv3_dir/orch/debate-locks"
+echo '{}' > "$cv3_dir/orch/handles.json"
+python3 - "$cv3_dir/orch/terminal-journal.jsonl" <<'PY'
+import json, sys, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+old = (now - datetime.timedelta(seconds=5000)).isoformat()
+row = {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_cv3_gone", "createdAt": old}
+with open(sys.argv[1], "w") as f:
+    f.write(json.dumps(row) + "\n")
+PY
+cv3_bin="$tmpdir/cv3-bin"
+mkdir -p "$cv3_bin"
+cat > "$cv3_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[]}}' ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$CV3_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$cv3_bin/orca"
+cv3_close_marker="$cv3_dir/closed.log"
+: > "$cv3_close_marker"
+cv3_rc=0
+(
+  export PATH="$cv3_bin:$PATH"
+  export CV3_CLOSE_MARKER="$cv3_close_marker"
+  "$SWEEP" --close --orch-dir "$cv3_dir/orch" --journal "$cv3_dir/orch/terminal-journal.jsonl" \
+    --handles-file "$cv3_dir/orch/handles.json" --locks-dir "$cv3_dir/orch/debate-locks"
+) >"$cv3_dir/sweep.out" 2>"$cv3_dir/sweep.err" || cv3_rc=$?
+assert CV3_run_exit_ok "[[ \"$cv3_rc\" -eq 0 ]]"
+assert CV3_close_never_attempted "[[ ! -s \"$cv3_close_marker\" ]]"
+assert CV3_reports_already_gone "grep -q 'term_cv3_gone.*already gone' \"$cv3_dir/sweep.out\""
+assert CV3_summary_counts_gone "grep -q 'closed-or-already-gone=1' \"$cv3_dir/sweep.out\""
 
 # --- O7: liveness undetermined (orca terminal list itself fails) — never
 # act on ambiguity, no matter that --close was passed ---
@@ -1722,11 +1848,28 @@ w_dir="$tmpdir/watchdog"
 mkdir -p "$w_dir/bin" "$w_dir/locks"
 export W_CLOSE_MARKER="$w_dir/closed.log"
 : > "$W_CLOSE_MARKER"
+# Task 3, Part B fixture fix: "terminal list" used to report both handles as
+# connected:true UNCONDITIONALLY, forever, regardless of any "terminal close"
+# call ever made against them. That was harmless before this task's fix
+# (close_handle_if_live never re-checked after closing), but is actively
+# WRONG once it does: terminal_close_and_verify's post-close re-check would
+# see these handles as still connected no matter what, making every close
+# look like it failed. Made stateful — omit (not merely mark
+# connected:false; only ABSENCE gives terminal_is_live's "confirmed dead"
+# verdict) a handle from the list once "terminal close" has been called
+# against it (tracked via $W_CLOSE_MARKER, already exported/reset per block
+# below) — matching what a real backend does after a close actually takes.
 cat > "$w_dir/bin/orca" <<'ORCASTUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "terminal list")
-    echo '{"ok":true,"result":{"terminals":[{"handle":"term_w_owned","connected":true},{"handle":"term_w_shared","connected":true}]}}'
+    entries=""
+    for h in term_w_owned term_w_shared; do
+      if ! grep -qx "$h" "$W_CLOSE_MARKER" 2>/dev/null; then
+        entries="${entries}${entries:+,}{\"handle\":\"$h\",\"connected\":true}"
+      fi
+    done
+    echo "{\"ok\":true,\"result\":{\"terminals\":[$entries]}}"
     ;;
   "terminal close")
     prev=""
@@ -2018,6 +2161,97 @@ assert W6_both_alive_lock_a_intact "[[ -f \"$w6a_lock_file\" ]]"
 kill -9 "$w6a_owner_pid" 2>/dev/null || true
 kill -9 "$w6b_owner_pid" 2>/dev/null || true
 kill -9 "$w6_watchdog_pid" 2>/dev/null || true
+
+# --- W7 (Task 3, Part B — the direct regression test for the controller
+# ruling on Task 1's review): a close that is fired but NEVER actually
+# takes (a dedicated stub that reports the handle as still connected no
+# matter how many times "terminal close" is called against it — unlike
+# w_dir/bin/orca above, which now correctly drops a handle once closed)
+# must NOT be silently treated as resolved. Before this fix,
+# close_handle_if_live returned the PRE-close liveness (always 0/live
+# whenever a close was attempted) regardless of whether it actually took —
+# run_watchdog only retried a handle on rc==2, so this exact scenario
+# dropped the handle from "pending" on the very first attempt and removed
+# the lock: a live, permission-bypassed terminal with no detector left.
+# Its own locks-dir (not w_dir/locks) keeps this test's leftover breadcrumb,
+# and the sweep run against it below, isolated from every other W-block's
+# lock files.
+w7_locks="$w_dir/locks-w7"
+mkdir -p "$w7_locks"
+w7_bin="$tmpdir/w7-bin"
+mkdir -p "$w7_bin"
+export W7_CLOSE_MARKER="$w_dir/w7-closed.log"
+: > "$W7_CLOSE_MARKER"
+cat > "$w7_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list")
+    echo '{"ok":true,"result":{"terminals":[{"handle":"term_w_stuck","connected":true}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$W7_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$w7_bin/orca"
+
+sleep 300 & w7_owner_pid=$!
+CLEANUP_PIDS+=("$w7_owner_pid")
+
+w7_lock_file="$w7_locks/w7slug.json"
+lock_write "$w7_lock_file" "$w7_owner_pid" w7slug 1800
+lock_register_handle "$w7_lock_file" term_w_stuck
+lock_merge_and_refresh "$w7_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w7_bin:$PATH"
+"$SWEEP" --watchdog --slug w7slug --owner-pid "$w7_owner_pid" --locks-dir "$w7_locks" \
+  --poll-seconds 1 --max-close-attempts 2 >"$w_dir/w7-watchdog.log" 2>&1 &
+w7_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w7_watchdog_pid")
+
+wait_for 3000 "kill -0 $w7_watchdog_pid 2>/dev/null" || true
+kill -9 "$w7_owner_pid"
+
+w7_watchdog_gone=0
+wait_for 8000 "! kill -0 $w7_watchdog_pid 2>/dev/null" && w7_watchdog_gone=1
+assert W7_watchdog_gives_up_and_exits "[[ \"$w7_watchdog_gone\" -eq 1 ]]"
+
+assert W7_close_was_actually_attempted "grep -qx term_w_stuck \"$W7_CLOSE_MARKER\""
+assert W7_lock_survives_unresolved_close "[[ -f \"$w7_lock_file\" ]]"
+# Deliberately requires BOTH file existence AND staleness in one condition —
+# `! lock_is_fresh` alone is also (trivially, uselessly) true for a MISSING
+# lock file, which would make this assertion pass even under the pre-fix
+# bug (lock removed entirely). Requiring -f first is what makes this
+# specifically prove "the lock survived, AND it is forced stale" rather
+# than "the lock is gone, so of course it isn't fresh".
+assert W7_breadcrumb_is_forced_stale \
+  "[[ -f \"$w7_lock_file\" ]] && ! lock_is_fresh \"$w7_lock_file\""
+assert W7_watchdog_log_says_breadcrumb "grep -qi 'breadcrumb' \"$w_dir/w7-watchdog.log\""
+
+# The breadcrumb must actually be findable by the sweeper RIGHT AWAY, not
+# after waiting out a full ttlSeconds — this is Part A/B's composition:
+# forcing ttlSeconds to 0 (lock_leave_as_breadcrumb) serves both "the
+# sweeper finds it now" and "a DIFFERENT slug's concurrency refusal is not
+# wrongfully blocked for up to 30 minutes" at once.
+w7_sweep_out="$(
+  export PATH="$w7_bin:$PATH"
+  "$SWEEP" --locks-dir "$w7_locks" --orch-dir "$w_dir" \
+    --journal "$w_dir/w7-no-such-journal.jsonl" --handles-file "$w_dir/w7-no-such-handles.json" 2>&1
+)"
+assert W7_sweeper_reports_candidate_immediately \
+  "printf '%s' \"\$w7_sweep_out\" | grep -q 'term_w_stuck.*WOULD CLOSE'"
+
+kill -9 "$w7_owner_pid" 2>/dev/null || true
+kill -9 "$w7_watchdog_pid" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 # Q-series: the REAL orca-debate.sh's watchdog wiring — lock path

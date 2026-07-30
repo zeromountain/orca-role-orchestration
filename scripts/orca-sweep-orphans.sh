@@ -121,31 +121,66 @@ fi
 # 3-state contract. Exit code mirrors terminal_is_live (0 live, 1 dead, 2
 # undetermined) so callers can distinguish "handled" from "leave it, maybe
 # retry later" without a second, possibly-inconsistent liveness check.
+#
+# Task 3, Part B (controller ruling on Task 1's review — the "Important
+# finding"): when do_close=1 and the handle IS live, this used to fire
+# `orca terminal close` fire-and-forget and then return live_rc — which at
+# that point in the case statement is ALWAYS 0 — regardless of whether the
+# close actually took effect. A silently failed close was therefore
+# INDISTINGUISHABLE from a successful one to every caller: run_watchdog
+# only kept retrying on rc=2, so rc=0 (whether truly closed or not) dropped
+# the handle from "pending" and, once every handle was dropped, removed
+# its own lock — leaving a live, permission-bypassed terminal with no
+# detector left. Fixed by re-checking AFTER the close attempt
+# (terminal_close_and_verify, orca-roles-lib.sh) and translating its
+# 0=confirmed-gone/1=still-live/2=undetermined contract back onto this
+# function's own terminal_is_live-shaped one (0=live/1=dead/2=undetermined)
+# — i.e. the two are inverted on purpose (terminal_close_and_verify's 0
+# means gone; this function's 0 means live), so confirmed-gone maps to 1,
+# still-live maps to 0, undetermined maps to 2. The four combinations of
+# (was live?) x (close succeeded?) this now produces:
+#   not live to begin with               -> 1 (dead), no close attempted
+#   live, do_close=0 (report-only)       -> 0 (live), no close attempted
+#   live, do_close=1, close succeeds     -> 1 (dead, confirmed)
+#   live, do_close=1, close does NOT     -> 0 (live — a REAL failure now,
+#                                             not silently reported as done)
+#   live, do_close=1, close undetermined -> 2 (undetermined)
 close_handle_if_live() {
-  local h="$1" label="$2" do_close="$3" live_rc=0
+  local h="$1" label="$2" do_close="$3" live_rc=0 verify_rc=0
   terminal_is_live "$h" || live_rc=$?
   case "$live_rc" in
     2)
       echo "sweep: $label ($h): liveness undetermined — leaving alone (never act on ambiguity)"
+      return 2
       ;;
     1)
       echo "sweep: $label ($h): already gone — nothing to do"
+      return 1
       ;;
     0)
-      if [[ "$do_close" -eq 1 ]]; then
-        echo "sweep: $label ($h): live and orphaned — closing"
-        if orca terminal close --terminal "$h" --tab --json >/dev/null 2>&1 \
-          || orca terminal close --terminal "$h" --json >/dev/null 2>&1; then
-          echo "sweep: $label ($h): closed"
-        else
-          echo "sweep: $label ($h): close returned non-zero (may already be gone)"
-        fi
-      else
+      if [[ "$do_close" -ne 1 ]]; then
         echo "sweep: $label ($h): live and orphaned — WOULD CLOSE (pass --close to act)"
+        return 0
       fi
+      echo "sweep: $label ($h): live and orphaned — closing"
+      verify_rc=0
+      terminal_close_and_verify "$h" || verify_rc=$?
+      case "$verify_rc" in
+        0)
+          echo "sweep: $label ($h): closed (confirmed gone)"
+          return 1
+          ;;
+        1)
+          echo "sweep: $label ($h): STILL LIVE after a close attempt — the close did not take effect"
+          return 0
+          ;;
+        2)
+          echo "sweep: $label ($h): close attempted; could not confirm it is gone (liveness undetermined)"
+          return 2
+          ;;
+      esac
       ;;
   esac
-  return "$live_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -386,7 +421,17 @@ for handle, claimants in stale_candidates.items():
     print("CANDIDATE\t%s\t%s\t%s\tstale-lock slug=%s" % (handle, field(title), field(""), all_slugs))
 PY
 
-  local n_candidates=0 n_closed=0 n_gone=0 n_undetermined=0 aborted=0
+  # Task 3, Part B: close_handle_if_live's hrc==0 no longer means the same
+  # thing in both modes now that it re-checks after a real close attempt.
+  # Under --close (ACT=1), hrc==0 means "still live after we tried to close
+  # it" — a genuine failure, counted separately (n_still_live) rather than
+  # folded into the old single "closed" bucket, so a silently-failed close
+  # is visible in THIS summary line too, not just in the per-handle message
+  # above it. Under the default report-only mode (ACT=0), hrc==0 still means
+  # exactly what it always did — "found live, would close, no attempt was
+  # ever made" — since close_handle_if_live never calls
+  # terminal_close_and_verify at all when do_close=0.
+  local n_candidates=0 n_gone=0 n_would_close=0 n_still_live=0 n_undetermined=0 aborted=0
   local kind handle title role reason hrc
   while IFS=$'\t' read -r kind handle title role reason; do
     [[ -z "$kind" ]] && continue
@@ -403,7 +448,13 @@ PY
         hrc=0
         close_handle_if_live "$handle" "$title" "$ACT" || hrc=$?
         case "$hrc" in
-          0) n_closed=$((n_closed + 1)) ;;
+          0)
+            if [[ "$ACT" -eq 1 ]]; then
+              n_still_live=$((n_still_live + 1))
+            else
+              n_would_close=$((n_would_close + 1))
+            fi
+            ;;
           1) n_gone=$((n_gone + 1)) ;;
           2) n_undetermined=$((n_undetermined + 1)) ;;
         esac
@@ -418,9 +469,9 @@ PY
   fi
 
   if [[ "$ACT" -eq 1 ]]; then
-    echo "sweep: candidates=$n_candidates closed=$n_closed already-gone=$n_gone undetermined-left-alone=$n_undetermined"
+    echo "sweep: candidates=$n_candidates closed-or-already-gone=$n_gone still-live-after-close=$n_still_live undetermined-left-alone=$n_undetermined"
   else
-    echo "sweep: candidates=$n_candidates would-close=$n_closed already-gone=$n_gone undetermined-left-alone=$n_undetermined (report-only — pass --close to act)"
+    echo "sweep: candidates=$n_candidates would-close=$n_would_close already-gone=$n_gone undetermined-left-alone=$n_undetermined (report-only — pass --close to act)"
   fi
 }
 
@@ -512,7 +563,19 @@ run_watchdog() {
       fi
       hrc=0
       close_handle_if_live "$h" "debate:$SLUG" "$ACT" || hrc=$?
-      [[ "$hrc" -eq 2 ]] && printf '%s\n' "$h" >> "$still_file"
+      # Task 3, Part B: close_handle_if_live now re-checks AFTER attempting
+      # a close, so hrc==0 here means something new and important — "still
+      # live after we tried to close it," a real failure — not just "found
+      # live" as it did before that fix. The OLD code only retried on
+      # hrc==2 (undetermined), so a close that silently failed (hrc==0,
+      # every single time, regardless of whether the close worked) was
+      # dropped from pending on the very first attempt and never retried —
+      # this is the controller-ruling bug this task exists to close. Both
+      # "still live" (0) and "undetermined" (2) are now unresolved and go
+      # back into pending for another attempt; only a CONFIRMED dead (1)
+      # — whether it was already gone or we just closed it — drops a
+      # handle from this list.
+      [[ "$hrc" -ne 1 ]] && printf '%s\n' "$h" >> "$still_file"
     done < "$pending_file"
     mv "$still_file" "$pending_file"
     attempt=$((attempt + 1))
@@ -520,7 +583,17 @@ run_watchdog() {
   done
 
   if [[ -s "$pending_file" ]]; then
-    echo "watchdog[$SLUG]: giving up after $MAX_CLOSE_ATTEMPTS attempts; still undetermined: $(tr '\n' ' ' < "$pending_file") — leaving the lock in place as a breadcrumb for orca-sweep-orphans.sh's sweep mode"
+    echo "watchdog[$SLUG]: giving up after $MAX_CLOSE_ATTEMPTS attempts; still not confirmed closed: $(tr '\n' ' ' < "$pending_file") — leaving the lock in place as a breadcrumb for orca-sweep-orphans.sh's sweep mode"
+    # Task 3, Part A/B composition: force the surviving lock stale
+    # immediately (lock_leave_as_breadcrumb, orca-roles-lib.sh) rather than
+    # leaving its heartbeat looking "fresh" for up to a full ttlSeconds —
+    # that would (a) hide this exact breadcrumb from sweep_mode's own
+    # stale-lock detector for up to 30 minutes, and (b) risk
+    # orca-debate.sh's cross-slug concurrency refusal wrongfully blocking a
+    # DIFFERENT, legitimate debate for that same window. See that
+    # function's own comment for the full reasoning — orca-debate.sh's
+    # cleanup() leans on the identical mechanism for the same two reasons.
+    lock_leave_as_breadcrumb "$lock_file"
   else
     echo "watchdog[$SLUG]: all owned handles resolved — removing lock"
     lock_remove "$lock_file"

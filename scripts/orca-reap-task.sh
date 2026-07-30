@@ -70,12 +70,25 @@ close_handle() {
     echo "reap: $h liveness undetermined (orca terminal list unavailable) — attempting close anyway"
   fi
   echo "reap: closing $h (tab)"
-  if orca terminal close --terminal "$h" --tab --json >/dev/null 2>&1 \
-    || orca terminal close --terminal "$h" --json >/dev/null 2>&1; then
-    echo "reap: closed $h"
-  else
-    echo "reap: close non-zero for $h (ok if already gone)"
-  fi
+  # Task 3, Part B: this is the actual close path for ordinary (non-debate)
+  # dispatch — the reaper started by orca-dispatch-role.sh for every
+  # six-role dispatch that doesn't opt into --persist. It used to fire
+  # `orca terminal close` fire-and-forget and log success unconditionally,
+  # the same class of bug the controller ruling on Task 1's review flagged
+  # for orca-sweep-orphans.sh. terminal_close_and_verify (orca-roles-lib.sh)
+  # re-checks afterward instead of trusting the close call's own reported
+  # success, so a close that silently fails is reported LOUDLY here rather
+  # than as a plain "closed". Unlike the debate lock's breadcrumb (Task 3,
+  # Part A), there is no lock file at all for an ordinary role dispatch —
+  # this makes the failure visible in the reaper's own log, it does not by
+  # itself give the orphan sweeper a new way to find this handle later.
+  local verify_rc=0
+  terminal_close_and_verify "$h" || verify_rc=$?
+  case "$verify_rc" in
+    0) echo "reap: closed $h (confirmed gone)" ;;
+    1) echo "reap: ERROR — $h is STILL LIVE after a close attempt for task=$TASK_ID" ;;
+    2) echo "reap: closed $h (close attempted; could not confirm it is gone — liveness undetermined)" ;;
+  esac
 }
 
 mark_ledger() {

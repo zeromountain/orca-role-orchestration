@@ -1210,6 +1210,71 @@ lock_remove() {
   rm -f "$path" "${path%.json}.handles.jsonl" 2>/dev/null || true
 }
 
+lock_leave_as_breadcrumb() {
+  # $1=lock_file
+  #
+  # Task 3: called instead of lock_remove whenever a close could not be
+  # CONFIRMED (terminal_close_and_verify returned 1 "still live" or 2
+  # "undetermined") — by orca-debate.sh's cleanup() and by
+  # orca-sweep-orphans.sh's run_watchdog, the two places that decide "is
+  # every handle this lock owns actually gone" before disposing of the
+  # lock. Leaving the lock file (and its sidecar — this does NOT call
+  # lock_remove or touch the sidecar at all) in place is what lets
+  # orca-sweep-orphans.sh's stale-lock path find the handle later; erasing
+  # the lock on a clean exit regardless of whether the close actually took
+  # is exactly the bug this task closes (observed live: a genuine orphan
+  # produced sweep's "candidates=0", because the ONLY two detectors sweep
+  # has are "untracked in handles.json" — which a debater handle never is,
+  # by design, see orca-close-role.sh's own header comment — and "stale
+  # debate lock", which a prematurely-removed lock defeats trivially).
+  #
+  # Rewrites ONLY ttlSeconds to 0 — pid/slug/handles/heartbeatAt are left
+  # exactly as they were (no lock_write, which would also reset "handles"
+  # to an empty array and lose exactly the information the breadcrumb
+  # exists to preserve). This one-field change is deliberately double
+  # duty, not a coincidence: ttlSeconds is read by exactly two consumers
+  # (grepped to confirm) — lock_is_fresh (orca-roles-lib.sh, on the
+  # do-not-touch list; this function does not modify it, only feeds it a
+  # lock whose own ttlSeconds is now 0) and orca-sweep-orphans.sh's own
+  # sweep_mode age-vs-ttl comparison — and forcing it to 0 makes BOTH
+  # agree the lock is stale immediately, instead of "fresh" for up to a
+  # full ttlSeconds (1800s/30min default):
+  #   1. orca-sweep-orphans.sh's stale-lock candidate path only inspects a
+  #      lock's handles once age>=ttl — with the ORIGINAL ttl left in
+  #      place, the very breadcrumb this function exists to create would
+  #      stay invisible to the sweeper for up to half an hour.
+  #   2. orca-debate.sh's cross-slug concurrency refusal, and its own
+  #      same-slug "overwriting a fresh lock" warning, both key off
+  #      lock_is_fresh too. An untouched, still-"fresh"-looking breadcrumb
+  #      would wrongfully block (or warn about) a DIFFERENT, perfectly
+  #      legitimate debate for as long as that TTL window lasts — exactly
+  #      the "concurrency refusal must not start refusing legitimate
+  #      debates because breadcrumbs accumulate" risk this whole feature
+  #      has to hold at the same time as "don't lose the orphan". Forcing
+  #      staleness immediately closes that window to (near) zero.
+  # heartbeatAt is deliberately left untouched (not zeroed/backdated) —
+  # it still records the true last-known-alive moment, which has forensic
+  # value and is not needed for either of the two effects above (both are
+  # driven by ttlSeconds alone, since age = now - heartbeatAt is always
+  # >= 0 for any heartbeatAt not in the future).
+  local lock_file="$1"
+  [[ -f "$lock_file" ]] || return 0
+  python3 - "$lock_file" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(0)
+d["ttlSeconds"] = 0
+tmp_path = path + ".tmp." + str(os.getpid())
+with open(tmp_path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.replace(tmp_path, path)
+PY
+}
+
 lock_handle_claimed_elsewhere() {
   # $1=locks_dir $2=handle $3=exclude_lock_file -> exit 0 if some OTHER lock
   # file in locks_dir claims $2 (in its merged "handles" array OR its
