@@ -2257,6 +2257,139 @@ assert Z5_stale_leftover_file_wiped "[[ ! -f \"$Z_DEBATE_DIR/round-1/ZZ.md\" ]]"
 assert Z5_stale_transcript_replaced \
   "[[ -f \"$Z_DEBATE_DIR/transcript.md\" ]] && ! grep -q 'stale transcript' \"$Z_DEBATE_DIR/transcript.md\""
 
+# ----------------------------------------------------------------------------
+# MX-series: Task 3 fix round 1 — the global mkdir-based startup mutex
+# (debate_startup_mutex_acquire/_release, orca-debate-lib.sh) that closes the
+# TOCTOU race in the ZC cross-slug concurrency refusal below. A plain
+# scan-then-register sequence only protects against a driver whose lock
+# ALREADY existed at scan time; since this driver's own lock is not written
+# until AFTER the scan, two different-slug drivers started close together
+# could each complete the scan, see nothing, and both proceed. These are
+# pure, deterministic primitive-level tests (real concurrent processes, but
+# proving mutual exclusion via a fixed, known hold duration rather than
+# hoping to observe a fast, real-world race) — the real two-driver
+# end-to-end demonstration is ZC3, further down, once q_scripts/q_bin exist.
+# ----------------------------------------------------------------------------
+mx_dir="$tmpdir/mutex"
+mkdir -p "$mx_dir"
+
+# --- MX1: real mutual exclusion under contention. Six concurrent
+# contenders each acquire the SAME mutex directory, hold it for a fixed,
+# known 0.2s (far longer than any real scheduling jitter on this machine),
+# then release — logging their own [start,end] interval in nanoseconds. If
+# acquire/release actually serialize (as mkdir's atomicity guarantees when
+# used correctly), NO two logged intervals can ever overlap, deterministically
+# — not "usually don't overlap." Any overlap is a genuine bug, confirmed
+# below by mutation. ---
+mx1_log="$mx_dir/mx1.log"
+: > "$mx1_log"
+mx1_pids=()
+for _mx1_i in $(seq 1 6); do
+  (
+    # $BASHPID (a distinct-per-subshell pid) does not exist before bash 4 —
+    # this repo's floor is bash 3.2 (macOS default), where `$$` inside a
+    # forked `(...)` subshell still reports the TOP-LEVEL script's pid, not
+    # this subshell's own. Not load-bearing for MX1 itself (which never
+    # checks pid liveness, only interval overlap), but a real, distinct pid
+    # is what a genuine caller would pass, so this uses one rather than a
+    # shared, meaningless value.
+    _mx1_own_pid="$(python3 -c 'import os; print(os.getpid())')"
+    if debate_startup_mutex_acquire "$mx_dir" "$_mx1_own_pid" 5; then
+      mx1_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
+      sleep 0.2
+      mx1_end_ns="$(python3 -c 'import time; print(time.time_ns())')"
+      echo "$mx1_start_ns $mx1_end_ns" >> "$mx1_log"
+      debate_startup_mutex_release "$mx_dir"
+    else
+      echo "TIMEOUT" >> "$mx1_log"
+    fi
+  ) &
+  mx1_pids+=("$!")
+done
+for _mx1_pid in "${mx1_pids[@]}"; do
+  wait "$_mx1_pid" 2>/dev/null || true
+done
+
+assert MX1_no_timeouts "! grep -q TIMEOUT \"$mx1_log\""
+assert MX1_six_intervals_recorded "[[ \"\$(wc -l < \"$mx1_log\" | tr -d ' ')\" == '6' ]]"
+mx1_overlap="$(python3 -c '
+import sys
+intervals = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) == 2:
+            intervals.append((int(parts[0]), int(parts[1])))
+intervals.sort()
+overlap = False
+for i in range(1, len(intervals)):
+    if intervals[i][0] < intervals[i - 1][1]:
+        overlap = True
+        break
+print("OVERLAP" if overlap else "CLEAN")
+' "$mx1_log")"
+assert MX1_no_overlapping_intervals "[[ \"$mx1_overlap\" == 'CLEAN' ]]"
+
+# --- MX2: a mutex held by a CONFIRMED-ALIVE owner is never stolen — acquire
+# must time out (return 1) rather than assume clear. ---
+mx2_dir="$mx_dir/mx2"
+mkdir -p "$mx2_dir"
+sleep 300 & mx2_holder_pid=$!
+CLEANUP_PIDS+=("$mx2_holder_pid")
+mkdir "$mx2_dir/.starting.lock"
+printf '%s\n' "$mx2_holder_pid" > "$mx2_dir/.starting.lock/pid"
+assert MX2_holder_pid_is_alive "kill -0 $mx2_holder_pid 2>/dev/null"
+mx2_rc=0
+debate_startup_mutex_acquire "$mx2_dir" "$$" 1 || mx2_rc=$?
+assert MX2_times_out_when_alive_holder "[[ \"$mx2_rc\" -eq 1 ]]"
+assert MX2_did_not_steal_alive_holder "[[ -d \"$mx2_dir/.starting.lock\" ]]"
+kill -9 "$mx2_holder_pid" 2>/dev/null || true
+
+# --- MX3: a STALE claim (recorded owner pid confirmed dead, AND old enough
+# to rule out racing a peer that just mkdir'd) IS reclaimed — otherwise one
+# crashed driver would deadlock every future debate start forever. ---
+mx3_dir="$mx_dir/mx3"
+mkdir -p "$mx3_dir"
+( : ) & mx3_dead_pid=$!
+wait "$mx3_dead_pid" 2>/dev/null || true
+mkdir "$mx3_dir/.starting.lock"
+printf '%s\n' "$mx3_dead_pid" > "$mx3_dir/.starting.lock/pid"
+python3 -c "
+import os, time
+old = time.time() - 999
+os.utime('$mx3_dir/.starting.lock', (old, old))
+"
+assert MX3_dead_pid_is_dead "! kill -0 $mx3_dead_pid 2>/dev/null"
+mx3_rc=0
+debate_startup_mutex_acquire "$mx3_dir" "$$" 3 || mx3_rc=$?
+assert MX3_reclaims_stale_dead_owner "[[ \"$mx3_rc\" -eq 0 ]]"
+debate_startup_mutex_release "$mx3_dir"
+assert MX3_release_removed_it "[[ ! -d \"$mx3_dir/.starting.lock\" ]]"
+
+# --- MX4: an aged claim with NO pid file at all (a peer that mkdir'd but
+# has not yet written its pid — a window of microseconds in real use) is
+# never reclaimed just because it looks old: only a CONFIRMED-dead pid ever
+# justifies stealing, matching this codebase's existing "can't-tell is not
+# license to act" bias elsewhere (pid_alive() in orca-sweep-orphans.sh,
+# lock_handle_claimed_elsewhere in orca-roles-lib.sh — neither touched by
+# this task). ---
+mx4_dir="$mx_dir/mx4"
+mkdir -p "$mx4_dir"
+mkdir "$mx4_dir/.starting.lock"
+python3 -c "
+import os, time
+old = time.time() - 999
+os.utime('$mx4_dir/.starting.lock', (old, old))
+"
+mx4_rc=0
+debate_startup_mutex_acquire "$mx4_dir" "$$" 1 || mx4_rc=$?
+assert MX4_never_reclaims_without_a_pid_to_check "[[ \"$mx4_rc\" -eq 1 ]]"
+assert MX4_directory_left_alone "[[ -d \"$mx4_dir/.starting.lock\" ]]"
+rm -rf "$mx4_dir/.starting.lock"
+
+# --- MX5: release is a safe no-op whether or not anything was ever held. ---
+assert MX5_release_when_never_held_is_safe "debate_startup_mutex_release \"$mx_dir/never-touched\""
+
 # --- ZC: concurrency refusal (Task 3 extra scope). A live lock for a
 # DIFFERENT slug must block a brand-new debate from starting, with a reason
 # naming the other slug; a STALE other-slug lock must NOT block (positive
@@ -2308,6 +2441,68 @@ export PATH="$Z_OLD_PATH"
 
 assert ZC2_stale_other_lock_does_not_block "[[ \"$zc2_rc\" -eq 0 ]]"
 assert ZC2_own_lock_cleaned_up_after_normal_exit "[[ ! -f \"$Q_LOCKS_DIR/new-debate.json\" ]]"
+
+# --- ZC3 (Task 3 fix round 1, demonstration): two REAL drivers, DIFFERENT
+# slugs, launched as close to simultaneously as bash allows, repeated across
+# several fresh slug pairs — at most one may ever reach dispatch.
+# ORCA_TEST_STARTUP_DELAY_S (a test-only seam in orca-debate.sh, never set in
+# real usage) widens the critical section deterministically: whichever
+# driver's `mkdir` wins holds the mutex for the full delay, which GUARANTEES
+# the loser is still inside its own wait-loop when the winner finishes
+# registering — so this proves the fix by construction rather than by
+# hoping to win a real, sub-millisecond scheduling race. Each trial uses a
+# fresh pair of slugs (no lock cleanup needed between trials) and its own
+# --dir-root, so trials cannot interfere with each other. ---
+zc3_trials=8
+zc3_any_double_dispatch=0
+zc3_any_neither_dispatch=0
+for zc3_i in $(seq 1 "$zc3_trials"); do
+  zc3_root="$tmpdir/zc3-$zc3_i"
+  mkdir -p "$zc3_root"
+  zc3_slug_a="zc3-a-$zc3_i"
+  zc3_slug_b="zc3-b-$zc3_i"
+
+  export PATH="$q_bin:$PATH"
+  export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+  export ORCA_TEST_STATUS_STUB=completed
+  ORCA_TEST_STARTUP_DELAY_S=0.2 "$Q_DRIVER" --topic "race a $zc3_i" --slug "$zc3_slug_a" --rounds 1 \
+    --dir-root "$zc3_root/debates" --lock-ttl-seconds 120 \
+    >"$zc3_root/a.out" 2>"$zc3_root/a.err" &
+  zc3_pid_a=$!
+  ORCA_TEST_STARTUP_DELAY_S=0.2 "$Q_DRIVER" --topic "race b $zc3_i" --slug "$zc3_slug_b" --rounds 1 \
+    --dir-root "$zc3_root/debates" --lock-ttl-seconds 120 \
+    >"$zc3_root/b.out" 2>"$zc3_root/b.err" &
+  zc3_pid_b=$!
+  unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+  export PATH="$Q_OLD_PATH"
+
+  zc3_rc_a=0
+  zc3_rc_b=0
+  wait "$zc3_pid_a" || zc3_rc_a=$?
+  wait "$zc3_pid_b" || zc3_rc_b=$?
+
+  zc3_a_dispatched=0
+  zc3_b_dispatched=0
+  if [[ -d "$zc3_root/debates/$zc3_slug_a/round-1" ]] \
+     && [[ -n "$(find "$zc3_root/debates/$zc3_slug_a/round-1" -name '*.md' 2>/dev/null)" ]]; then
+    zc3_a_dispatched=1
+  fi
+  if [[ -d "$zc3_root/debates/$zc3_slug_b/round-1" ]] \
+     && [[ -n "$(find "$zc3_root/debates/$zc3_slug_b/round-1" -name '*.md' 2>/dev/null)" ]]; then
+    zc3_b_dispatched=1
+  fi
+
+  if [[ "$zc3_a_dispatched" -eq 1 && "$zc3_b_dispatched" -eq 1 ]]; then
+    zc3_any_double_dispatch=1
+    echo "ZC3 trial $zc3_i: BOTH dispatched (rc_a=$zc3_rc_a rc_b=$zc3_rc_b) — the exact race this fix closes" >&2
+  fi
+  if [[ "$zc3_a_dispatched" -eq 0 && "$zc3_b_dispatched" -eq 0 ]]; then
+    zc3_any_neither_dispatch=1
+    echo "ZC3 trial $zc3_i: NEITHER dispatched (rc_a=$zc3_rc_a rc_b=$zc3_rc_b)" >&2
+  fi
+done
+assert ZC3_never_both_dispatch_across_trials "[[ \"$zc3_any_double_dispatch\" -eq 0 ]]"
+assert ZC3_exactly_one_dispatches_every_trial "[[ \"$zc3_any_neither_dispatch\" -eq 0 ]]"
 
 echo
 echo "Results: $pass passed, $fail failed"

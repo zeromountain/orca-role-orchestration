@@ -21,6 +21,98 @@ DEBATERS_DEFAULT="claude,codex,grok,gemini"
 DEBATE_LOCK_TTL_SECONDS_DEFAULT=1800
 WATCHDOG_POLL_SECONDS_DEFAULT=20
 
+# Task 3 fix round 1: closes a TOCTOU race in orca-debate.sh's cross-slug
+# concurrency refusal. Scanning "$LOCK_DIR/*.json" for another slug's live
+# lock only helps if this driver's OWN lock already existed at scan time —
+# but it does not (debate_watchdog_start writes it only after the scan
+# passes), so two different-slug drivers started close together can each
+# complete the scan, see nothing, and both proceed into ensure_terminal's
+# shared role terminals. This is a real mutex, not per-slug bookkeeping: a
+# single, well-known directory name (never one named after any slug) so
+# that ANY two concurrent driver invocations — regardless of which slugs
+# they are for — serialize through the exact same critical section
+# (scan-other-slugs-then-register-mine, in orca-debate.sh). mkdir is atomic
+# on a POSIX filesystem: exactly one concurrent caller's mkdir can succeed
+# for a given path, which is what gives this mutual exclusion without
+# flock(1) (unavailable on this repo's floor, bash 3.2 / macOS).
+DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT=5
+DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT=2
+
+debate_dir_age_seconds() {
+  # $1=path -> age in whole seconds since the path's mtime, on stdout.
+  # Nothing on stdout and exit 1 if the path does not exist / mtime cannot be
+  # read. Used only to decide whether a held startup mutex is old enough to
+  # be considered abandoned (see debate_startup_mutex_acquire) — never used
+  # for the debate lock's own heartbeat/TTL (that stays lock_is_fresh, in
+  # orca-roles-lib.sh, untouched).
+  python3 - "$1" <<'PY'
+import os, sys, time
+try:
+    mtime = os.path.getmtime(sys.argv[1])
+except Exception:
+    sys.exit(1)
+print(int(time.time() - mtime))
+PY
+}
+
+debate_startup_mutex_acquire() {
+  # $1=locks_dir $2=owner_pid $3=(optional) max_wait_seconds
+  #
+  # Acquires the global mkdir-based startup mutex at
+  # "$locks_dir/.starting.lock". Returns 0 (acquired) or 1 (gave up after
+  # max_wait_seconds without acquiring — the caller must treat this as
+  # "refuse to start," never as "assume clear," matching this codebase's
+  # existing bias elsewhere: never treat an inability to determine
+  # something as license to act.
+  #
+  # A holder that dies mid-critical-section (before calling
+  # debate_startup_mutex_release) would otherwise deadlock EVERY future
+  # debate start forever, so a stale claim is force-reclaimed — but only
+  # when its recorded owner pid is CONFIRMED dead (kill -0 fails) AND the
+  # claim is old enough that we are not simply racing a peer that just
+  # mkdir'd and has not yet written its pid file (the
+  # DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT guard below). An alive or
+  # undeterminable owner is always left alone — same "never treat
+  # can't-tell as gone" rule as pid_alive() in orca-sweep-orphans.sh and
+  # lock_handle_claimed_elsewhere in orca-roles-lib.sh (neither touched by
+  # this function).
+  local locks_dir="$1" owner_pid="$2"
+  local max_wait="${3:-$DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}"
+  local mutex_dir="$locks_dir/.starting.lock"
+  local poll_s="0.05"
+  local max_iterations
+  max_iterations="$(python3 -c "print(max(1, int(float('$max_wait') / $poll_s)))")"
+  local i=0 held_pid age
+  while true; do
+    if mkdir "$mutex_dir" 2>/dev/null; then
+      printf '%s\n' "$owner_pid" > "$mutex_dir/pid" 2>/dev/null || true
+      return 0
+    fi
+    held_pid="$(cat "$mutex_dir/pid" 2>/dev/null || true)"
+    if [[ -n "$held_pid" ]] && ! kill -0 "$held_pid" 2>/dev/null; then
+      age="$(debate_dir_age_seconds "$mutex_dir" 2>/dev/null || true)"
+      if [[ -n "$age" ]] && [[ "$age" -ge "$DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT" ]]; then
+        rm -rf "$mutex_dir" 2>/dev/null || true
+        continue
+      fi
+    fi
+    i=$((i + 1))
+    if [[ "$i" -ge "$max_iterations" ]]; then
+      return 1
+    fi
+    sleep "$poll_s"
+  done
+}
+
+debate_startup_mutex_release() {
+  # $1=locks_dir. Idempotent — safe to call whether or not this process
+  # actually holds the mutex, and safe to call more than once (the EXIT trap
+  # in orca-debate.sh and its own explicit release both call this; only one
+  # of them will ever find something to remove).
+  local locks_dir="$1"
+  rm -rf "${locks_dir:?}/.starting.lock" 2>/dev/null || true
+}
+
 debate_role_key()   { printf 'debater_%s\n' "$1"; }
 debate_short_name() { printf '%s\n' "${1#debater_}"; }
 

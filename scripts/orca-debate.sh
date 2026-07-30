@@ -226,6 +226,43 @@ LABEL_MAP_FILE="$LABELS_DIR/$SLUG.json"
 if [[ "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$LOCK_DIR"
 
+  # --- Task 3 fix round 1: a global mkdir-based mutex closes the TOCTOU
+  # race a plain scan-then-register sequence has. Scanning "$LOCK_DIR/*.json"
+  # for another slug's live lock only protects against a driver whose lock
+  # ALREADY existed at scan time — but this driver's own lock does not exist
+  # until debate_watchdog_start below, so two different-slug drivers started
+  # close together could each complete the scan, see nothing, and both
+  # proceed into ensure_terminal's shared role terminals (the exact
+  # corruption this refusal exists to prevent, merely narrowed to a race
+  # window instead of eliminated). debate_startup_mutex_acquire/_release
+  # (orca-debate-lib.sh) wrap the ENTIRE scan-then-register sequence below
+  # in one critical section: mkdir is atomic on POSIX, so at most one
+  # concurrent driver invocation — regardless of slug — can be inside it at
+  # a time. A failure to acquire is treated as "refuse to start" (never as
+  # "assume clear"), matching the same conservative bias as the refusal
+  # itself. Released as soon as this driver's own lock is written (a few
+  # lines down), NOT held for the debate's lifetime — see the explicit
+  # release below and cleanup()'s own defensive (idempotent) release.
+  if ! debate_startup_mutex_acquire "$LOCK_DIR" "$$"; then
+    echo "Could not acquire the debate-start coordination lock within ${DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}s (another driver appears to be starting right now). Refusing to start rather than risk two drivers racing into the same terminals — retry in a moment." >&2
+    exit 1
+  fi
+  # Safety net: if anything between here and the explicit release a few
+  # lines down dies unexpectedly (an error under set -e, a signal), this
+  # temporary EXIT trap still releases the mutex instead of leaking it
+  # forever. Superseded (silently, harmlessly) once `trap cleanup EXIT` is
+  # registered further down — cleanup() itself also releases the mutex
+  # (idempotent) as a second line of defense.
+  trap 'debate_startup_mutex_release "$LOCK_DIR"' EXIT
+
+  # Test seam only: widens the critical section on demand so a test can
+  # DETERMINISTICALLY force two concurrent driver invocations to overlap,
+  # rather than relying on winning a real, sub-millisecond scheduling race.
+  # Never set in real usage.
+  if [[ -n "${ORCA_TEST_STARTUP_DELAY_S:-}" ]]; then
+    sleep "$ORCA_TEST_STARTUP_DELAY_S"
+  fi
+
   # --- Task 3 extra scope: refuse to start if a DIFFERENT slug's lock is
   # currently live. ensure_terminal (orca-roles-lib.sh) reuses a live role
   # terminal GLOBALLY (one terminal per role key, not per debate), so two
@@ -252,6 +289,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         fi
       fi
       echo "Refusing to start: debate '$other_slug' has a live lock ($lf, $alive_note). Starting a second debate now would make ensure_terminal dispatch into the SAME four agent sessions '$other_slug' is using, corrupting both. Wait for '$other_slug' to finish, or — only if you are certain it is actually dead — remove $lf yourself and retry." >&2
+      debate_startup_mutex_release "$LOCK_DIR"
       exit 1
     fi
   done
@@ -284,6 +322,12 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   printf '%s\n' "$WATCHDOG_PID" > "$WATCHDOG_PID_FILE"
   export ORCA_ROLE_LOCK_FILE="$LOCK_FILE"
   echo "  watchdog: pid=$WATCHDOG_PID ttl=${LOCK_TTL_SECONDS}s lock=$LOCK_FILE"
+
+  # Our own lock is now on disk (lock_write, inside debate_watchdog_start)
+  # and therefore visible to any OTHER driver's scan — release the mutex
+  # immediately so it is held only for this brief registration window, never
+  # for this debate's entire lifetime.
+  debate_startup_mutex_release "$LOCK_DIR"
 else
   # --dry-run must NEVER write the real label map: a partial-roster preview
   # (e.g. --debaters claude,grok --dry-run) would otherwise leave a 2-seat
@@ -309,6 +353,14 @@ cleanup() {
   # never race this driver's own close attempts. debate_watchdog_stop is a
   # guarded no-op when nothing was ever started (--dry-run).
   debate_watchdog_stop "$WATCHDOG_PID_FILE" "$LOCK_FILE"
+
+  # Defensive, idempotent second release of the startup mutex (see the
+  # explicit release right after debate_watchdog_start, and the temporary
+  # EXIT trap registered right after acquiring it) — a harmless no-op in the
+  # normal case where it was already released; a real backstop if some path
+  # through the DRY_RUN=0 block above ever reaches here without having done
+  # so itself.
+  debate_startup_mutex_release "$LOCK_DIR"
 
   # Throwaway --dry-run label map (never the real $LABELS_DIR/<slug>.json —
   # see the DRY_RUN branch above): tidy it up regardless of KEEP_TABS/DRY_RUN,

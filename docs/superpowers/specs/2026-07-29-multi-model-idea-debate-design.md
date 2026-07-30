@@ -126,74 +126,95 @@ injected preamble small and removes any need for character-count truncation of d
 
 ### Round output schemas
 
-Each debater writes markdown to an assigned path. The schema is part of the dispatch spec and
-is what prevents mutual agreement from being cheap — every round forces an act of dissent.
+Each debater writes markdown to an assigned path, named by its LABEL — never its model name (see
+§2 above; the path and the required headings below are the literal, current output of
+`debate_spec` in `scripts/orca-debate-lib.sh`, not an illustrative example). The schema is part of
+the dispatch spec and is what prevents mutual agreement from being cheap — every round forces an
+act of dissent.
 
-**R1 → `round-1/<model>.md`**
+**R1 → `round-1/<label>.md`**
 
 ```markdown
-# R1 proposal — <model> (<lens>)
+# R1 proposal
 
-## Prior art (3-6 items)
-- <what exists, how far it got> [출처: URL | 제품명 | 미검증]
+## Prior art
+List 3-6 things that already exist in this space: what they do, how far they got, and where they
+stopped. One line each, every line tagged with a source.
 
-## Proposals (2-3)
+## Proposals
+Give 2-3. For each:
+
 ### P1. <one-line name>
 - Core hypothesis:
 - Target user / JTBD:
 - Why now:
 - Differentiating axis: (what is actually different from the prior art above)
-- Weakest link: (the strongest argument against my own proposal — REQUIRED)
+- Weakest link: (the strongest argument against your OWN proposal — required)
 - Evidence: [출처: …]
 
-## Directions I deliberately rejected, and why
+## Directions I deliberately rejected
+What you considered and dropped, and why. At least two.
 ```
 
-**R2 → `round-2/<model>.md`**
+**R2 → `round-2/<label>.md`**
 
 ```markdown
-# R2 critique — <model>
+# R2 critique
 
-## Verdict per proposal (all except my own)
+## Verdict per proposal
+One block per proposal EXCEPT your own:
+
 ### Proposal <label>
-- Fatal flaw: (at least one required; "none" is not an accepted answer without justification)
+- Fatal flaw: (at least one; "none" alone is not accepted without justification)
 - Unverified claims attacked: (target [출처: 미검증] claims first)
 - What is worth keeping:
 - Verdict: KILL | CONDITIONAL (condition: …) | SURVIVE
 
 ## Ranking
-1. … 2. … 3. …   (all critiqued proposals, strongest first — ties not allowed)
+Rank every proposal you critiqued, strongest first. Ties are not allowed.
 
-## Merged proposals (max 2)
+## Merged proposals
+At most 2. For each:
+
 ### M1. <name> = <label>'s X + <label>'s Y
 - Why the merge beats either alone:
 - New risk the merge introduces:
 
-## Retractions from my own R1 (if any)
+## Retractions from my own R1
+Anything in your own proposal you no longer defend, and why. "None" is allowed only if you say
+what would have changed your mind.
 ```
 
-**R3 → `round-3/<model>.md`**
+**R3 → `round-3/<label>.md`**
 
 ```markdown
-# R3 niche convergence — <model>
+# R3 niche convergence
 
-## Differentiating axes (2-3)
-- <axis>: why this axis separates a niche from a crowded market
+## Differentiating axes
+2-3 axes. For each: why this axis separates a defensible niche from a crowded market.
 
-## Niche candidates (1-2, ranked)
+## Niche candidates
+1-2, ranked. For each:
+
 ### N1. <name>
 - One-sentence definition:
 - Who I am explicitly giving up:
 - Why this is a niche: (structural reason incumbents cannot or will not do it)
-- First validation experiment: (runnable in 1-2 weeks, success/failure stated as a number)
-- Kill condition: (what fact would make me abandon this)
+- First validation experiment: (runnable in 1-2 weeks; success/failure stated as a number)
+- Kill condition: (what fact would make you abandon this)
 - Largest remaining uncertainty:
 
-## Dissent (candidates I do NOT support, and why)
+## Dissent
+Candidates from the critiques that you do NOT support, and why. Must not be empty — if you
+support everything, say what you would sacrifice first.
 ```
 
-Required-dissent fields — R1 "weakest link", R2 mandatory fatal flaw + forced ranking, R3
-"dissent" — are the mechanism against a four-way agreement spiral.
+No header anywhere carries a model name or lens label — the persona/lens is what makes each
+debater's *content* distinct, not a token in the required structure, and the anonymity guarantee
+in §2 depends on that (a `# R1 proposal — <model> (<lens>)` header would itself be exactly the
+kind of authorship leak §2 exists to close). Required-dissent fields — R1 "weakest link", R2
+mandatory fatal flaw + forced ranking, R3 "dissent" — are the mechanism against a four-way
+agreement spiral.
 
 ### Research requirement
 
@@ -252,8 +273,11 @@ never creates or owns it (see §2's "ownership is driver-only"); a missing file 
 a "?" placeholder for the own-label preview text) since nothing is actually dispatched.
 
 **Naming.** A debater's short name is its role key minus the `debater_` prefix — `claude`,
-`codex`, `grok`, `gemini`. Short names are what `--debaters` accepts and what output files are
-named after; role keys are what the dispatch and handles layers use.
+`codex`, `grok`, `gemini`. Short names are what `--debaters` accepts, what the label map's
+`roster`/`labels` keys are indexed by, and what the manifest records; role keys are what the
+dispatch and handles layers use. Output files are named after the debater's LABEL (§2), never its
+short name — the one exception is the transcript, which re-attributes by short name for the human
+reader.
 
 **Why file-based output, not message bodies.** `worker_done` payloads are conventionally short
 summaries (`orca-wait-done.sh` reads only `subject` and `payload.taskId`), and four models
@@ -279,6 +303,15 @@ orca-debate.sh --topic "…" | --topic-file <f>
   slugs would otherwise dispatch into the SAME four agent sessions (observed live: a second
   driver's cleanup closed the first driver's tabs mid-round). A stale other-slug lock does not
   block. `--slug` is sanitized (rejects `/`, `..`, empty) before it is used to build a path.
+  The scan-then-register sequence itself is wrapped in a global, mkdir-based startup mutex
+  (`debate_startup_mutex_acquire`/`_release`, `orca-debate-lib.sh`) — a plain scan is a TOCTOU
+  race on its own, since this driver's own lock does not exist until AFTER the scan passes, so
+  two different-slug drivers started close together could each see "no one else" and both
+  proceed. mkdir's atomicity gives mutual exclusion over the whole scan-then-register step
+  without `flock` (unavailable on bash 3.2/macOS); the mutex is released the instant this
+  driver's own lock is written, not held for the debate's lifetime, and a claim whose recorded
+  owner pid is confirmed dead is reclaimed so one crashed driver can never deadlock every future
+  debate start.
 - Creates the debate directory, writes `topic.md`. For a real (non-dry-run) run of a given slug,
   clears any previous run's `round-*/`, `transcript.md`, and manifests for that slug first — there
   is no partial-resume feature (the loop below always restarts at round 1), so a prior run's
