@@ -38,7 +38,10 @@ Usage:
 By default a background reaper auto-closes the worker tab when the dispatch
 completes or fails (no coordinator action required).
 
-  --wait      Also block on orca-wait-done.sh (optional; reaper still runs unless --no-reap)
+  --wait      Also block on orca-wait-done.sh, pinned to THIS dispatch's own
+              task id (--task) so it can only complete on this task's own
+              message, never a leftover from an unrelated flow (optional;
+              reaper still runs unless --no-reap)
   --no-reap   Disable automatic background close (tabs will linger unless closed elsewhere)
   --persist   Keep the worker tab open after worker_done (implies --no-reap).
               For multi-round flows (debate) where the caller closes tabs itself.
@@ -206,8 +209,15 @@ else
 fi
 
 if [[ "$WAIT_DONE" -eq 1 ]]; then
+  # --task pins this wait to the dispatch we just created (Task 4): without
+  # it, a leftover worker_done from an unrelated flow (e.g. a multi-round
+  # debate, which deliberately never drains its own worker_done backlog)
+  # would be the first message orca-wait-done.sh sees, and --role would then
+  # resolve the close target from handles.json by role name rather than from
+  # that message — closing this role's real, still-running tab and
+  # reporting THIS task done on the strength of someone else's completion.
   echo "Also blocking on wait-done…"
-  exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE"
+  exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE" --task "$TASK_ID"
 fi
 
 echo "Dispatched. task_id=$TASK_ID handle=$HANDLE"

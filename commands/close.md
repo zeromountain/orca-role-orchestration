@@ -1,6 +1,6 @@
 ---
 description: Emergency close of an Orca role worker terminal (normally automatic)
-argument-hint: "<architect|executor|thrifty|fallback|term_*>"
+argument-hint: "<architect|executor|thrifty|ui|reviewer|fallback|term_*>"
 allowed-tools: Bash(.orca/orchestration/scripts/orca-close-role.sh:*)
 ---
 

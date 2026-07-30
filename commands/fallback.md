@@ -1,6 +1,6 @@
 ---
 description: Re-dispatch a rate/session-limited role to the Gemini Flash fallback worker
-argument-hint: "<architect|executor|thrifty|term_*> <continuation goal>"
+argument-hint: "<architect|executor|thrifty|ui|reviewer|term_*> <continuation goal>"
 allowed-tools: Bash(.orca/orchestration/scripts/orca-fallback-on-limit.sh:*)
 ---
 

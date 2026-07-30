@@ -1,6 +1,6 @@
 ---
 description: Dispatch a task to an Orca role worker (supervised, auto-closing tab)
-argument-hint: "<architect|executor|thrifty|fallback> <task description>"
+argument-hint: "<architect|executor|thrifty|ui|reviewer|fallback> <task description>"
 allowed-tools: Bash(.orca/orchestration/scripts/orca-dispatch-role.sh:*), Read
 ---
 

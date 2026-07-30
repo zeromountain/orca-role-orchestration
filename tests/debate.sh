@@ -2529,6 +2529,436 @@ done
 assert ZC3_never_both_dispatch_across_trials "[[ \"$zc3_any_double_dispatch\" -eq 0 ]]"
 assert ZC3_exactly_one_dispatches_every_trial "[[ \"$zc3_any_neither_dispatch\" -eq 0 ]]"
 
+# ============================================================================
+# WD-series (Task 4): orca-wait-done.sh's new --task filter. The defect: bare
+# `orca orchestration check` has no per-task selector, so a leftover message
+# from an unrelated flow (a multi-round debate deliberately never drains its
+# own worker_done backlog — draining via `check` would consume messages
+# belonging to any concurrent flow, worse than the pollution) is the first
+# thing a supervised wait sees. Pre-fix, orca-wait-done.sh acted on whatever
+# arrived: closed FROM_HANDLE with no --role, or (with --role, exactly what
+# orca-dispatch-role.sh --wait passes) resolved the close target from
+# handles.json BY ROLE NAME regardless of which task the message was
+# actually for. Both pre-fix failure modes were reproduced empirically
+# against the unedited script before any change here (stubbed orca, one
+# leftover worker_done for task_X with from_handle=term_debaterX):
+#   no --role : closed term_debaterX (a debater's terminal, unrelated to
+#               whatever the caller actually wanted)
+#   --role thrifty (handles.json: thrifty -> term_thriftyReal) : closed
+#               term_thriftyReal — thrifty's real, still-running terminal —
+#               solely because of the role hint, even though the message
+#               that triggered it belonged to an unrelated task
+# Both are recorded in task-4-report.md; they are not re-asserted here as
+# permanent tests because there is no old code path left to point them at
+# once the fix lands (this file sources/exercises the FIXED script only) —
+# same reasoning Task 1's H1 comment gives for its own pre-fix reproduction.
+#
+# All stubs below are on PATH inside a subshell/sandbox, never the real
+# runtime. Every "orchestration check" stub is deliberately either (a) static
+# per test (always the same non-matching or matching message, when a single
+# poll settles the assertion) or (b) stateful via its own call-count log
+# (when the test specifically needs to prove looping ACROSS separate polls,
+# not just multiple messages within one poll) — WD4 and WD6 exist precisely
+# because the brief warns a fixture with only one message per poll can never
+# prove "examines all of them", and WD5/WD6 exist because a fixture that
+# always matches on the first poll can never prove "the wait continues
+# under the original overall timeout" across repeated polls.
+# ============================================================================
+
+# --- WD1: a message for a DIFFERENT task is never acted on, and the wait
+# keeps polling (does not return) until the ORIGINAL overall timeout. ---
+wd1_dir="$tmpdir/wd1"
+mkdir -p "$wd1_dir/bin" "$wd1_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd1_dir/orch/scripts/"
+chmod +x "$wd1_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd1_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo call >> "$ORCA_WD1_DIR/check-calls.log"
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_debaterX","subject":"debate leftover","payload":{"taskId":"task_X"}}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD1_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd1_dir/bin/orca"
+
+wd1_rc=0
+(
+  export PATH="$wd1_dir/bin:$PATH"
+  export ORCA_WD1_DIR="$wd1_dir"
+  "$wd1_dir/orch/scripts/orca-wait-done.sh" --task task_Y --timeout-ms 900
+) >"$wd1_dir/stdout.log" 2>"$wd1_dir/stderr.log" || wd1_rc=$?
+
+wd1_calls="$(wc -l < "$wd1_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD1_exits_zero "[[ \"$wd1_rc\" -eq 0 ]]"
+assert WD1_never_closes "[[ ! -f \"$wd1_dir/closed.log\" ]]"
+assert WD1_kept_polling "[[ \"${wd1_calls:-0}\" -ge 2 ]]"
+assert WD1_reports_timeout "grep -q 'No matching message' \"$wd1_dir/stderr.log\""
+assert WD1_logs_skipped_task "grep -q 'task=task_X' \"$wd1_dir/stderr.log\""
+assert WD1_never_reports_a_match \
+  "! grep -q 'Received type=worker_done subject=debate leftover' \"$wd1_dir/stderr.log\""
+
+# --- WD2: the SAME stub message, but --task now matches — closes the
+# expected handle, and does so on the first poll (no unnecessary looping). ---
+wd2_dir="$tmpdir/wd2"
+mkdir -p "$wd2_dir/bin" "$wd2_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd2_dir/orch/scripts/"
+chmod +x "$wd2_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd2_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo call >> "$ORCA_WD2_DIR/check-calls.log"
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_debaterX","subject":"debate leftover","payload":{"taskId":"task_X"}}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD2_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd2_dir/bin/orca"
+
+wd2_rc=0
+(
+  export PATH="$wd2_dir/bin:$PATH"
+  export ORCA_WD2_DIR="$wd2_dir"
+  "$wd2_dir/orch/scripts/orca-wait-done.sh" --task task_X --timeout-ms 5000
+) >"$wd2_dir/stdout.log" 2>"$wd2_dir/stderr.log" || wd2_rc=$?
+
+wd2_calls="$(wc -l < "$wd2_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD2_exits_zero "[[ \"$wd2_rc\" -eq 0 ]]"
+assert WD2_closes_target "grep -qx term_debaterX \"$wd2_dir/closed.log\""
+assert WD2_settles_on_first_poll "[[ \"${wd2_calls:-0}\" -eq 1 ]]"
+assert WD2_reports_received \
+  "grep -qF 'Received type=worker_done subject=debate leftover from=term_debaterX task=task_X' \"$wd2_dir/stderr.log\""
+
+# --- WD3: no --task at all reproduces today's behavior EXACTLY — same
+# stub, same close decision, and (since the no-filter branch is the
+# original code untouched) the exact original stderr strings: the literal
+# --timeout-ms value (not a recomputed remaining budget) and no task-filter
+# language anywhere. This is the permanent regression test for "existing
+# callers are unaffected"; a live comparison against the pre-fix script
+# itself would not be meaningful once the fix lands (see the WD-series
+# header comment) so this asserts the documented invariant directly. ---
+wd3_dir="$tmpdir/wd3"
+mkdir -p "$wd3_dir/bin" "$wd3_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd3_dir/orch/scripts/"
+chmod +x "$wd3_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd3_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo call >> "$ORCA_WD3_DIR/check-calls.log"
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_debaterX","subject":"debate leftover","payload":{"taskId":"task_X"}}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD3_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd3_dir/bin/orca"
+
+wd3_rc=0
+(
+  export PATH="$wd3_dir/bin:$PATH"
+  export ORCA_WD3_DIR="$wd3_dir"
+  "$wd3_dir/orch/scripts/orca-wait-done.sh" --timeout-ms 1234
+) >"$wd3_dir/stdout.log" 2>"$wd3_dir/stderr.log" || wd3_rc=$?
+
+wd3_calls="$(wc -l < "$wd3_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD3_exits_zero "[[ \"$wd3_rc\" -eq 0 ]]"
+assert WD3_closes_from_handle "grep -qx term_debaterX \"$wd3_dir/closed.log\""
+assert WD3_single_poll "[[ \"${wd3_calls:-0}\" -eq 1 ]]"
+assert WD3_original_waiting_message \
+  "grep -qF 'Waiting (types=worker_done,escalation,decision_gate timeout-ms=1234)…' \"$wd3_dir/stderr.log\""
+assert WD3_original_received_message \
+  "grep -qF 'Received type=worker_done subject=debate leftover from=term_debaterX task=task_X' \"$wd3_dir/stderr.log\""
+assert WD3_no_task_filter_language "! grep -q 'timeout-ms=1234 task=' \"$wd3_dir/stderr.log\""
+
+# --- WD4: a SINGLE `check` response carrying SEVERAL messages, where the
+# matching one is NOT first. The brief warns this is exactly where a
+# one-message fixture cannot prove "examines all of them" — three messages
+# here, the wanted one in the middle, and the other two must be logged
+# (not silently dropped) but never closed on. ---
+wd4_dir="$tmpdir/wd4"
+mkdir -p "$wd4_dir/bin" "$wd4_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd4_dir/orch/scripts/"
+chmod +x "$wd4_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd4_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo call >> "$ORCA_WD4_DIR/check-calls.log"
+    echo '{"ok":true,"result":{"count":3,"messages":[
+      {"type":"worker_done","from_handle":"term_other1","subject":"leftover1","payload":{"taskId":"task_other1"}},
+      {"type":"worker_done","from_handle":"term_targetZ","subject":"the one we want","payload":{"taskId":"task_Z"}},
+      {"type":"escalation","from_handle":"term_other2","subject":"leftover2","payload":{"taskId":"task_other2"}}
+    ]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD4_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd4_dir/bin/orca"
+
+wd4_rc=0
+(
+  export PATH="$wd4_dir/bin:$PATH"
+  export ORCA_WD4_DIR="$wd4_dir"
+  "$wd4_dir/orch/scripts/orca-wait-done.sh" --task task_Z --timeout-ms 5000
+) >"$wd4_dir/stdout.log" 2>"$wd4_dir/stderr.log" || wd4_rc=$?
+
+wd4_calls="$(wc -l < "$wd4_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD4_exits_zero "[[ \"$wd4_rc\" -eq 0 ]]"
+assert WD4_closes_the_middle_match "grep -qx term_targetZ \"$wd4_dir/closed.log\""
+assert WD4_never_closes_first "! grep -qx term_other1 \"$wd4_dir/closed.log\""
+assert WD4_never_closes_last "! grep -qx term_other2 \"$wd4_dir/closed.log\""
+assert WD4_single_poll_sufficient "[[ \"${wd4_calls:-0}\" -eq 1 ]]"
+assert WD4_logs_skipped_first "grep -q 'task=task_other1' \"$wd4_dir/stderr.log\""
+assert WD4_logs_skipped_last "grep -q 'task=task_other2' \"$wd4_dir/stderr.log\""
+assert WD4_reports_the_match \
+  "grep -qF 'Received type=worker_done subject=the one we want from=term_targetZ task=task_Z' \"$wd4_dir/stderr.log\""
+
+# --- WD5: the match arrives only after several SEPARATE polls (not within
+# one batch) — proves the loop genuinely persists ACROSS `check` calls under
+# the ORIGINAL overall timeout, not merely across messages within one call. ---
+wd5_dir="$tmpdir/wd5"
+mkdir -p "$wd5_dir/bin" "$wd5_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd5_dir/orch/scripts/"
+chmod +x "$wd5_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd5_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    n=0
+    [[ -f "$ORCA_WD5_DIR/check-calls.log" ]] && n=$(wc -l < "$ORCA_WD5_DIR/check-calls.log" | tr -d ' ')
+    echo call >> "$ORCA_WD5_DIR/check-calls.log"
+    n=$((n + 1))
+    if [[ "$n" -lt 3 ]]; then
+      echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_noise","subject":"noise","payload":{"taskId":"task_noise"}}]}}'
+    else
+      echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_finally","subject":"the real one","payload":{"taskId":"task_final"}}]}}'
+    fi
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD5_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd5_dir/bin/orca"
+
+wd5_rc=0
+(
+  export PATH="$wd5_dir/bin:$PATH"
+  export ORCA_WD5_DIR="$wd5_dir"
+  "$wd5_dir/orch/scripts/orca-wait-done.sh" --task task_final --timeout-ms 5000
+) >"$wd5_dir/stdout.log" 2>"$wd5_dir/stderr.log" || wd5_rc=$?
+
+wd5_calls="$(wc -l < "$wd5_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD5_exits_zero "[[ \"$wd5_rc\" -eq 0 ]]"
+assert WD5_closes_after_persistence "grep -qx term_finally \"$wd5_dir/closed.log\""
+assert WD5_never_closes_noise "! grep -qx term_noise \"$wd5_dir/closed.log\""
+assert WD5_took_multiple_polls "[[ \"${wd5_calls:-0}\" -ge 3 ]]"
+assert WD5_logged_noise "grep -q 'task=task_noise' \"$wd5_dir/stderr.log\""
+
+# --- WD6: end-to-end through the REAL orca-dispatch-role.sh --wait, against
+# a stub that queues two leftover "debate" worker_done messages (a different
+# task id) ahead of this dispatch's own completion. Proves requirement #2
+# directly (not just by grepping the source for the wiring): the task id
+# orca-dispatch-role.sh just created via `orchestration task-create` is what
+# actually reaches the exec'd orca-wait-done.sh's --task filter, so the
+# leftover messages are ignored and only this dispatch's own message closes
+# its own terminal. --no-reap keeps the background reaper out of the way
+# (it is orthogonal to this defect and would otherwise linger for up to
+# REAP_TIMEOUT_MS against this same stub). ---
+wd6_dir="$tmpdir/wd6"
+mkdir -p "$wd6_dir/bin" "$wd6_dir/scripts"
+cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd6_dir/scripts/"
+echo '{}' > "$wd6_dir/handles.json"
+WD6_DISPATCH="$wd6_dir/scripts/orca-dispatch-role.sh"
+
+cat > "$wd6_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_wd6role"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_wd6role","accepted":true}}}' ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_wd6role","tail":["ROLE=thrifty"]}}}' ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_wd6role","connected":true}]}}' ;;
+  "orchestration task-create") echo '{"ok":true,"result":{"task":{"id":"task_wd6_target"}}}' ;;
+  "orchestration dispatch") echo '{"ok":true,"result":{"dispatch":{"id":"disp_wd6"}}}' ;;
+  "orchestration check")
+    n=0
+    [[ -f "$ORCA_WD6_DIR/check-calls.log" ]] && n=$(wc -l < "$ORCA_WD6_DIR/check-calls.log" | tr -d ' ')
+    echo call >> "$ORCA_WD6_DIR/check-calls.log"
+    n=$((n + 1))
+    if [[ "$n" -lt 3 ]]; then
+      echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_debate_leftover","subject":"leftover debate worker_done","payload":{"taskId":"task_wd6_noise"}}]}}'
+    else
+      echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_wd6role","subject":"thrifty done","payload":{"taskId":"task_wd6_target"}}]}}'
+    fi
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD6_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd6_dir/bin/orca"
+
+wd6_rc=0
+(
+  export PATH="$wd6_dir/bin:$PATH"
+  export ORCA_WD6_DIR="$wd6_dir"
+  "$WD6_DISPATCH" thrifty --spec "irrelevant wd6 body" --wait --no-reap --timeout-ms 5000
+) >"$wd6_dir/dispatch.out" 2>"$wd6_dir/dispatch.err" || wd6_rc=$?
+
+wd6_calls="$(wc -l < "$wd6_dir/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD6_dispatch_wait_ok "[[ \"$wd6_rc\" -eq 0 ]]"
+assert WD6_closes_own_handle "grep -qx term_wd6role \"$wd6_dir/closed.log\""
+assert WD6_never_closes_leftover "! grep -qx term_debate_leftover \"$wd6_dir/closed.log\""
+assert WD6_skipped_noise_task_logged "grep -q 'task=task_wd6_noise' \"$wd6_dir/dispatch.err\""
+assert WD6_reports_target_task "grep -q 'task=task_wd6_target' \"$wd6_dir/dispatch.err\""
+assert WD6_persisted_across_polls "[[ \"${wd6_calls:-0}\" -ge 3 ]]"
+
+# --- WD7: usage/docs/wiring surface. ---
+assert WD7_syntax_clean "bash -n \"$ROOT/scripts/orca-wait-done.sh\""
+wd7_help_out="$("$ROOT/scripts/orca-wait-done.sh" --help 2>&1 || true)"
+assert WD7_help_mentions_task "printf '%s' \"\$wd7_help_out\" | grep -q -- '--task'"
+assert WD7_dispatch_wiring_passes_task \
+  "grep -q -- '--role \"\$ROLE\" --task \"\$TASK_ID\"' \"$ROOT/scripts/orca-dispatch-role.sh\""
+assert WD7_singlewaiter_documented_in_script \
+  "grep -qi 'single-waiter' \"$ROOT/scripts/orca-wait-done.sh\""
+assert WD7_singlewaiter_documented_in_docs \
+  "grep -qi 'one waiter at a time' \"$ROOT/templates/SCRIPTS.md\""
+assert WD7_dispatch_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/dispatch.md\""
+assert WD7_close_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/close.md\""
+assert WD7_fallback_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/fallback.md\""
+
+# --- WD8: the ORIGINAL bug scenario verbatim, exercised directly on
+# orca-wait-done.sh (not through orca-dispatch-role.sh, so a --role handle
+# for a role OTHER than whoever the message actually came from is in play,
+# not just "the one role this dispatch happens to own" as in WD6). handles
+# .json maps thrifty -> term_thriftyReal (its real, currently-running
+# terminal); the queued message is a leftover debate worker_done for an
+# unrelated task, from_handle=term_debaterX. This is the exact fixture used
+# for the pre-fix empirical demonstration recorded in task-4-report.md. ---
+wd8_dir="$tmpdir/wd8"
+mkdir -p "$wd8_dir/bin" "$wd8_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wd8_dir/orch/scripts/"
+chmod +x "$wd8_dir/orch/scripts/orca-wait-done.sh"
+cat > "$wd8_dir/orch/handles.json" <<'JSON'
+{"version":1,"roles":{"thrifty":{"handle":"term_thriftyReal"}},"thrifty":"term_thriftyReal"}
+JSON
+cat > "$wd8_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo call >> "$ORCA_WD8_DIR/check-calls.log"
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_debaterX","subject":"debate leftover","payload":{"taskId":"task_X"}}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$ORCA_WD8_DIR/closed.log"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wd8_dir/bin/orca"
+
+# (a) --role thrifty, NO --task (the pre-fix call shape): reproduces the
+# original bug — closes thrifty's REAL terminal on the strength of an
+# unrelated task's message. This is expected/documented behavior for the
+# no-filter path (Step 3: unaffected), which is exactly why requirement #2
+# (orca-dispatch-role.sh --wait always supplies --task) matters.
+wd8a_rc=0
+(
+  export PATH="$wd8_dir/bin:$PATH"
+  export ORCA_WD8_DIR="$wd8_dir/a"
+  mkdir -p "$ORCA_WD8_DIR"
+  "$wd8_dir/orch/scripts/orca-wait-done.sh" --role thrifty --timeout-ms 900
+) >"$wd8_dir/a.out" 2>"$wd8_dir/a.err" || wd8a_rc=$?
+assert WD8a_norole_filter_reproduces_bug "grep -qx term_thriftyReal \"$wd8_dir/a/closed.log\""
+
+# (b) --role thrifty AND --task task_X (matching the message): the fixed
+# path proceeds, since the message IS confirmed to be for the awaited task —
+# role-hint resolution firing here is now safe.
+wd8b_rc=0
+(
+  export PATH="$wd8_dir/bin:$PATH"
+  export ORCA_WD8_DIR="$wd8_dir/b"
+  mkdir -p "$ORCA_WD8_DIR"
+  "$wd8_dir/orch/scripts/orca-wait-done.sh" --role thrifty --task task_X --timeout-ms 5000
+) >"$wd8_dir/b.out" 2>"$wd8_dir/b.err" || wd8b_rc=$?
+assert WD8b_matching_task_still_closes "grep -qx term_thriftyReal \"$wd8_dir/b/closed.log\""
+
+# (c) --role thrifty AND --task task_Y (a DIFFERENT, unrelated task — the
+# actual defect scenario): must NOT close thrifty's real terminal, must NOT
+# close anything at all, and must keep polling instead of returning early.
+wd8c_rc=0
+(
+  export PATH="$wd8_dir/bin:$PATH"
+  export ORCA_WD8_DIR="$wd8_dir/c"
+  mkdir -p "$ORCA_WD8_DIR"
+  "$wd8_dir/orch/scripts/orca-wait-done.sh" --role thrifty --task task_Y --timeout-ms 900
+) >"$wd8_dir/c.out" 2>"$wd8_dir/c.err" || wd8c_rc=$?
+wd8c_calls="$(wc -l < "$wd8_dir/c/check-calls.log" 2>/dev/null | tr -d ' ')"
+assert WD8c_exits_zero "[[ \"$wd8c_rc\" -eq 0 ]]"
+assert WD8c_never_closes_thrifty "[[ ! -f \"$wd8_dir/c/closed.log\" ]]"
+assert WD8c_kept_polling "[[ \"${wd8c_calls:-0}\" -ge 2 ]]"
+assert WD8c_logs_the_leftover "grep -q 'task=task_X' \"$wd8_dir/c.err\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1
