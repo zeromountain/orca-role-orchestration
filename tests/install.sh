@@ -174,6 +174,16 @@ if [[ -n "$stale_hits" ]]; then
 fi
 assert T11_no_stale_models "[[ -z \"\$stale_hits\" ]]"
 
+# --- T12 orphan sweeper / dead-man watchdog scaffold (Task 2) ---
+assert T12_script_sweep "[[ -x \"$ORCH/scripts/orca-sweep-orphans.sh\" ]]"
+assert T12_gitignore_locks "grep -qF '.orca/orchestration/debate-locks/' \"$tmpdir/.gitignore\""
+# $tmpdir's .gitignore has been through T1 (fresh), T2 (re-run), T3, T4, T5,
+# T6 (--reset), and any of the re-runs above by this point — matching the
+# existing T9_gitignore_no_dup pattern, this is a real idempotency check
+# across many re-runs, not just a single one.
+gi_locks_count=$(grep -cF '.orca/orchestration/debate-locks/' "$tmpdir/.gitignore" 2>/dev/null || true)
+assert T12_gitignore_no_dup "[[ \"$gi_locks_count\" -eq 1 ]]"
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then

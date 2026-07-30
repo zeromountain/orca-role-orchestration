@@ -35,6 +35,7 @@ KEEP_TABS=0
 DRY_RUN=0
 DIR_ROOT="$ORCH/debates"
 BUILD_ONLY=""
+LOCK_TTL_SECONDS="$DEBATE_LOCK_TTL_SECONDS_DEFAULT"
 
 # Per-round defaults: R1 carries the research obligation and gets longer.
 R1_TIMEOUT_MS=1800000
@@ -46,13 +47,15 @@ Usage:
   orca-debate.sh --topic "…" | --topic-file <file>
                  [--slug <s>] [--rounds 1|2|3] [--debaters claude,codex,grok,gemini]
                  [--judge <role>] [--timeout-ms N] [--keep-tabs] [--dry-run]
-                 [--dir-root <path>]
+                 [--dir-root <path>] [--lock-ttl-seconds N]
   orca-debate.sh --build-transcript <debate-dir>
 
   --judge <role>   Dispatch this role to write the decision document
                    (default: leave it to the coordinator).
   --keep-tabs      Do not close debater tabs on exit (debugging).
   --dry-run        Print every round's specs; create no terminals.
+  --lock-ttl-seconds N  Dead-man watchdog staleness threshold (default 1800 —
+                   see orca-debate-lib.sh for reasoning). Mainly for tests.
 EOF
 }
 
@@ -97,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --keep-tabs) KEEP_TABS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --dir-root) DIR_ROOT="${2:?}"; shift 2 ;;
+    --lock-ttl-seconds) LOCK_TTL_SECONDS="${2:?}"; shift 2 ;;
     --build-transcript) BUILD_ONLY="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; usage; exit 1 ;;
@@ -166,8 +170,37 @@ echo "Debate: $SLUG"
 echo "  dir: $DEBATE_DIR"
 echo "  debaters: $DEBATERS"
 
+# --- dead-man watchdog (Task 2) ---
+# Computed unconditionally (cheap — just paths) so cleanup()/stop_debate_watchdog
+# below can always reference them; only actually created when DRY_RUN=0, since
+# a --dry-run debate creates no terminals and has nothing for a watchdog to own.
+LOCK_DIR="$ORCH/debate-locks"
+LOCK_FILE="$LOCK_DIR/$SLUG.json"
+WATCHDOG_PID_FILE="$LOCK_DIR/$SLUG.watchdog.pid"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$LOCK_DIR"
+  if [[ -f "$LOCK_FILE" ]] && lock_is_fresh "$LOCK_FILE"; then
+    echo "(warn) a fresh debate lock already exists for slug '$SLUG' (pid=$(lock_pid "$LOCK_FILE")) — overwriting it. If that debate is still actually running, its watchdog will notice the pid no longer matches this run and stand down without closing anything (see orca-sweep-orphans.sh), but two drivers now believe they own the same tabs. Consider --slug to pick a different slug if that was not intended." >&2
+  fi
+  WATCHDOG_PID="$(debate_watchdog_start "$HERE" "$LOCK_FILE" "$SLUG" "$$" "$LOCK_DIR" "$LOCK_TTL_SECONDS")"
+  printf '%s\n' "$WATCHDOG_PID" > "$WATCHDOG_PID_FILE"
+  export ORCA_ROLE_LOCK_FILE="$LOCK_FILE"
+  echo "  watchdog: pid=$WATCHDOG_PID ttl=${LOCK_TTL_SECONDS}s lock=$LOCK_FILE"
+fi
+
 # --- close debater tabs on any exit ---
 cleanup() {
+  # Stop the watchdog and remove the lock FIRST, unconditionally — even
+  # under --keep-tabs. A driver reaching cleanup() is exiting deliberately;
+  # the dead-man's-switch concern (an owner that stops proving it is alive)
+  # is over regardless of whether tabs are being kept open on purpose for
+  # debugging. Doing this before the KEEP_TABS/DRY_RUN early return below,
+  # and before this function's own tab-closing loop, means the watchdog can
+  # never race this driver's own close attempts. debate_watchdog_stop is a
+  # guarded no-op when nothing was ever started (--dry-run).
+  debate_watchdog_stop "$WATCHDOG_PID_FILE" "$LOCK_FILE"
+
   if [[ "$KEEP_TABS" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
     return 0
   fi
@@ -179,7 +212,16 @@ cleanup() {
   done
   IFS="$old"
   for short in "${roster[@]}"; do
-    "$HERE/orca-close-role.sh" "$(debate_role_key "$short")" >/dev/null 2>&1 || true
+    # Outcomes are observable (not silenced to /dev/null) — a driver that
+    # cannot see why a close failed cannot diagnose exactly the class of
+    # failure this task exists to fix.
+    local close_out close_rc=0
+    close_out="$("$HERE/orca-close-role.sh" "$(debate_role_key "$short")" 2>&1)" || close_rc=$?
+    if [[ "$close_rc" -eq 0 ]]; then
+      echo "cleanup: closed $short — $close_out" >&2
+    else
+      echo "cleanup: close FAILED for $short (rc=$close_rc) — $close_out" >&2
+    fi
   done
 }
 # A single `trap cleanup EXIT INT TERM` looks right but is not: cleanup()

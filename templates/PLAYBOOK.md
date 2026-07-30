@@ -86,6 +86,11 @@ Timeout / `count:0` = checkpoint, not failure if terminal still working.
 propose → critique (anonymized) → converge. Four read-only seats, quorum 3, tabs persist between
 rounds and close when the driver exits. Transcript in `debates/<slug>/`; decision in `docs/ideas/`.
 
+A background watchdog (`orca-sweep-orphans.sh --watchdog`, started automatically) closes debater
+tabs on its own if the driver is killed or crashes mid-debate, so a lost driver never leaves a
+permission-bypassed session running unattended. Run `orca-sweep-orphans.sh` any time to report (or,
+with `--close`, close) any other untracked role/debate terminal.
+
 ## Routing cheat sheet
 
 | Request | Primary | Secondary |

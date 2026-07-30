@@ -5,6 +5,22 @@
 
 DEBATERS_DEFAULT="claude,codex,grok,gemini"
 
+# Task 2: dead-man watchdog for `--persist` tabs. Generous relative to a
+# single round (R1_TIMEOUT_MS in orca-debate.sh is 1800000 = 30 min — the
+# longest one) while remaining far short of "hours" if a debate is
+# abandoned. In practice this is a backstop, not the primary detector: the
+# watchdog is an independent polling process (see
+# orca-sweep-orphans.sh --watchdog) that notices the owning driver's death
+# via `kill -0` within one poll interval (default 20s, see
+# WATCHDOG_POLL_SECONDS_DEFAULT below), decoupled from how long any given
+# round takes — the driver spends most of a round blocked waiting on a
+# child process, so a "the owner refreshes its own heartbeat between doing
+# other work" design would leave gaps as long as a round itself. Instead
+# the watchdog refreshes the heartbeat on the owner's behalf, once per poll
+# cycle, for as long as `kill -0 <owner pid>` keeps succeeding.
+DEBATE_LOCK_TTL_SECONDS_DEFAULT=1800
+WATCHDOG_POLL_SECONDS_DEFAULT=20
+
 debate_role_key()   { printf 'debater_%s\n' "$1"; }
 debate_short_name() { printf '%s\n' "${1#debater_}"; }
 
@@ -299,4 +315,37 @@ EOF
       return 1
       ;;
   esac
+}
+
+debate_watchdog_start() {
+  # $1=here(scripts dir, for locating orca-sweep-orphans.sh)
+  # $2=lock_file $3=slug $4=owner_pid $5=locks_dir $6=ttl_seconds
+  # Writes the initial lock (lock_write, from orca-roles-lib.sh — must
+  # already be sourced by the caller) and starts the watchdog daemon via
+  # nohup, backgrounded. Prints the watchdog's own pid on stdout.
+  local here="$1" lock_file="$2" slug="$3" owner_pid="$4" locks_dir="$5" ttl="$6"
+  lock_write "$lock_file" "$owner_pid" "$slug" "$ttl"
+  nohup "$here/orca-sweep-orphans.sh" --watchdog --slug "$slug" --owner-pid "$owner_pid" \
+    --locks-dir "$locks_dir" >"${lock_file%.json}.watchdog.log" 2>&1 &
+  printf '%s\n' "$!"
+}
+
+debate_watchdog_stop() {
+  # $1=watchdog_pid_file $2=lock_file
+  # Stops the watchdog (SIGTERM — its own trap exits without touching
+  # anything, since a driver reaching this point is exiting deliberately,
+  # whether or not it chooses to close tabs itself right after) and removes
+  # the lock. Idempotent and safe to call even when nothing was ever
+  # started (e.g. --dry-run never calls debate_watchdog_start, so both
+  # files below are simply absent and every step here is a guarded no-op).
+  local pid_file="$1" lock_file="$2" wpid
+  if [[ -f "$pid_file" ]]; then
+    wpid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+      kill -TERM "$wpid" 2>/dev/null || true
+      echo "debate_watchdog_stop: stopped watchdog pid=$wpid" >&2
+    fi
+    rm -f "$pid_file"
+  fi
+  lock_remove "$lock_file"
 }

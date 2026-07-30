@@ -30,9 +30,13 @@ POLL_S=5
 DRY_RUN=0
 QUORUM=3
 
-# Test seams: allow the dispatcher and the status source to be stubbed.
-DISPATCH_BIN="${ORCA_DEBATE_DISPATCH:-$HERE/orca-dispatch-role.sh}"
-STATUS_STUB="${ORCA_DEBATE_STATUS_STUB:-}"
+# Test seams: allow the dispatcher and the status source to be stubbed. These
+# are ORCA_TEST_-prefixed (not ORCA_DEBATE_-prefixed) because they are live env
+# vars that override real dispatch behavior — a name that reads as "debate
+# config" invites setting it in a real environment by accident; ORCA_TEST_
+# makes clear this seam exists for tests only.
+DISPATCH_BIN="${ORCA_TEST_DISPATCH:-$HERE/orca-dispatch-role.sh}"
+STATUS_STUB="${ORCA_TEST_STATUS_STUB:-}"
 
 usage() {
   cat <<'EOF'

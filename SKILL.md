@@ -86,6 +86,7 @@ orca-role-orchestration/
     orca-debate.sh              # drive a 3-round four-model idea debate
     orca-debate-round.sh        # one debate round: fan out, poll, collect, lint
     orca-debate-lib.sh          # debate helpers + round prompts (sourced)
+    orca-sweep-orphans.sh       # report/close untracked terminals; --persist dead-man watchdog
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
     roles.yaml                 # managed routing (always refreshed)

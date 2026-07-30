@@ -100,6 +100,20 @@ else
 fi
 
 HANDLE="$(ensure_terminal "$ROLE")"
+
+# Dead-man watchdog registration (Task 2): completely generic and
+# debate-agnostic — this script does not know or care what ORCA_ROLE_LOCK_FILE
+# means (today only orca-debate.sh sets it, via its own exported env var,
+# inherited by this process since orca-debate-round.sh calls this script as a
+# child). If a --persist caller has an active lock context, register our
+# resolved handle so that caller's watchdog knows to close it if the caller
+# ever stops proving it is alive. A missing/absent lock context, or a
+# non-persist dispatch, is a normal no-op — most dispatches have neither.
+if [[ "$PERSIST" -eq 1 && -n "${ORCA_ROLE_LOCK_FILE:-}" && -f "$ORCA_ROLE_LOCK_FILE" ]]; then
+  lock_register_handle "$ORCA_ROLE_LOCK_FILE" "$HANDLE" \
+    || echo "(warn) could not register $HANDLE with lock $ORCA_ROLE_LOCK_FILE — the watchdog owning that lock will not know about this handle" >&2
+fi
+
 MODEL="$(role_meta "$ROLE" | cut -f2)"
 PERSONA_FILE="$ORCH/personas/$ROLE.md"
 STANCE=""

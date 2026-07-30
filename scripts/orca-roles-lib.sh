@@ -515,3 +515,207 @@ ensure_terminal() {
 
   printf '%s\n' "$handle"
 }
+
+# ---------------------------------------------------------------------------
+# Generic ownership-lock primitives (Task 2: orphan sweeper + dead-man
+# watchdog for `--persist`). Deliberately NOT debate-specific in name or
+# behavior — any `--persist` dispatch can register a handle here, and the
+# concept (an owner pid, a set of handles it is responsible for, a
+# heartbeat + TTL that defines staleness) has nothing debate-specific in it.
+# `orca-debate.sh` is the only current caller of lock_write, because it is
+# the only current owner of a multi-round `--persist` flow, but this file —
+# already the single source for role metadata and the terminal journal — is
+# the natural home for the primitive, not scripts/orca-debate-lib.sh.
+#
+# Lock file contract ($ORCH/debate-locks/<slug>.json — see
+# task-2-report.md for the full data contract table):
+#   {"pid": <owner pid>, "slug": "...", "handles": [...],
+#    "heartbeatAt": "<ISO-8601 UTC>", "ttlSeconds": <int>}
+#
+# Every write below goes through a temp-file + atomic rename (os.replace),
+# never a direct in-place write — this file's entire purpose is surviving
+# a process that gets killed without warning, and an in-place
+# json.dump(open(path, "w")) truncates the file before writing the new
+# content, so a kill mid-write would leave a corrupt/truncated lock file on
+# disk. A temp file in the same directory plus os.replace is atomic on a
+# local filesystem: a killed writer leaves, at worst, a stray .tmp.<pid>
+# file next to an untouched, still-valid lock file.
+#
+# `lock_register_handle` deliberately does NOT read-modify-write the lock
+# file directly, even though every other lock_* writer below does. Two
+# independent read-modify-write processes on the same file (a --persist
+# dispatch appending a handle, and a running watchdog refreshing
+# heartbeatAt) can race: reader A reads, reader B reads, A writes, B writes
+# — B's write wins and silently discards A's change. If that lost update is
+# a just-created debater's handle, the watchdog never learns about it and
+# can never close it — precisely the orphan this task exists to prevent.
+# So instead: lock_register_handle only ever appends one line to a sidecar
+# file ("<lock path without .json>.handles.jsonl"); a single `printf >>`
+# write of one short line is atomic on a local filesystem (POSIX guarantees
+# atomicity for writes at or below PIPE_BUF, at least 512 bytes — far more
+# than one terminal handle), so any number of concurrent appends can never
+# clobber each other. The watchdog (the lock file's sole read-modify-write
+# owner after the initial lock_write) folds the sidecar into the lock's
+# "handles" array on every poll cycle via lock_merge_and_refresh, then
+# empties the sidecar. This composition (many safe appenders, one
+# periodic-merging owner) avoids the race without needing a real mutex —
+# bash 3.2 / macOS has no `flock(1)`.
+lock_write() {
+  # $1=path $2=pid $3=slug $4=ttl_seconds. Creates (or overwrites) the lock
+  # with an empty handles array; handles arrive later via
+  # lock_register_handle as --persist dispatches create them.
+  local path="$1" pid="$2" slug="$3" ttl="$4"
+  mkdir -p "$(dirname "$path")" 2>/dev/null || true
+  python3 - "$path" "$pid" "$slug" "$ttl" <<'PY'
+import json, os, sys, datetime
+
+path, pid, slug, ttl = sys.argv[1:5]
+data = {
+    "pid": int(pid),
+    "slug": slug,
+    "handles": [],
+    "heartbeatAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "ttlSeconds": int(ttl),
+}
+tmp_path = path + ".tmp." + str(os.getpid())
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp_path, path)
+PY
+}
+
+lock_register_handle() {
+  # $1=lock_file $2=handle. See the file-header comment above for why this
+  # appends to a sidecar instead of writing the lock file directly. Silent
+  # no-op (return 1) if the lock file does not exist — a caller with no
+  # active lock context has nothing to register against.
+  local lock_file="$1" handle="$2" sidecar
+  [[ -n "$lock_file" && -f "$lock_file" ]] || return 1
+  sidecar="${lock_file%.json}.handles.jsonl"
+  printf '%s\n' "$handle" >> "$sidecar"
+}
+
+lock_merge_and_refresh() {
+  # $1=lock_file. Folds the append-only sidecar's handles into this lock's
+  # own "handles" array (dedup), refreshes heartbeatAt to now, and
+  # atomically rewrites the lock file. Truncates the sidecar after a
+  # successful merge. Returns 1 (no write attempted) if the lock file
+  # itself is missing or unparseable — callers (the watchdog loop) must
+  # treat that as "nothing left to own," not as an error to retry past.
+  local lock_file="$1" sidecar
+  [[ -f "$lock_file" ]] || return 1
+  sidecar="${lock_file%.json}.handles.jsonl"
+  python3 - "$lock_file" "$sidecar" <<'PY'
+import json, os, sys, datetime
+
+lock_path, sidecar_path = sys.argv[1:3]
+try:
+    d = json.load(open(lock_path))
+except Exception:
+    sys.exit(1)
+
+handles = list(d.get("handles") or [])
+seen = set(handles)
+if os.path.exists(sidecar_path):
+    with open(sidecar_path) as f:
+        for line in f:
+            h = line.strip()
+            if h and h not in seen:
+                handles.append(h)
+                seen.add(h)
+
+d["handles"] = handles
+d["heartbeatAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+tmp_path = lock_path + ".tmp." + str(os.getpid())
+with open(tmp_path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.replace(tmp_path, lock_path)
+
+if os.path.exists(sidecar_path):
+    open(sidecar_path, "w").close()
+PY
+}
+
+lock_pid() {
+  # $1=path -> owning pid on stdout (empty if missing/malformed). Meant to
+  # be captured via `$(lock_pid ...)` by callers, so — following the same
+  # precaution documented at length in create_role above — the python
+  # heredoc below redirects its own stdout to a scratch file (plain `>`,
+  # never nested inside this function's own `$(...)`), and a separate
+  # trivial, heredoc-free `cat` is what the caller's command substitution
+  # actually captures.
+  local path="$1" scratch
+  scratch="$(mktemp)"
+  python3 - "$path" <<'PY' >"$scratch"
+import json, sys
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+    print(d.get("pid") or "")
+except Exception:
+    print("")
+PY
+  cat "$scratch"
+  rm -f "$scratch"
+}
+
+lock_handles() {
+  # $1=path -> each handle on its own line (empty output if missing/
+  # malformed). Same scratch-file precaution as lock_pid.
+  local path="$1" scratch
+  scratch="$(mktemp)"
+  python3 - "$path" <<'PY' >"$scratch"
+import json, sys
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(0)
+for h in d.get("handles") or []:
+    print(h)
+PY
+  cat "$scratch"
+  rm -f "$scratch"
+}
+
+lock_is_fresh() {
+  # $1=path -> exit 0 (fresh: heartbeatAt within ttlSeconds of now) or 1
+  # (stale, missing, or malformed). Bare exit-code contract, never
+  # `$(...)`-captured, so this is safe as a plain heredoc regardless of the
+  # bash-3.2-heredoc-in-$(...) issue documented elsewhere in this file.
+  #
+  # This is the primitive Task 3's concurrency refusal must call: before a
+  # new debate driver writes its own lock, enumerate every OTHER file under
+  # `$ORCH/debate-locks/*.json` (slug = basename minus .json), call
+  # `lock_is_fresh` on each, and refuse to start if any of them is fresh
+  # AND names a different slug than the one about to be started (use
+  # `lock_pid` to name the owning pid in the refusal message).
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  python3 - "$path" <<'PY'
+import json, sys, datetime
+
+path = sys.argv[1]
+try:
+    d = json.load(open(path))
+    hb = datetime.datetime.fromisoformat(d["heartbeatAt"])
+    ttl = float(d["ttlSeconds"])
+except Exception:
+    sys.exit(1)
+if hb.tzinfo is None:
+    hb = hb.replace(tzinfo=datetime.timezone.utc)
+now = datetime.datetime.now(datetime.timezone.utc)
+age = (now - hb).total_seconds()
+sys.exit(0 if age < ttl else 1)
+PY
+}
+
+lock_remove() {
+  # $1=lock_file. Removes the lock and its sidecar (if any). Idempotent —
+  # always safe to call on a lock that is already gone or never existed.
+  local path="$1"
+  rm -f "$path" "${path%.json}.handles.jsonl" 2>/dev/null || true
+}

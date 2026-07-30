@@ -16,3 +16,6 @@
 
 # Orca local runtime state
 .orca/orchestration/terminal-journal.jsonl
+
+# Orca local runtime state
+.orca/orchestration/debate-locks/

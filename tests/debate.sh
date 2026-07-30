@@ -21,7 +21,14 @@ assert() {
 }
 
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+# Task 2's watchdog tests start real background processes (a fake "owner" and
+# the real watchdog daemon) against a stubbed orca — never the real runtime.
+# CLEANUP_PIDS collects every such pid so the EXIT trap below can force-kill
+# anything still alive no matter how/where the suite exits (assertion
+# failure, unexpected error under set -e, etc.), so a broken assertion in
+# this file can never leak a stray process onto the dev machine.
+CLEANUP_PIDS=()
+trap 'for _p in "${CLEANUP_PIDS[@]:-}"; do kill -9 "$_p" 2>/dev/null || true; done; rm -rf "$tmpdir"' EXIT
 
 echo "=== tests/debate.sh (tmp=$tmpdir) ==="
 
@@ -270,8 +277,8 @@ chmod +x "$STUB/orca-dispatch-role.sh"
 DEB2="$tmpdir/debate2"
 mkdir -p "$DEB2"
 printf 'TOPIC_E2\n' > "$DEB2/topic.md"
-ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
-ORCA_DEBATE_STATUS_STUB=completed \
+ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role.sh" \
+ORCA_TEST_STATUS_STUB=completed \
 "$ROUND" --dir "$DEB2" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1
 assert E2_files "[[ -f \"$DEB2/round-1/claude.md\" && -f \"$DEB2/round-1/gemini.md\" ]]"
 assert E2_manifest "[[ -f \"$DEB2/round-1/manifest.json\" ]]"
@@ -284,8 +291,8 @@ mkdir -p "$DEB3"
 printf 'TOPIC_E3\n' > "$DEB3/topic.md"
 # The round script exits 2 here by design, so the call must be if-guarded:
 # tests/debate.sh runs under `set -e`, which would otherwise abort the suite.
-if ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role.sh" \
-   ORCA_DEBATE_STATUS_STUB=failed \
+if ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role.sh" \
+   ORCA_TEST_STATUS_STUB=failed \
    "$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1; then
   QUORUM_RC=0
 else
@@ -333,8 +340,8 @@ printf 'TOPIC_E4\n' > "$DEB4/topic.md"
 # but capture the real exit code rather than assuming it, since a regression here
 # would abort the whole script, not merely flip 0 to 2.
 E4_RC=0
-ORCA_DEBATE_DISPATCH="$STUB/orca-dispatch-role-fail1.sh" \
-ORCA_DEBATE_STATUS_STUB=completed \
+ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role-fail1.sh" \
+ORCA_TEST_STATUS_STUB=completed \
 "$ROUND" --dir "$DEB4" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1 || E4_RC=$?
 assert E4_survives_fail   "[[ $E4_RC -eq 0 ]]"
 assert E4_others_present  "[[ -f \"$DEB4/round-1/claude.md\" && -f \"$DEB4/round-1/gemini.md\" && -f \"$DEB4/round-1/grok.md\" ]]"
@@ -812,6 +819,594 @@ assert H9_gitignore_has_journal "grep -qF '.orca/orchestration/terminal-journal.
 "$ROOT/scripts/install-to-project.sh" --project-root "$h9_root" --project-name h9-test >/dev/null 2>&1
 h9_count=$(grep -cF '.orca/orchestration/terminal-journal.jsonl' "$h9_root/.gitignore" 2>/dev/null || true)
 assert H9_gitignore_no_dup "[[ \"$h9_count\" -eq 1 ]]"
+
+# ============================================================================
+# Task 2 (orphan sweeper + dead-man watchdog for --persist): L-series (lock
+# primitives, pure — no orca, no processes), O-series (sweep mode against a
+# stubbed orca), P-series (--persist end-to-end selects STAY-OPEN, via a
+# stubbed orca, matching the H-series pattern), W-series (the watchdog
+# daemon itself — real background processes against a stubbed orca, never
+# the real runtime; every backgrounded pid is appended to CLEANUP_PIDS so
+# the file-level EXIT trap force-kills anything still alive no matter how
+# this file exits).
+# ============================================================================
+
+SWEEP="$ROOT/scripts/orca-sweep-orphans.sh"
+assert T2_sweep_exec "[[ -x \"$SWEEP\" ]]"
+assert T2_sweep_help "\"$SWEEP\" --help | grep -q -- '--watchdog'"
+
+sw_bad_rc=0
+"$SWEEP" --bogus-flag >/dev/null 2>&1 || sw_bad_rc=$?
+assert T2_sweep_unknown_flag_rejected "[[ \"$sw_bad_rc\" -ne 0 ]]"
+
+sw_missing_rc=0
+"$SWEEP" --watchdog >/dev/null 2>&1 || sw_missing_rc=$?
+assert T2_sweep_watchdog_requires_args "[[ \"$sw_missing_rc\" -ne 0 ]]"
+
+# --- L1: lock_write creates the documented shape ---
+l_dir="$tmpdir/lock-l1"
+mkdir -p "$l_dir"
+LFILE="$l_dir/testslug.json"
+lock_write "$LFILE" 4242 testslug 1800
+assert L1_pid    "[[ \"\$(lock_pid \"$LFILE\")\" == '4242' ]]"
+assert L1_empty  "[[ -z \"\$(lock_handles \"$LFILE\")\" ]]"
+assert L1_fresh  "lock_is_fresh \"$LFILE\""
+assert L1_no_tmp "[[ -z \"\$(find \"$l_dir\" -name '*.tmp.*')\" ]]"
+
+# --- L2: registering against a lock that does not exist is a documented no-op ---
+assert L2_noop "! lock_register_handle \"$l_dir/does-not-exist.json\" term_x"
+
+# --- L3/L4: register (with a duplicate) + merge dedups, refreshes heartbeat,
+# and empties the sidecar ---
+l1_hb_before="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["heartbeatAt"])' "$LFILE")"
+lock_register_handle "$LFILE" term_aaa
+lock_register_handle "$LFILE" term_bbb
+lock_register_handle "$LFILE" term_aaa
+assert L3_sidecar_lines "[[ \"\$(wc -l < \"${LFILE%.json}.handles.jsonl\" | tr -d ' ')\" == '3' ]]"
+sleep 1
+lock_merge_and_refresh "$LFILE"
+assert L4_merged_count "[[ \"\$(lock_handles \"$LFILE\" | wc -l | tr -d ' ')\" == '2' ]]"
+assert L4_has_aaa "lock_handles \"$LFILE\" | grep -qx term_aaa"
+assert L4_has_bbb "lock_handles \"$LFILE\" | grep -qx term_bbb"
+assert L4_sidecar_emptied "[[ ! -s \"${LFILE%.json}.handles.jsonl\" ]]"
+l1_hb_after="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["heartbeatAt"])' "$LFILE")"
+assert L4_heartbeat_refreshed "[[ \"$l1_hb_before\" != \"$l1_hb_after\" ]]"
+
+# --- L5/L6: staleness ---
+python3 - "$LFILE" <<'PY'
+import json, sys, datetime
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999999)).isoformat()
+d["ttlSeconds"] = 5
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+assert L5_stale "! lock_is_fresh \"$LFILE\""
+assert L6_missing_not_fresh "! lock_is_fresh \"$l_dir/nope.json\""
+
+# --- L7: lock_remove removes lock+sidecar; idempotent ---
+touch "${LFILE%.json}.handles.jsonl"
+lock_remove "$LFILE"
+assert L7_lock_gone "[[ ! -f \"$LFILE\" ]]"
+assert L7_sidecar_gone "[[ ! -f \"${LFILE%.json}.handles.jsonl\" ]]"
+assert L7_idempotent "lock_remove \"$LFILE\""
+
+# ----------------------------------------------------------------------------
+# O-series: sweep mode against a stubbed orca. One shared fixture (journal +
+# handles.json + debate-locks/), exercised twice with different stub `orca`
+# binaries — once where every handle reports live/connected (proving the
+# sweeper closes exactly the orphans and nothing else), once where
+# `terminal list` itself fails (proving undetermined liveness is always
+# left alone, never treated as "safe to close" just because --close was
+# passed).
+# ----------------------------------------------------------------------------
+o_dir="$tmpdir/orphan-sweep"
+o_orch="$o_dir/orch"
+o_journal="$o_orch/terminal-journal.jsonl"
+o_handles="$o_orch/handles.json"
+o_locks="$o_orch/debate-locks"
+mkdir -p "$o_orch" "$o_locks"
+
+cat > "$o_handles" <<'JSON'
+{"version":1,"roles":{"architect":{"handle":"term_tracked"}},"architect":"term_tracked"}
+JSON
+
+lock_write "$o_locks/freshslug.json" 99999 freshslug 999999
+lock_register_handle "$o_locks/freshslug.json" term_protected
+lock_merge_and_refresh "$o_locks/freshslug.json"
+
+lock_write "$o_locks/staleslug.json" 99998 staleslug 5
+lock_register_handle "$o_locks/staleslug.json" term_stale_candidate
+lock_merge_and_refresh "$o_locks/staleslug.json"
+python3 - "$o_locks/staleslug.json" <<'PY'
+import json, sys, datetime
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+assert O0_stale_lock_is_stale "! lock_is_fresh \"$o_locks/staleslug.json\""
+assert O0_fresh_lock_is_fresh "lock_is_fresh \"$o_locks/freshslug.json\""
+
+python3 - "$o_journal" <<'PY'
+import json, sys, datetime
+path = sys.argv[1]
+now = datetime.datetime.now(datetime.timezone.utc)
+old = (now - datetime.timedelta(seconds=5000)).isoformat()
+young = now.isoformat()
+rows = [
+    {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_orphan_old", "createdAt": old},
+    {"role": None, "title": "some-users-own-terminal", "raw": {}, "handle": "term_unrelated", "createdAt": old},
+    {"role": "debater_codex", "title": "debate-sol", "raw": {}, "handle": "term_too_young", "createdAt": young},
+    {"role": "architect", "title": "role-opus-architect", "raw": {}, "handle": "term_tracked", "createdAt": old},
+    {"role": "debater_grok", "title": "debate-grok", "raw": {}, "handle": None, "createdAt": old},
+    {"role": "debater_gemini", "title": "debate-agy", "raw": {}, "handle": "term_protected", "createdAt": old},
+    {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_stale_candidate", "createdAt": old},
+]
+with open(path, "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+
+o_bin_live="$tmpdir/o-bin-live"
+mkdir -p "$o_bin_live"
+cat > "$o_bin_live/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list")
+    echo '{"ok":true,"result":{"terminals":[
+      {"handle":"term_orphan_old","connected":true},
+      {"handle":"term_stale_candidate","connected":true},
+      {"handle":"term_unrelated","connected":true},
+      {"handle":"term_too_young","connected":true},
+      {"handle":"term_tracked","connected":true},
+      {"handle":"term_protected","connected":true}
+    ]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$O_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$o_bin_live/orca"
+
+o_close_marker_a="$o_dir/closed-a.log"
+: > "$o_close_marker_a"
+o_rc_a=0
+(
+  export PATH="$o_bin_live:$PATH"
+  export O_CLOSE_MARKER="$o_close_marker_a"
+  "$SWEEP" --close --orch-dir "$o_orch" --journal "$o_journal" --handles-file "$o_handles" --locks-dir "$o_locks"
+) >"$o_dir/sweep-a.out" 2>"$o_dir/sweep-a.err" || o_rc_a=$?
+assert O1_run_exit_ok "[[ \"$o_rc_a\" -eq 0 ]]"
+assert O1_closes_journal_orphan "grep -qx term_orphan_old \"$o_close_marker_a\""
+assert O1_closes_stale_lock_handle "grep -qx term_stale_candidate \"$o_close_marker_a\""
+assert O2_leaves_unrelated_title "! grep -qx term_unrelated \"$o_close_marker_a\""
+assert O3_leaves_too_young "! grep -qx term_too_young \"$o_close_marker_a\""
+assert O4_leaves_tracked "! grep -qx term_tracked \"$o_close_marker_a\""
+assert O5_leaves_lock_protected "! grep -qx term_protected \"$o_close_marker_a\""
+assert O8_no_handle_reported "grep -q 'no-handle' \"$o_dir/sweep-a.out\""
+assert O8_no_crash_on_no_handle "grep -qi 'unclosable' \"$o_dir/sweep-a.out\""
+
+# Report-only (the sweeper's own default): the exact same candidates are
+# identified, but nothing is actually closed without --close.
+o_close_marker_default="$o_dir/closed-default.log"
+: > "$o_close_marker_default"
+o_rc_default=0
+(
+  export PATH="$o_bin_live:$PATH"
+  export O_CLOSE_MARKER="$o_close_marker_default"
+  "$SWEEP" --orch-dir "$o_orch" --journal "$o_journal" --handles-file "$o_handles" --locks-dir "$o_locks"
+) >"$o_dir/sweep-default.out" 2>&1 || o_rc_default=$?
+assert O6_default_run_exit_ok "[[ \"$o_rc_default\" -eq 0 ]]"
+assert O6_default_report_only_no_close "[[ ! -s \"$o_close_marker_default\" ]]"
+assert O6_default_reports_would_close "grep -q 'WOULD CLOSE' \"$o_dir/sweep-default.out\""
+
+# --- O7: liveness undetermined (orca terminal list itself fails) — never
+# act on ambiguity, no matter that --close was passed ---
+o_bin_down="$tmpdir/o-bin-down"
+mkdir -p "$o_bin_down"
+cat > "$o_bin_down/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo "simulated outage" >&2; exit 7 ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$O_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$o_bin_down/orca"
+
+o_close_marker_b="$o_dir/closed-b.log"
+: > "$o_close_marker_b"
+o_rc_b=0
+(
+  export PATH="$o_bin_down:$PATH"
+  export O_CLOSE_MARKER="$o_close_marker_b"
+  "$SWEEP" --close --orch-dir "$o_orch" --journal "$o_journal" --handles-file "$o_handles" --locks-dir "$o_locks"
+) >"$o_dir/sweep-b.out" 2>"$o_dir/sweep-b.err" || o_rc_b=$?
+assert O7_undetermined_run_exit_ok "[[ \"$o_rc_b\" -eq 0 ]]"
+assert O7_undetermined_never_closes "[[ ! -s \"$o_close_marker_b\" ]]"
+assert O7_undetermined_reported "grep -qi 'undetermined' \"$o_dir/sweep-b.out\""
+
+# --- O9: a handles.json that EXISTS but fails to parse (handles_set writes
+# it with a plain `open(path, "w")`, not an atomic temp-file-plus-rename, so
+# a read can land mid-write; a hand-edited file can also break it) must
+# abort the whole sweep rather than silently treat everything in it as
+# untracked — the wrong fail-safe direction for a tool whose only job is
+# never closing a terminal it does not own. Found by trying exactly this
+# attack against the sweeper; see task-2-report.md. A missing handles.json
+# (as opposed to present-but-broken) is deliberately NOT this case — T2's
+# fixture setup above already exercises "missing" implicitly (O-series
+# candidates close fine against the real $o_handles), so this specifically
+# targets "present but corrupt."
+o9_dir="$tmpdir/orphan-sweep-o9"
+mkdir -p "$o9_dir/orch/debate-locks"
+printf '{not valid json!!' > "$o9_dir/orch/handles.json"
+cp "$o_journal" "$o9_dir/orch/terminal-journal.jsonl"
+o9_close_marker="$o9_dir/closed.log"
+: > "$o9_close_marker"
+o9_rc=0
+(
+  export PATH="$o_bin_live:$PATH"
+  export O_CLOSE_MARKER="$o9_close_marker"
+  "$SWEEP" --close --orch-dir "$o9_dir/orch" --journal "$o9_dir/orch/terminal-journal.jsonl" \
+    --handles-file "$o9_dir/orch/handles.json" --locks-dir "$o9_dir/orch/debate-locks"
+) >"$o9_dir/sweep.out" 2>"$o9_dir/sweep.err" || o9_rc=$?
+assert O9_malformed_handles_run_exit_ok "[[ \"$o9_rc\" -eq 0 ]]"
+assert O9_malformed_handles_closes_nothing "[[ ! -s \"$o9_close_marker\" ]]"
+assert O9_malformed_handles_reported "grep -qi 'could not be parsed' \"$o9_dir/sweep.err\""
+
+# --- O10: a journal entry with role=null (exactly the Task 1
+# bootstrap-partial-failure orphan this whole task exists to sweep — see
+# orca-bootstrap-roles.sh's bare 2-arg create_role calls) still becomes a
+# real candidate and gets closed, and the log line for it is not garbled.
+# Regression for a real bug found while testing O9's ABORT path: bash
+# classifies tab as an IFS "blank" character regardless of how IFS is set,
+# so `IFS=$'\t' read` collapses a run of tabs — i.e. an EMPTY field (role
+# is "" when the journal's role is null) between two adjacent delimiters —
+# into a single delimiter instead of yielding an empty field, shifting
+# every later field left by one. The handle/title fields (read before the
+# empty one) were never affected, so the actual close decision was never
+# wrong, but the printed reason text was silently swallowed. Fixed by never
+# emitting a truly-empty TSV field (see field() in orca-sweep-orphans.sh).
+o10_dir="$tmpdir/orphan-sweep-o10"
+mkdir -p "$o10_dir/orch/debate-locks"
+echo '{}' > "$o10_dir/orch/handles.json"
+# Reuses the handle "term_orphan_old" (already known to o_bin_live's stub
+# `orca terminal list` as connected) so this fixture does not need its own
+# stub — only the role=null shape is new here. A second, too-young row
+# (also role=null) proves a SKIP line's reason text — the field the
+# collapsing bug actually swallowed externally-visibly — survives intact:
+# a SKIP line for a normal (non-null-role) row already always worked, so
+# this specifically targets the role="" case.
+python3 - "$o10_dir/orch/terminal-journal.jsonl" <<'PY'
+import json, sys, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+rows = [
+    {
+        "role": None, "title": "debate-opus", "raw": {},
+        "handle": "term_orphan_old",
+        "createdAt": (now - datetime.timedelta(seconds=5000)).isoformat(),
+    },
+    {
+        "role": None, "title": "debate-sol", "raw": {},
+        "handle": "term_role_null_too_young",
+        "createdAt": now.isoformat(),
+    },
+]
+with open(sys.argv[1], "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + "\n")
+PY
+o10_close_marker="$o10_dir/closed.log"
+: > "$o10_close_marker"
+o10_rc=0
+(
+  export PATH="$o_bin_live:$PATH"
+  export O_CLOSE_MARKER="$o10_close_marker"
+  "$SWEEP" --close --orch-dir "$o10_dir/orch" --journal "$o10_dir/orch/terminal-journal.jsonl" \
+    --handles-file "$o10_dir/orch/handles.json" --locks-dir "$o10_dir/orch/debate-locks"
+) >"$o10_dir/sweep.out" 2>"$o10_dir/sweep.err" || o10_rc=$?
+assert O10_role_null_run_exit_ok "[[ \"$o10_rc\" -eq 0 ]]"
+assert O10_role_null_still_closed "grep -qx term_orphan_old \"$o10_close_marker\""
+assert O10_role_null_skip_reason_not_swallowed \
+  "grep -q 'term_role_null_too_young.*too young, guard against mid-creation race' \"$o10_dir/sweep.out\""
+
+# ----------------------------------------------------------------------------
+# P-series: --persist actually selects the STAY-OPEN tail (not AUTO-CLOSE),
+# end-to-end through the real orca-dispatch-role.sh against a stubbed orca —
+# not just at the dispatch_tail_block()/seed_text() function level (R3/R4
+# above already cover those). Captures the exact --spec bytes handed to
+# `orca orchestration task-create --json`.
+# ----------------------------------------------------------------------------
+persist_sandbox="$tmpdir/persist-sandbox/scripts"
+mkdir -p "$persist_sandbox"
+cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$persist_sandbox/"
+echo '{}' > "$tmpdir/persist-sandbox/handles.json"
+PERSIST_DISPATCH="$persist_sandbox/orca-dispatch-role.sh"
+
+p_bin="$tmpdir/persist-bin"
+mkdir -p "$p_bin"
+cat > "$p_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_persisttest"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--text" ]]; then printf '%s' "$a" > "$P_MARKER_DIR/sent.txt"; fi
+      prev="$a"
+    done
+    echo '{"ok":true,"result":{"send":{"handle":"term_persisttest","accepted":true}}}'
+    ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_persisttest","tail":["x"]}}}' ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_persisttest","connected":true}]}}' ;;
+  "orchestration task-create")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--spec" ]]; then printf '%s' "$a" > "$P_MARKER_DIR/spec.txt"; fi
+      prev="$a"
+    done
+    echo '{"ok":true,"result":{"task":{"id":"task_persisttest"}}}'
+    ;;
+  "orchestration dispatch") echo '{"ok":true,"result":{"dispatch":{"id":"disp_persisttest"}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$p_bin/orca"
+
+p_marker_1="$tmpdir/persist-marker-1"
+mkdir -p "$p_marker_1"
+p1_rc=0
+(
+  export PATH="$p_bin:$PATH"
+  export P_MARKER_DIR="$p_marker_1"
+  "$PERSIST_DISPATCH" debater_claude --persist --spec "irrelevant body one"
+) >"$p_marker_1/persist.out" 2>"$p_marker_1/persist.err" || p1_rc=$?
+assert P1_persist_dispatch_ok "[[ \"$p1_rc\" -eq 0 ]]"
+assert P1_spec_has_stayopen "grep -q 'STAY-OPEN' \"$p_marker_1/spec.txt\""
+assert P1_spec_no_close_cmd "! grep -q 'orca terminal close' \"$p_marker_1/spec.txt\""
+
+p_marker_2="$tmpdir/persist-marker-2"
+mkdir -p "$p_marker_2"
+p2_rc=0
+(
+  export PATH="$p_bin:$PATH"
+  export P_MARKER_DIR="$p_marker_2"
+  "$PERSIST_DISPATCH" debater_claude --no-reap --spec "irrelevant body two"
+) >"$p_marker_2/persist.out" 2>"$p_marker_2/persist.err" || p2_rc=$?
+assert P2_autoclose_dispatch_ok "[[ \"$p2_rc\" -eq 0 ]]"
+assert P2_spec_has_autoclose "grep -q 'AUTO-CLOSE' \"$p_marker_2/spec.txt\""
+assert P2_spec_has_close_cmd "grep -q 'orca terminal close' \"$p_marker_2/spec.txt\""
+assert P2_spec_no_stayopen "! grep -q 'STAY-OPEN' \"$p_marker_2/spec.txt\""
+
+# --- P3: a --persist dispatch with an active lock context registers its
+# handle (the wiring orca-debate.sh relies on to hand new debater handles to
+# its own watchdog) ---
+p3_lock_dir="$tmpdir/persist-lock"
+mkdir -p "$p3_lock_dir"
+P3_LOCK_FILE="$p3_lock_dir/p3slug.json"
+lock_write "$P3_LOCK_FILE" "$$" p3slug 1800
+p_marker_3="$tmpdir/persist-marker-3"
+mkdir -p "$p_marker_3"
+p3_rc=0
+(
+  export PATH="$p_bin:$PATH"
+  export P_MARKER_DIR="$p_marker_3"
+  export ORCA_ROLE_LOCK_FILE="$P3_LOCK_FILE"
+  "$PERSIST_DISPATCH" debater_codex --persist --spec "irrelevant body three"
+) >"$p_marker_3/persist.out" 2>"$p_marker_3/persist.err" || p3_rc=$?
+lock_merge_and_refresh "$P3_LOCK_FILE"
+assert P3_dispatch_ok "[[ \"$p3_rc\" -eq 0 ]]"
+assert P3_handle_registered "lock_handles \"$P3_LOCK_FILE\" | grep -qx term_persisttest"
+
+# A non-persist dispatch through the same lock context must NOT register
+# anything (the PERSIST=1 gate is what keeps this feature debate-agnostic
+# dispatch calls side-effect-free).
+p3b_rc=0
+(
+  export PATH="$p_bin:$PATH"
+  export P_MARKER_DIR="$p_marker_3"
+  export ORCA_ROLE_LOCK_FILE="$P3_LOCK_FILE"
+  "$PERSIST_DISPATCH" architect --no-reap --spec "irrelevant body four"
+) >"$p_marker_3/persist-b.out" 2>"$p_marker_3/persist-b.err" || p3b_rc=$?
+lock_merge_and_refresh "$P3_LOCK_FILE"
+assert P3B_nonpersist_dispatch_ok "[[ \"$p3b_rc\" -eq 0 ]]"
+assert P3B_nonpersist_not_registered "[[ \"\$(lock_handles \"$P3_LOCK_FILE\" | wc -l | tr -d ' ')\" == '1' ]]"
+
+# ----------------------------------------------------------------------------
+# W-series: the watchdog daemon itself. Real background processes (a fake
+# "owner" and the real watchdog binary) against a stubbed orca — never the
+# real Orca runtime. Every backgrounded pid goes into CLEANUP_PIDS.
+# ----------------------------------------------------------------------------
+w_dir="$tmpdir/watchdog"
+mkdir -p "$w_dir/bin" "$w_dir/locks"
+export W_CLOSE_MARKER="$w_dir/closed.log"
+: > "$W_CLOSE_MARKER"
+cat > "$w_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list")
+    echo '{"ok":true,"result":{"terminals":[{"handle":"term_w_owned","connected":true}]}}'
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$W_CLOSE_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$w_dir/bin/orca"
+
+wait_for() {
+  # $1=timeout_ms $2=condition-as-eval-string. Short, bounded polling for an
+  # async background process to reach an observable state — the same idiom
+  # F5 above already uses (poll the driver's own log for proof round 1 is in
+  # flight) rather than a long fixed sleep.
+  local timeout_ms="$1" cond="$2" waited=0
+  while [[ "$waited" -lt "$timeout_ms" ]]; do
+    if eval "$cond"; then return 0; fi
+    sleep 0.1
+    waited=$((waited + 100))
+  done
+  return 1
+}
+
+# --- W1: a normal stop (debate_watchdog_start/stop, the exact pair
+# orca-debate.sh calls) leaves no watchdog process running and never
+# touches the owned handle. ---
+sleep 300 & w1_owner_pid=$!
+CLEANUP_PIDS+=("$w1_owner_pid")
+w1_lock_file="$w_dir/locks/w1slug.json"
+w1_pidfile="$w_dir/locks/w1slug.watchdog.pid"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+w1_wpid="$(debate_watchdog_start "$ROOT/scripts" "$w1_lock_file" w1slug "$w1_owner_pid" "$w_dir/locks" 1800)"
+export PATH="$OLD_PATH"
+printf '%s\n' "$w1_wpid" > "$w1_pidfile"
+CLEANUP_PIDS+=("$w1_wpid")
+
+w1_up=0
+wait_for 2000 "kill -0 $w1_wpid 2>/dev/null" && w1_up=1
+assert W1_watchdog_started "[[ \"$w1_up\" -eq 1 ]]"
+assert W1_lock_created "[[ -f \"$w1_lock_file\" ]]"
+
+# Wait for proof the watchdog has cleared its (slow — sourcing a library,
+# parsing args) startup and reached its steady-state poll loop, THEN give
+# it a beat more to clear one loop iteration's synchronous work (pid
+# compare, kill -0, lock_merge_and_refresh) and actually enter its sleep.
+# Without this, debate_watchdog_stop's lock_remove can race the watchdog's
+# own still-starting-up first loop check and let it exit via "lock file
+# gone" instead of via the SIGTERM this block exists to test — a real gap
+# found empirically: an earlier draft of this test called
+# debate_watchdog_stop immediately after fork, and a mutation that
+# disabled SIGTERM entirely still passed, because the lock-file-gone path
+# papered over it.
+wait_for 3000 "grep -q 'watching owner pid=' \"${w1_lock_file%.json}.watchdog.log\" 2>/dev/null" || true
+sleep 1
+
+debate_watchdog_stop "$w1_pidfile" "$w1_lock_file"
+
+# A working SIGTERM handler exits promptly — bounded to roughly
+# sleep_interruptible's 1s chunk size (see orca-sweep-orphans.sh), not the
+# full ~20s poll interval. This bound is only reliable BECAUSE of
+# sleep_interruptible: confirmed empirically on this repo's bash (3.2.57)
+# that a trap on a signal already registered does NOT preempt a
+# currently-running external `sleep N` — it only runs once that sleep
+# returns on its own. A single `sleep "$POLL_SECONDS"` here would have made
+# a normal stop take up to the full poll interval (still eventually
+# correct, just not prompt) and would have made this assertion's 3s window
+# see the watchdog as still alive, a false failure unrelated to whether
+# SIGTERM actually works. Deliberately tight enough (3s) that a regression
+# (SIGTERM silently not delivered, or the sleep un-chunked again) shows up
+# as this assertion failing, not as a slow-but-eventually-green test.
+w1_stopped=0
+wait_for 3000 "! kill -0 $w1_wpid 2>/dev/null" && w1_stopped=1
+assert W1_watchdog_stopped "[[ \"$w1_stopped\" -eq 1 ]]"
+assert W1_lock_removed "[[ ! -f \"$w1_lock_file\" ]]"
+assert W1_pidfile_removed "[[ ! -f \"$w1_pidfile\" ]]"
+assert W1_close_marker_empty "[[ ! -s \"$W_CLOSE_MARKER\" ]]"
+
+kill -9 "$w1_owner_pid" 2>/dev/null || true
+
+# --- W2: kill -9 on the owner — THE most important criterion. The
+# watchdog (a genuinely separate process, never a child kept alive by the
+# owner) notices via its own polling and closes the owned handle, well
+# within the poll interval and nowhere near the full TTL. ---
+: > "$W_CLOSE_MARKER"
+sleep 300 & w2_owner_pid=$!
+CLEANUP_PIDS+=("$w2_owner_pid")
+
+w2_lock_file="$w_dir/locks/w2slug.json"
+lock_write "$w2_lock_file" "$w2_owner_pid" w2slug 1800
+lock_register_handle "$w2_lock_file" term_w_owned
+lock_merge_and_refresh "$w2_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+"$SWEEP" --watchdog --slug w2slug --owner-pid "$w2_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 --max-close-attempts 3 >"$w_dir/w2-watchdog.log" 2>&1 &
+w2_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w2_watchdog_pid")
+
+wait_for 3000 "kill -0 $w2_watchdog_pid 2>/dev/null" || true
+
+echo "=== W2 kill -9 demonstration: owner pid=$w2_owner_pid, watchdog pid=$w2_watchdog_pid ==="
+kill -9 "$w2_owner_pid"
+
+w2_closed=0
+wait_for 8000 "grep -qx term_w_owned \"$W_CLOSE_MARKER\" 2>/dev/null" && w2_closed=1
+assert W2_kill9_closes_owned_handle "[[ \"$w2_closed\" -eq 1 ]]"
+
+w2_gone=0
+wait_for 3000 "! kill -0 $w2_watchdog_pid 2>/dev/null" && w2_gone=1
+assert W2_watchdog_process_exits_after "[[ \"$w2_gone\" -eq 1 ]]"
+assert W2_lock_removed_after_close "[[ ! -f \"$w2_lock_file\" ]]"
+
+echo "--- W2 watchdog log ---"
+cat "$w_dir/w2-watchdog.log" 2>/dev/null || true
+echo "--- end W2 watchdog log ---"
+
+# --- W3: a lock whose owning pid changes underneath a running watchdog
+# (e.g. a second driver reusing the same slug) makes it stand down without
+# ever touching a handle — it must never assume ownership it was not given. ---
+: > "$W_CLOSE_MARKER"
+sleep 300 & w3_orig_owner_pid=$!
+CLEANUP_PIDS+=("$w3_orig_owner_pid")
+sleep 300 & w3_new_owner_pid=$!
+CLEANUP_PIDS+=("$w3_new_owner_pid")
+
+w3_lock_file="$w_dir/locks/w3slug.json"
+lock_write "$w3_lock_file" "$w3_orig_owner_pid" w3slug 1800
+lock_register_handle "$w3_lock_file" term_w_owned
+lock_merge_and_refresh "$w3_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+"$SWEEP" --watchdog --slug w3slug --owner-pid "$w3_orig_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 >"$w_dir/w3-watchdog.log" 2>&1 &
+w3_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w3_watchdog_pid")
+
+wait_for 3000 "kill -0 $w3_watchdog_pid 2>/dev/null" || true
+# simulate a second driver taking over the same slug
+lock_write "$w3_lock_file" "$w3_new_owner_pid" w3slug 1800
+
+w3_stood_down=0
+wait_for 5000 "! kill -0 $w3_watchdog_pid 2>/dev/null" && w3_stood_down=1
+assert W3_watchdog_stands_down "[[ \"$w3_stood_down\" -eq 1 ]]"
+assert W3_no_close_attempted "[[ ! -s \"$W_CLOSE_MARKER\" ]]"
+
+kill -9 "$w3_orig_owner_pid" 2>/dev/null || true
+kill -9 "$w3_new_owner_pid" 2>/dev/null || true
 
 echo
 echo "Results: $pass passed, $fail failed"

@@ -12,6 +12,7 @@
 | `.orca/orchestration/scripts/orca-debate.sh` | Drive a 3-round four-model idea debate |
 | `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
 | `.orca/orchestration/scripts/orca-debate-lib.sh` | Debate helpers + round prompts (sourced) |
+| `.orca/orchestration/scripts/orca-sweep-orphans.sh` | Report/close untracked role terminals; also the `--persist` dead-man watchdog |
 
 Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and quoted
 (one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
