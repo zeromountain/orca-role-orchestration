@@ -294,8 +294,14 @@ for lf in sorted(glob.glob(os.path.join(locks_dir, "*.json"))):
             protected.add(h)
     else:
         for h in handles:
-            if h not in stale_candidates:
-                stale_candidates[h] = (slug, pid)
+            # Aggregate every stale lock naming this handle — do not keep
+            # only the first. A handle can be named by more than one
+            # stale lock (e.g. two debates that shared it, both now
+            # abandoned-looking); keeping only the first found by
+            # sorted(glob.glob(...)) order let sort order alone decide
+            # protection, including dropping a later lock whose owner
+            # pid was confirmed alive without ever examining it.
+            stale_candidates.setdefault(h, []).append((slug, pid))
 
 handle_title = {}
 journal_candidates = []
@@ -339,7 +345,7 @@ for handle, title, role, created_raw in journal_candidates:
     seen.add(handle)
     print("CANDIDATE\t%s\t%s\t%s\tjournal-orphan createdAt=%s" % (handle, field(title), field(role), created_raw))
 
-for handle, (slug, owner_pid) in stale_candidates.items():
+for handle, claimants in stale_candidates.items():
     if handle in seen:
         continue
     # Deliberately NOT gated on "handle in tracked": orca-close-role.sh does
@@ -353,13 +359,31 @@ for handle, (slug, owner_pid) in stale_candidates.items():
     # gone. What DOES protect it: something else CURRENTLY claiming
     # responsibility.
     if handle in protected:
-        print("SKIP\t%s\t%s\t%s\tstale lock %s but also claimed by a different, still-fresh lock" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), slug))
+        first_slug = claimants[0][0]
+        print("SKIP\t%s\t%s\t%s\tstale lock %s but also claimed by a different, still-fresh lock" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), first_slug))
         continue
-    if pid_alive(owner_pid):
-        print("SKIP\t%s\t%s\t%s\tstale lock %s but owner pid=%s is still alive (its watchdog may have died, not the debate itself)" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), slug, owner_pid))
+    # Check EVERY stale lock naming this handle, not just one — a handle
+    # can be named by more than one (e.g. two debates that shared it),
+    # and a single arbitrarily-chosen claimant (whichever sorted first)
+    # previously decided protection instead of the actual facts: reviewer
+    # reproduced a case where the first, dead-owner lock was examined, a
+    # second lock naming the same handle with a confirmed-ALIVE owner was
+    # never even looked at, and the handle was wrongly reported
+    # CANDIDATE/WOULD CLOSE. Protected if ANY claimant's owner is not
+    # provably dead; only a CANDIDATE once every claimant's owner is
+    # confirmed dead.
+    alive_claim = None
+    for claim_slug, claim_pid in claimants:
+        if pid_alive(claim_pid):
+            alive_claim = (claim_slug, claim_pid)
+            break
+    if alive_claim is not None:
+        alive_slug, alive_pid = alive_claim
+        print("SKIP\t%s\t%s\t%s\tstale lock %s but owner pid=%s is still alive (its watchdog may have died, not the debate itself)" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), alive_slug, alive_pid))
         continue
     title = handle_title.get(handle, "(unknown)")
-    print("CANDIDATE\t%s\t%s\t%s\tstale-lock slug=%s" % (handle, field(title), field(""), slug))
+    all_slugs = ",".join(s for s, _ in claimants)
+    print("CANDIDATE\t%s\t%s\t%s\tstale-lock slug=%s" % (handle, field(title), field(""), all_slugs))
 PY
 
   local n_candidates=0 n_closed=0 n_gone=0 n_undetermined=0 aborted=0

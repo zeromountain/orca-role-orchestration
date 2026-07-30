@@ -893,6 +893,189 @@ assert L7_sidecar_gone "[[ ! -f \"${LFILE%.json}.handles.jsonl\" ]]"
 assert L7_idempotent "lock_remove \"$LFILE\""
 
 # ----------------------------------------------------------------------------
+# C-series: lock_handle_claimed_elsewhere itself (pure, no orca — direct
+# function calls), and the python/sweep-side aggregation it has a sibling
+# bug in. Fix round 2: review found (A) the bash function gated on
+# lock_is_fresh BEFORE ever checking the owner pid, so a lock whose own
+# watchdog died but whose OWNER is still alive was skipped entirely and
+# treated as not claiming; and (B) the sweep script's stale_candidates
+# dict kept only the FIRST stale lock found (by glob sort order) naming a
+# given handle, silently dropping any other claimant — including one with
+# a confirmed-alive owner.
+# ----------------------------------------------------------------------------
+c_dir="$tmpdir/cross-lock-claim"
+mkdir -p "$c_dir/locks"
+( : ) & c_dead_pid=$!
+wait "$c_dead_pid" 2>/dev/null || true
+
+# "exclude" stand-in — its own status never matters, only that it is
+# correctly excluded from consideration.
+lock_write "$c_dir/locks/c_exclude.json" "$c_dead_pid" cexclude 999999
+
+# --- C1 (Finding A): other lock's heartbeat is STALE but its owner is
+# ALIVE — must still be seen as claiming the handle. ---
+lock_write "$c_dir/locks/c1_other.json" "$$" c1other 5
+lock_register_handle "$c_dir/locks/c1_other.json" term_c1
+lock_merge_and_refresh "$c_dir/locks/c1_other.json"
+python3 - "$c_dir/locks/c1_other.json" <<'PY'
+import json, datetime, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+assert C0_c1_other_is_stale "! lock_is_fresh \"$c_dir/locks/c1_other.json\""
+assert C0_test_pid_is_alive "kill -0 \"\$\$\""
+c1_rc=0
+lock_handle_claimed_elsewhere "$c_dir/locks" term_c1 "$c_dir/locks/c_exclude.json" || c1_rc=$?
+assert C1_stale_but_owner_alive_is_claimed "[[ \"$c1_rc\" -eq 0 ]]"
+
+# --- C2 (sanity, deadlock-matrix "both dead" half seen from the function
+# level): other lock is stale AND its owner is confirmed dead — must NOT
+# be seen as claiming. ---
+lock_write "$c_dir/locks/c2_other.json" "$c_dead_pid" c2other 5
+lock_register_handle "$c_dir/locks/c2_other.json" term_c2
+lock_merge_and_refresh "$c_dir/locks/c2_other.json"
+python3 - "$c_dir/locks/c2_other.json" <<'PY'
+import json, datetime, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+c2_rc=0
+lock_handle_claimed_elsewhere "$c_dir/locks" term_c2 "$c_dir/locks/c_exclude.json" || c2_rc=$?
+assert C2_stale_and_owner_dead_is_not_claimed "[[ \"$c2_rc\" -eq 1 ]]"
+
+# --- C3 (deadlock-matrix "both alive" half): other lock fresh AND its
+# owner alive — trivially claimed. ---
+lock_write "$c_dir/locks/c3_other.json" "$$" c3other 999999
+lock_register_handle "$c_dir/locks/c3_other.json" term_c3
+lock_merge_and_refresh "$c_dir/locks/c3_other.json"
+c3_rc=0
+lock_handle_claimed_elsewhere "$c_dir/locks" term_c3 "$c_dir/locks/c_exclude.json" || c3_rc=$?
+assert C3_both_alive_is_claimed "[[ \"$c3_rc\" -eq 0 ]]"
+
+# --- C4/C5 (Finding B): the python/sweep-side aggregation. Two stale
+# locks share ONE handle, one owner dead, one owner alive. Protection
+# must not depend on which lock name sorts first — tested both ways. ---
+c_agg_dir="$tmpdir/cross-lock-agg"
+c_agg_orch="$c_agg_dir/orch"
+mkdir -p "$c_agg_orch/debate-locks"
+# Tracked in handles.json exactly as handles_set would leave it — the same
+# realism requirement from the last round's fixture fix applies here too:
+# an untracked handle reaches the sweeper via the journal-orphan path
+# first (which has its own, unrelated "protected" check and marks the
+# handle "seen"), short-circuiting the stale-candidate loop this test
+# exists to exercise before it ever runs.
+cat > "$c_agg_orch/handles.json" <<'JSON'
+{"version":1,"roles":{"debater_claude":{"handle":"term_agg_shared"}},"debater_claude":"term_agg_shared"}
+JSON
+echo '{"role":"debater_claude","title":"debate-opus","raw":{},"handle":"term_agg_shared","createdAt":"2020-01-01T00:00:00+00:00"}' \
+  > "$c_agg_orch/terminal-journal.jsonl"
+
+c_agg_bin="$tmpdir/c-agg-bin"
+mkdir -p "$c_agg_bin"
+cat > "$c_agg_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_agg_shared","connected":true}]}}' ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$C_AGG_MARKER"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$c_agg_bin/orca"
+
+push_stale() {
+  python3 - "$1" <<'PY'
+import json, datetime, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+}
+
+run_agg_ordering() {
+  # $1=label $2=dead_lock_filename $3=alive_lock_filename — filenames chosen
+  # by the caller so glob sort order (alphabetical) is controlled explicitly.
+  local label="$1" dead_name="$2" alive_name="$3"
+  rm -rf "$c_agg_orch/debate-locks"
+  mkdir -p "$c_agg_orch/debate-locks"
+  lock_write "$c_agg_orch/debate-locks/$dead_name" "$c_dead_pid" "deadslug_$label" 5
+  lock_register_handle "$c_agg_orch/debate-locks/$dead_name" term_agg_shared
+  lock_merge_and_refresh "$c_agg_orch/debate-locks/$dead_name"
+  lock_write "$c_agg_orch/debate-locks/$alive_name" "$$" "aliveslug_$label" 5
+  lock_register_handle "$c_agg_orch/debate-locks/$alive_name" term_agg_shared
+  lock_merge_and_refresh "$c_agg_orch/debate-locks/$alive_name"
+  push_stale "$c_agg_orch/debate-locks/$dead_name"
+  push_stale "$c_agg_orch/debate-locks/$alive_name"
+
+  : > "$c_agg_dir/closed-$label.log"
+  (
+    export PATH="$c_agg_bin:$PATH"
+    export C_AGG_MARKER="$c_agg_dir/closed-$label.log"
+    "$SWEEP" --orch-dir "$c_agg_orch" --journal "$c_agg_orch/terminal-journal.jsonl" \
+      --handles-file "$c_agg_orch/handles.json" --locks-dir "$c_agg_orch/debate-locks"
+  ) >"$c_agg_dir/sweep-$label.out" 2>"$c_agg_dir/sweep-$label.err"
+}
+
+# dead_first: dead-owner lock sorts alphabetically before the alive-owner
+# lock — this is the exact reviewer repro (their "p_dead.json" / "q_alive.json").
+# Both modes checked: report-only (--close was not passed, so the close
+# marker is always empty regardless of correctness — the actual signal is
+# the reported text) and, separately below (C6), --close for real against
+# a stub. "WOULD CLOSE" appearing at all in this single-handle fixture can
+# only be about term_agg_shared.
+run_agg_ordering dead_first "aaa_dead.json" "zzz_alive.json"
+assert C4_agg_dead_first_not_closed "! grep -qx term_agg_shared \"$c_agg_dir/closed-dead_first.log\""
+assert C4_agg_dead_first_not_reported_would_close "! grep -q 'WOULD CLOSE' \"$c_agg_dir/sweep-dead_first.out\""
+assert C4_agg_dead_first_reason "grep -qi 'owner pid=.*still alive' \"$c_agg_dir/sweep-dead_first.out\""
+
+# alive_first: same two locks, reversed sort order.
+run_agg_ordering alive_first "aaa_alive.json" "zzz_dead.json"
+assert C5_agg_alive_first_not_closed "! grep -qx term_agg_shared \"$c_agg_dir/closed-alive_first.log\""
+assert C5_agg_alive_first_not_reported_would_close "! grep -q 'WOULD CLOSE' \"$c_agg_dir/sweep-alive_first.out\""
+assert C5_agg_alive_first_reason "grep -qi 'owner pid=.*still alive' \"$c_agg_dir/sweep-alive_first.out\""
+
+# --- C6: aggregation must not OVER-protect either — two stale locks
+# sharing a handle, BOTH owners confirmed dead, must still become a
+# candidate (and, with --close, actually close). ---
+rm -rf "$c_agg_orch/debate-locks"
+mkdir -p "$c_agg_orch/debate-locks"
+lock_write "$c_agg_orch/debate-locks/aaa_dead1.json" "$c_dead_pid" deadslug1 5
+lock_register_handle "$c_agg_orch/debate-locks/aaa_dead1.json" term_agg_shared
+lock_merge_and_refresh "$c_agg_orch/debate-locks/aaa_dead1.json"
+( : ) & c_dead_pid2=$!
+wait "$c_dead_pid2" 2>/dev/null || true
+lock_write "$c_agg_orch/debate-locks/zzz_dead2.json" "$c_dead_pid2" deadslug2 5
+lock_register_handle "$c_agg_orch/debate-locks/zzz_dead2.json" term_agg_shared
+lock_merge_and_refresh "$c_agg_orch/debate-locks/zzz_dead2.json"
+push_stale "$c_agg_orch/debate-locks/aaa_dead1.json"
+push_stale "$c_agg_orch/debate-locks/zzz_dead2.json"
+: > "$c_agg_dir/closed-both_dead.log"
+c6_rc=0
+(
+  export PATH="$c_agg_bin:$PATH"
+  export C_AGG_MARKER="$c_agg_dir/closed-both_dead.log"
+  "$SWEEP" --close --orch-dir "$c_agg_orch" --journal "$c_agg_orch/terminal-journal.jsonl" \
+    --handles-file "$c_agg_orch/handles.json" --locks-dir "$c_agg_orch/debate-locks"
+) >"$c_agg_dir/sweep-both_dead.out" 2>"$c_agg_dir/sweep-both_dead.err" || c6_rc=$?
+assert C6_both_dead_run_exit_ok "[[ \"$c6_rc\" -eq 0 ]]"
+assert C6_both_dead_still_closes "grep -qx term_agg_shared \"$c_agg_dir/closed-both_dead.log\""
+
+# ----------------------------------------------------------------------------
 # O-series: sweep mode against a stubbed orca. One shared fixture (journal +
 # handles.json + debate-locks/), exercised twice with different stub `orca`
 # binaries — once where every handle reports live/connected (proving the
@@ -1592,6 +1775,45 @@ assert W5_watchdog_a_exits "[[ \"$w5a_gone\" -eq 1 ]]"
 w5b_gone=0
 wait_for 5000 "! kill -0 $w5b_watchdog_pid 2>/dev/null" && w5b_gone=1
 assert W5_watchdog_b_exits "[[ \"$w5b_gone\" -eq 1 ]]"
+
+# --- W6: deadlock matrix, third case — two locks share a handle and BOTH
+# owners stay alive throughout. Neither watchdog ever has a reason to enter
+# its close phase (their own kill -0 on their own owner keeps succeeding),
+# so nothing should be closed and both watchdogs should still be quietly
+# running at the end. Completes the matrix the C1–C3 function-level tests
+# and W4 (one alive)/W5 (both dead) already cover at the watchdog level. ---
+: > "$W_CLOSE_MARKER"
+sleep 300 & w6a_owner_pid=$!
+CLEANUP_PIDS+=("$w6a_owner_pid")
+sleep 300 & w6b_owner_pid=$!
+CLEANUP_PIDS+=("$w6b_owner_pid")
+
+w6a_lock_file="$w_dir/locks/w6a.json"
+w6b_lock_file="$w_dir/locks/w6b.json"
+lock_write "$w6a_lock_file" "$w6a_owner_pid" w6a 1800
+lock_register_handle "$w6a_lock_file" term_w_shared
+lock_merge_and_refresh "$w6a_lock_file"
+lock_write "$w6b_lock_file" "$w6b_owner_pid" w6b 1800
+lock_register_handle "$w6b_lock_file" term_w_shared
+lock_merge_and_refresh "$w6b_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+"$SWEEP" --watchdog --slug w6a --owner-pid "$w6a_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 >"$w_dir/w6-watchdog.log" 2>&1 &
+w6_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w6_watchdog_pid")
+
+wait_for 3000 "kill -0 $w6_watchdog_pid 2>/dev/null" || true
+sleep 3
+assert W6_both_alive_watchdog_still_running "kill -0 $w6_watchdog_pid 2>/dev/null"
+assert W6_both_alive_nothing_closed "[[ ! -s \"$W_CLOSE_MARKER\" ]]"
+assert W6_both_alive_lock_a_intact "[[ -f \"$w6a_lock_file\" ]]"
+
+kill -9 "$w6a_owner_pid" 2>/dev/null || true
+kill -9 "$w6b_owner_pid" 2>/dev/null || true
+kill -9 "$w6_watchdog_pid" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 # Q-series: the REAL orca-debate.sh's watchdog wiring — lock path

@@ -726,8 +726,9 @@ lock_handle_claimed_elsewhere() {
   # not-yet-merged sidecar — a handle a --persist dispatch just registered
   # can sit in the sidecar for up to one whole poll cycle before that lock's
   # own watchdog folds it in, and reading only "handles" would wrongly say
-  # "not claimed" during that window) AND that other lock is both fresh
-  # AND its own recorded owner pid is confirmed alive; exit 1 otherwise.
+  # "not claimed" during that window) AND we cannot prove that other lock's
+  # recorded owner pid is gone; exit 1 only once EVERY lock naming the
+  # handle has a confirmed-dead owner.
   #
   # Two different roles reuse the SAME underlying terminal handle for a
   # role key across debates (ensure_terminal reuses a live role terminal
@@ -736,20 +737,46 @@ lock_handle_claimed_elsewhere() {
   # closing a handle, a caller must check whether some OTHER lock still
   # actively depends on it.
   #
-  # Requiring the OTHER lock's owner pid to be alive (not freshness alone)
-  # closes a real gap found in review: if two locks share a handle and
-  # BOTH owners die within moments of each other, a freshness-only check
-  # would let each lock's watchdog defer to the other (both locks then
-  # remove themselves, satisfied nobody needs to act) and the handle would
-  # never be closed by either — the exact permanently-orphaned,
-  # permission-bypassed terminal this whole feature exists to prevent.
-  # Requiring proof the other lock's owner is still around means at least
-  # one watchdog (whichever's peer is already gone) still closes it.
+  # Deliberately NOT gated on lock_is_fresh: a lock's own watchdog can die
+  # (or fall behind) independently of its OWNER (driver) staying alive and
+  # actively using the handle — checking freshness first would skip
+  # exactly that lock without ever looking at its owner, treating a still
+  # -live owner's claim as if it did not exist. The owner pid is checked
+  # directly instead, with the same "never treat an inability to
+  # determine liveness as license to act" bias as pid_alive() on the
+  # python/sweep side: an empty or unreadable owner pid can never be
+  # PROVEN dead, so it defaults to protecting too.
+  #
+  # This function's own `for` loop already scans every lock in locks_dir
+  # and only `return`s early on a live claim, so it does not stop at the
+  # first lock that merely names the handle — a related, separate bug
+  # found in the same review DOES exist, but on the python/sweep side
+  # (orca-sweep-orphans.sh's stale_candidates dict kept only the first
+  # stale lock naming a given handle, so sort order could decide
+  # protection there); fixed at that site to aggregate the same way this
+  # loop always has. A handle is protected if ANY lock naming it has an
+  # owner that is not provably dead; only when every lock naming it has a
+  # confirmed-dead owner does this return "not claimed", allowing the
+  # caller to proceed.
+  #
+  # This does not reopen the mutual-deference gap fixed in the previous
+  # round (two locks sharing a handle, both owners die near-simultaneously,
+  # each lock's watchdog defers to the other because the other still LOOKS
+  # fresh — heartbeatAt does not expire until a full ttlSeconds after the
+  # last refresh, which can be tens of minutes even though the owner died
+  # seconds ago). Freshness plays no part in this decision at all now: the
+  # only way a lock counts as "claiming" is a NOT-provably-dead owner pid.
+  # Once an owner is confirmed dead (kill -0 fails with no such process),
+  # it stays dead — there is no path back to "alive" — so once BOTH
+  # owners in a shared-handle pair are confirmed dead, BOTH sides' checks
+  # of each other correctly resolve to "not claimed", and whichever
+  # watchdog runs its close phase proceeds instead of deferring. Verified
+  # both analytically and empirically (W5 in tests/debate.sh, and the W6
+  # matrix added for this fix: both-dead / one-alive / both-alive).
   local locks_dir="$1" handle="$2" exclude="$3" lf sidecar other_pid claims
   for lf in "$locks_dir"/*.json; do
     [[ -f "$lf" ]] || continue
     [[ -n "$exclude" && "$lf" == "$exclude" ]] && continue
-    lock_is_fresh "$lf" || continue
 
     claims=1
     if lock_handles "$lf" | grep -qxF "$handle"; then
@@ -763,9 +790,12 @@ lock_handle_claimed_elsewhere() {
     [[ "$claims" -eq 0 ]] || continue
 
     other_pid="$(lock_pid "$lf")"
-    if [[ -n "$other_pid" ]] && kill -0 "$other_pid" 2>/dev/null; then
+    if [[ -z "$other_pid" ]] || kill -0 "$other_pid" 2>/dev/null; then
       return 0
     fi
+    # This one lock's owner is confirmed dead — keep scanning the rest;
+    # do NOT return 1 here (that is exactly the "stop at the first claim"
+    # bug this fix closes).
   done
   return 1
 }
