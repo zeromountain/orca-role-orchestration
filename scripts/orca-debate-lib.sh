@@ -68,33 +68,59 @@ debate_startup_mutex_acquire() {
   # A holder that dies mid-critical-section (before calling
   # debate_startup_mutex_release) would otherwise deadlock EVERY future
   # debate start forever, so a stale claim is force-reclaimed — but only
-  # when its recorded owner pid is CONFIRMED dead (kill -0 fails) AND the
-  # claim is old enough that we are not simply racing a peer that just
-  # mkdir'd and has not yet written its pid file (the
-  # DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT guard below). An alive or
-  # undeterminable owner is always left alone — same "never treat
-  # can't-tell as gone" rule as pid_alive() in orca-sweep-orphans.sh and
-  # lock_handle_claimed_elsewhere in orca-roles-lib.sh (neither touched by
-  # this function).
+  # when it is old enough that we are not simply racing a peer that just
+  # mkdir'd (the DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT guard below,
+  # applied to BOTH branches immediately below). An alive or undeterminable
+  # owner is always left alone — same "never treat can't-tell as gone" rule
+  # as pid_alive() in orca-sweep-orphans.sh and lock_handle_claimed_elsewhere
+  # in orca-roles-lib.sh (neither touched by this function):
+  #   - pid file present, and its process is CONFIRMED dead (kill -0 fails):
+  #     reclaim once old enough.
+  #   - pid file ABSENT entirely: this is EITHER a peer whose mkdir just
+  #     succeeded and has not yet reached its own `printf … > pid` two lines
+  #     below (must NOT be stolen), OR the previous holder was killed
+  #     (SIGKILL, OOM, host crash — not a normal exit, which the caller's own
+  #     trap/cleanup already covers) in that exact gap, before ever writing a
+  #     pid (found by direct reproduction: with no pid file EVER written,
+  #     the check below used to require one before it would even consider
+  #     staleness, so a directory in this state was NEVER reclaimed at any
+  #     age — a silent, total, permanent block on every future debate start,
+  #     for every slug, fixable only by a human manually removing a hidden
+  #     directory the refusal message did not name). Age is what tells these
+  #     two apart: the real gap between `mkdir` and the pid write is two
+  #     adjacent bash builtins — sub-millisecond even under load — so
+  #     DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT (2s, the same threshold
+  #     already used for the confirmed-dead-pid branch) is several orders of
+  #     magnitude of margin: a pid-less directory this old is unambiguous
+  #     evidence of the crash case, never the in-flight-peer case.
   local locks_dir="$1" owner_pid="$2"
   local max_wait="${3:-$DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}"
   local mutex_dir="$locks_dir/.starting.lock"
   local poll_s="0.05"
   local max_iterations
   max_iterations="$(python3 -c "print(max(1, int(float('$max_wait') / $poll_s)))")"
-  local i=0 held_pid age
+  local i=0 held_pid age reclaim=0
   while true; do
     if mkdir "$mutex_dir" 2>/dev/null; then
       printf '%s\n' "$owner_pid" > "$mutex_dir/pid" 2>/dev/null || true
       return 0
     fi
+    reclaim=0
     held_pid="$(cat "$mutex_dir/pid" 2>/dev/null || true)"
-    if [[ -n "$held_pid" ]] && ! kill -0 "$held_pid" 2>/dev/null; then
-      age="$(debate_dir_age_seconds "$mutex_dir" 2>/dev/null || true)"
-      if [[ -n "$age" ]] && [[ "$age" -ge "$DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT" ]]; then
-        rm -rf "$mutex_dir" 2>/dev/null || true
-        continue
+    age="$(debate_dir_age_seconds "$mutex_dir" 2>/dev/null || true)"
+    if [[ -n "$age" ]] && [[ "$age" -ge "$DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT" ]]; then
+      if [[ -n "$held_pid" ]]; then
+        # Pid recorded — only reclaim once it is CONFIRMED dead.
+        ! kill -0 "$held_pid" 2>/dev/null && reclaim=1
+      else
+        # No pid recorded at all, and old enough that this can only be the
+        # crash-before-writing-it case, never a peer still mid-mkdir.
+        reclaim=1
       fi
+    fi
+    if [[ "$reclaim" -eq 1 ]]; then
+      rm -rf "$mutex_dir" 2>/dev/null || true
+      continue
     fi
     i=$((i + 1))
     if [[ "$i" -ge "$max_iterations" ]]; then

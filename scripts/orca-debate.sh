@@ -244,7 +244,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   # lines down), NOT held for the debate's lifetime — see the explicit
   # release below and cleanup()'s own defensive (idempotent) release.
   if ! debate_startup_mutex_acquire "$LOCK_DIR" "$$"; then
-    echo "Could not acquire the debate-start coordination lock within ${DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}s (another driver appears to be starting right now). Refusing to start rather than risk two drivers racing into the same terminals — retry in a moment." >&2
+    echo "Could not acquire the debate-start coordination lock ($LOCK_DIR/.starting.lock) within ${DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}s (another driver appears to be starting right now). Refusing to start rather than risk two drivers racing into the same terminals — retry in a moment, or if that directory is left over from a crash and you are certain nothing is actively starting, remove it yourself." >&2
     exit 1
   fi
   # Safety net: if anything between here and the explicit release a few

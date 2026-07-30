@@ -309,9 +309,14 @@ orca-debate.sh --topic "…" | --topic-file <f>
   two different-slug drivers started close together could each see "no one else" and both
   proceed. mkdir's atomicity gives mutual exclusion over the whole scan-then-register step
   without `flock` (unavailable on bash 3.2/macOS); the mutex is released the instant this
-  driver's own lock is written, not held for the debate's lifetime, and a claim whose recorded
-  owner pid is confirmed dead is reclaimed so one crashed driver can never deadlock every future
-  debate start.
+  driver's own lock is written, not held for the debate's lifetime. A held claim is reclaimed,
+  once old enough (2s — several orders of magnitude above the real gap between the mutex's own
+  `mkdir` and its pid-file write) to rule out stealing from a peer still mid-registration, in
+  either of two cases: its recorded owner pid is confirmed dead, or no pid was ever recorded at
+  all (the crash-before-writing-it case — found by direct reproduction: requiring a pid to exist
+  before even checking staleness left a pid-less claim unreclaimable at ANY age, a silent,
+  total, permanent block on every future debate start). Age is what tells a crash apart from a
+  peer legitimately mid-`mkdir`, in both cases — never "no pid recorded" alone.
 - Creates the debate directory, writes `topic.md`. For a real (non-dry-run) run of a given slug,
   clears any previous run's `round-*/`, `transcript.md`, and manifests for that slug first — there
   is no partial-resume feature (the loop below always restarts at round 1), so a prior run's

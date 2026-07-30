@@ -2366,26 +2366,51 @@ assert MX3_reclaims_stale_dead_owner "[[ \"$mx3_rc\" -eq 0 ]]"
 debate_startup_mutex_release "$mx3_dir"
 assert MX3_release_removed_it "[[ ! -d \"$mx3_dir/.starting.lock\" ]]"
 
-# --- MX4: an aged claim with NO pid file at all (a peer that mkdir'd but
-# has not yet written its pid — a window of microseconds in real use) is
-# never reclaimed just because it looks old: only a CONFIRMED-dead pid ever
-# justifies stealing, matching this codebase's existing "can't-tell is not
-# license to act" bias elsewhere (pid_alive() in orca-sweep-orphans.sh,
-# lock_handle_claimed_elsewhere in orca-roles-lib.sh — neither touched by
-# this task). ---
+# --- MX4: a YOUNG claim with NO pid file at all — a peer whose `mkdir` just
+# succeeded and has not yet reached its own `printf … > pid` two lines
+# later (a window of microseconds in real use) — must NOT be stolen. Fresh
+# directory, mtime deliberately left untouched (this is the "fixture is
+# what you think it is" check the previous round's fix-round retro calls
+# for: an earlier draft of this exact test backdated the mtime to 999s
+# instead, which made it silently test the OPPOSITE condition — an OLD
+# pid-less claim — while its name and comment both claimed "young"; that
+# mismatch is exactly how the permanent-deadlock bug this round fixes went
+# unnoticed. A short max_wait (1s, well under the 2s stale threshold) keeps
+# the directory genuinely young for this whole attempt.) ---
 mx4_dir="$mx_dir/mx4"
 mkdir -p "$mx4_dir"
 mkdir "$mx4_dir/.starting.lock"
+assert MX4_fixture_has_no_pid_file "[[ ! -f \"$mx4_dir/.starting.lock/pid\" ]]"
+mx4_age_at_start="$(debate_dir_age_seconds "$mx4_dir/.starting.lock")"
+assert MX4_fixture_is_actually_young "[[ \"$mx4_age_at_start\" -lt \"$DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT\" ]]"
+mx4_rc=0
+debate_startup_mutex_acquire "$mx4_dir" "$$" 1 || mx4_rc=$?
+assert MX4_young_pidless_not_reclaimed "[[ \"$mx4_rc\" -eq 1 ]]"
+assert MX4_directory_left_alone "[[ -d \"$mx4_dir/.starting.lock\" ]]"
+rm -rf "$mx4_dir/.starting.lock"
+
+# --- MX6 (this round's fix — direct reproduction of the reported bug): an
+# OLD claim with NO pid file at all — the previous holder crashed (SIGKILL/
+# OOM/host crash, not a normal exit) in the gap between its own `mkdir` and
+# its own pid write — is now reclaimed rather than blocking every future
+# debate start forever. Matches the reviewer's exact reproduction: mtime
+# backdated far in the past, no pid file ever written. ---
+mx6_dir="$mx_dir/mx6"
+mkdir -p "$mx6_dir"
+mkdir "$mx6_dir/.starting.lock"
 python3 -c "
 import os, time
 old = time.time() - 999
-os.utime('$mx4_dir/.starting.lock', (old, old))
+os.utime('$mx6_dir/.starting.lock', (old, old))
 "
-mx4_rc=0
-debate_startup_mutex_acquire "$mx4_dir" "$$" 1 || mx4_rc=$?
-assert MX4_never_reclaims_without_a_pid_to_check "[[ \"$mx4_rc\" -eq 1 ]]"
-assert MX4_directory_left_alone "[[ -d \"$mx4_dir/.starting.lock\" ]]"
-rm -rf "$mx4_dir/.starting.lock"
+assert MX6_fixture_has_no_pid_file "[[ ! -f \"$mx6_dir/.starting.lock/pid\" ]]"
+mx6_age_at_start="$(debate_dir_age_seconds "$mx6_dir/.starting.lock")"
+assert MX6_fixture_is_actually_old "[[ \"$mx6_age_at_start\" -ge \"$DEBATE_STARTUP_MUTEX_STALE_SECONDS_DEFAULT\" ]]"
+mx6_rc=0
+debate_startup_mutex_acquire "$mx6_dir" "$$" 3 || mx6_rc=$?
+assert MX6_old_pidless_reclaimed_not_timed_out "[[ \"$mx6_rc\" -eq 0 ]]"
+debate_startup_mutex_release "$mx6_dir"
+assert MX6_release_removed_it "[[ ! -d \"$mx6_dir/.starting.lock\" ]]"
 
 # --- MX5: release is a safe no-op whether or not anything was ever held. ---
 assert MX5_release_when_never_held_is_safe "debate_startup_mutex_release \"$mx_dir/never-touched\""
