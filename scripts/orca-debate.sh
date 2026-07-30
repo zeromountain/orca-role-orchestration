@@ -212,11 +212,26 @@ cleanup() {
   done
   IFS="$old"
   for short in "${roster[@]}"; do
+    # ensure_terminal reuses a live role terminal globally, so a debater's
+    # handle here can be the exact same underlying terminal a DIFFERENT,
+    # still-running debate is depending on right now — this driver ending
+    # normally is not evidence that handle is safe to close. Same check,
+    # same reasoning, as the watchdog's own close-phase guard in
+    # orca-sweep-orphans.sh (our own lock was already removed by
+    # debate_watchdog_stop above, so this only ever matches an OTHER
+    # debate's lock).
+    local role_key handle
+    role_key="$(debate_role_key "$short")"
+    handle="$(handles_get "$HANDLES_FILE" "$role_key" 2>/dev/null || true)"
+    if [[ -n "$handle" ]] && lock_handle_claimed_elsewhere "$LOCK_DIR" "$handle" "$LOCK_FILE"; then
+      echo "cleanup: leaving $short ($handle) alone — claimed by a different, still-active debate" >&2
+      continue
+    fi
     # Outcomes are observable (not silenced to /dev/null) — a driver that
     # cannot see why a close failed cannot diagnose exactly the class of
     # failure this task exists to fix.
     local close_out close_rc=0
-    close_out="$("$HERE/orca-close-role.sh" "$(debate_role_key "$short")" 2>&1)" || close_rc=$?
+    close_out="$("$HERE/orca-close-role.sh" "$role_key" 2>&1)" || close_rc=$?
     if [[ "$close_rc" -eq 0 ]]; then
       echo "cleanup: closed $short — $close_out" >&2
     else

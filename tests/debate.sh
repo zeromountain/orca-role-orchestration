@@ -908,27 +908,90 @@ o_handles="$o_orch/handles.json"
 o_locks="$o_orch/debate-locks"
 mkdir -p "$o_orch" "$o_locks"
 
+# A guaranteed-dead pid: fork a trivial subshell and `wait` it, so it is
+# both dead AND reaped. A hardcoded fake number (e.g. 99998) risks —
+# vanishingly unlikely, but not zero — coinciding with a real running
+# process on some machine; this is deterministic.
+( : ) & o_dead_pid=$!
+wait "$o_dead_pid" 2>/dev/null || true
+
+# handles.json exactly as handles_set leaves it: BOTH shapes (top-level
+# role=handle AND roles.<role>.handle), for a PRIMARY role (architect,
+# which has no lock mechanism at all — handles.json currency is its only
+# "in use" signal) and for a DEBATER role (debater_claude). This is the
+# fixture shape review found missing: orca-close-role.sh never edits
+# handles.json ("next dispatch recreates via ensure_terminal"), so a
+# debater's handle sits here PERMANENTLY from creation — tracked whether
+# its terminal is alive, closed, or abandoned. Every realistic fixture for
+# a debater handle must include it here; omitting it (as an earlier draft
+# of this file did) silently masks the exact defect Finding 1 was about.
 cat > "$o_handles" <<'JSON'
-{"version":1,"roles":{"architect":{"handle":"term_tracked"}},"architect":"term_tracked"}
+{"version":1,"roles":{"architect":{"handle":"term_tracked"},"debater_claude":{"handle":"term_stale_candidate"},"debater_codex":{"handle":"term_owner_still_alive"},"debater_grok":{"handle":"term_stale_and_crosslocked"},"debater_gemini":{"handle":"term_sidecar_only_protected"}},"architect":"term_tracked","debater_claude":"term_stale_candidate","debater_codex":"term_owner_still_alive","debater_grok":"term_stale_and_crosslocked","debater_gemini":"term_sidecar_only_protected"}
 JSON
 
 lock_write "$o_locks/freshslug.json" 99999 freshslug 999999
 lock_register_handle "$o_locks/freshslug.json" term_protected
 lock_merge_and_refresh "$o_locks/freshslug.json"
 
-lock_write "$o_locks/staleslug.json" 99998 staleslug 5
+# staleslug: owner pid is the guaranteed-dead pid above — this is the
+# realistic "driver AND watchdog both died" scenario Finding 1 is about.
+# Its handle (term_stale_candidate) is ALSO tracked in handles.json above,
+# exactly as real usage always leaves it.
+lock_write "$o_locks/staleslug.json" "$o_dead_pid" staleslug 5
 lock_register_handle "$o_locks/staleslug.json" term_stale_candidate
 lock_merge_and_refresh "$o_locks/staleslug.json"
-python3 - "$o_locks/staleslug.json" <<'PY'
-import json, sys, datetime
-path = sys.argv[1]
+
+# staleslug_alive_owner: heartbeat is ALSO stale (past TTL — its watchdog
+# stopped refreshing), but its recorded owner pid ($$, this very test
+# process) is very much alive — the debate itself may still be legitimately
+# running even though its OWN watchdog died. This must NOT become a
+# candidate (R1 finding: presence-in-handles.json is not the protection
+# rule, but neither is "heartbeat expired" alone — an alive owner pid is).
+lock_write "$o_locks/staleslug_alive_owner.json" "$$" staleslug_alive_owner 5
+lock_register_handle "$o_locks/staleslug_alive_owner.json" term_owner_still_alive
+lock_merge_and_refresh "$o_locks/staleslug_alive_owner.json"
+
+# staleslug_crosslocked / freshslug_crosslocked: the SAME handle
+# (term_stale_and_crosslocked) is named by a stale lock AND, separately, by
+# a DIFFERENT lock that is still fresh with a confirmed-alive owner ($$) —
+# a second, live debate legitimately sharing the handle (ensure_terminal
+# reuses a live role terminal globally). Must NOT become a candidate
+# (Finding 2, sweeper side — the same "claimed by another fresh lock"
+# reasoning applied to the stale-lock path, not just the journal path).
+lock_write "$o_locks/staleslug_crosslocked.json" "$o_dead_pid" staleslug_crosslocked 5
+lock_register_handle "$o_locks/staleslug_crosslocked.json" term_stale_and_crosslocked
+lock_merge_and_refresh "$o_locks/staleslug_crosslocked.json"
+lock_write "$o_locks/freshslug_crosslocked.json" "$$" freshslug_crosslocked 999999
+lock_register_handle "$o_locks/freshslug_crosslocked.json" term_stale_and_crosslocked
+lock_merge_and_refresh "$o_locks/freshslug_crosslocked.json"
+
+# freshslug_sidecar_only: registers a handle via the sidecar WITHOUT
+# merging (no lock_merge_and_refresh call) — proving the sidecar itself,
+# not just the merged "handles" array, is read when deciding protection
+# (R2 finding). This handle is ALSO named by a separate stale lock.
+lock_write "$o_locks/freshslug_sidecar_only.json" "$$" freshslug_sidecar_only 999999
+lock_register_handle "$o_locks/freshslug_sidecar_only.json" term_sidecar_only_protected
+lock_write "$o_locks/staleslug_sidecar.json" "$o_dead_pid" staleslug_sidecar 5
+lock_register_handle "$o_locks/staleslug_sidecar.json" term_sidecar_only_protected
+lock_merge_and_refresh "$o_locks/staleslug_sidecar.json"
+
+# Push all the "stale" locks' heartbeats into the past, past their tiny
+# ttlSeconds=5, without touching the fresh ones.
+for _stale_lock in staleslug staleslug_alive_owner staleslug_crosslocked staleslug_sidecar; do
+  python3 - "$o_locks/$_stale_lock.json" <<PY
+import json, datetime
+path = "$o_locks/$_stale_lock.json"
 d = json.load(open(path))
 d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
 with open(path, "w") as f:
     json.dump(d, f)
 PY
+done
 assert O0_stale_lock_is_stale "! lock_is_fresh \"$o_locks/staleslug.json\""
 assert O0_fresh_lock_is_fresh "lock_is_fresh \"$o_locks/freshslug.json\""
+assert O0_stale_alive_owner_is_stale "! lock_is_fresh \"$o_locks/staleslug_alive_owner.json\""
+assert O0_dead_pid_is_dead "! kill -0 \"$o_dead_pid\" 2>/dev/null"
+assert O0_test_pid_is_alive "kill -0 \"\$\$\""
 
 python3 - "$o_journal" <<'PY'
 import json, sys, datetime
@@ -937,13 +1000,35 @@ now = datetime.datetime.now(datetime.timezone.utc)
 old = (now - datetime.timedelta(seconds=5000)).isoformat()
 young = now.isoformat()
 rows = [
+    # term_orphan_old: an EARLIER, since-replaced creation for debater_claude
+    # that never became (or is no longer) the role's tracked handle — the
+    # genuine bootstrap/recreate-style journal orphan. role kept non-null
+    # here deliberately (matches a real create_role call); it is simply not
+    # CURRENT any more, which is what "not in tracked" means in reality.
     {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_orphan_old", "createdAt": old},
     {"role": None, "title": "some-users-own-terminal", "raw": {}, "handle": "term_unrelated", "createdAt": old},
-    {"role": "debater_codex", "title": "debate-sol", "raw": {}, "handle": "term_too_young", "createdAt": young},
+    # role=None here on purpose: this fixture's four tracked-debater role
+    # slots are already used below (claude/codex/grok/gemini), and this
+    # row's own test (O3, too-young) does not depend on role at all.
+    {"role": None, "title": "debate-sol", "raw": {}, "handle": "term_too_young", "createdAt": young},
     {"role": "architect", "title": "role-opus-architect", "raw": {}, "handle": "term_tracked", "createdAt": old},
     {"role": "debater_grok", "title": "debate-grok", "raw": {}, "handle": None, "createdAt": old},
-    {"role": "debater_gemini", "title": "debate-agy", "raw": {}, "handle": "term_protected", "createdAt": old},
+    # role=None: same reasoning as term_too_young above — O5 only needs
+    # "claimed by a fresh lock", not "also currently tracked".
+    {"role": None, "title": "debate-agy", "raw": {}, "handle": "term_protected", "createdAt": old},
+    # The four debater handles below are each the CURRENT (and only) value
+    # handles.json remembers for their role — exactly what handles_set
+    # always leaves once ensure_terminal has succeeded, which is the
+    # fixture realism review found missing. Each is deliberately placed in
+    # a stale lock (see the lock_write calls above) so it is evaluated
+    # ONLY by the stale-candidate path, isolating exactly what each new
+    # check (owner-pid-alive / claimed-by-another-fresh-lock /
+    # claimed-via-sidecar-only) is meant to test — none of them are
+    # reachable via the tracked-check-gated journal-orphan path at all.
     {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_stale_candidate", "createdAt": old},
+    {"role": "debater_codex", "title": "debate-sol", "raw": {}, "handle": "term_owner_still_alive", "createdAt": old},
+    {"role": "debater_grok", "title": "debate-grok", "raw": {}, "handle": "term_stale_and_crosslocked", "createdAt": old},
+    {"role": "debater_gemini", "title": "debate-agy", "raw": {}, "handle": "term_sidecar_only_protected", "createdAt": old},
 ]
 with open(path, "w") as f:
     for r in rows:
@@ -962,7 +1047,10 @@ case "$1 $2" in
       {"handle":"term_unrelated","connected":true},
       {"handle":"term_too_young","connected":true},
       {"handle":"term_tracked","connected":true},
-      {"handle":"term_protected","connected":true}
+      {"handle":"term_protected","connected":true},
+      {"handle":"term_owner_still_alive","connected":true},
+      {"handle":"term_stale_and_crosslocked","connected":true},
+      {"handle":"term_sidecar_only_protected","connected":true}
     ]}}'
     ;;
   "terminal close")
@@ -989,9 +1077,13 @@ o_rc_a=0
 ) >"$o_dir/sweep-a.out" 2>"$o_dir/sweep-a.err" || o_rc_a=$?
 assert O1_run_exit_ok "[[ \"$o_rc_a\" -eq 0 ]]"
 assert O1_closes_journal_orphan "grep -qx term_orphan_old \"$o_close_marker_a\""
-assert O1_closes_stale_lock_handle "grep -qx term_stale_candidate \"$o_close_marker_a\""
+assert O1_closes_stale_lock_handle_even_though_tracked_in_handles_json \
+  "grep -qx term_stale_candidate \"$o_close_marker_a\""
 assert O2_leaves_unrelated_title "! grep -qx term_unrelated \"$o_close_marker_a\""
 assert O3_leaves_too_young "! grep -qx term_too_young \"$o_close_marker_a\""
+assert O11_leaves_stale_lock_with_alive_owner "! grep -qx term_owner_still_alive \"$o_close_marker_a\""
+assert O12_leaves_stale_and_crosslocked_handle "! grep -qx term_stale_and_crosslocked \"$o_close_marker_a\""
+assert O13_leaves_sidecar_only_claimed_handle "! grep -qx term_sidecar_only_protected \"$o_close_marker_a\""
 assert O4_leaves_tracked "! grep -qx term_tracked \"$o_close_marker_a\""
 assert O5_leaves_lock_protected "! grep -qx term_protected \"$o_close_marker_a\""
 assert O8_no_handle_reported "grep -q 'no-handle' \"$o_dir/sweep-a.out\""
@@ -1247,7 +1339,7 @@ cat > "$w_dir/bin/orca" <<'ORCASTUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "terminal list")
-    echo '{"ok":true,"result":{"terminals":[{"handle":"term_w_owned","connected":true}]}}'
+    echo '{"ok":true,"result":{"terminals":[{"handle":"term_w_owned","connected":true},{"handle":"term_w_shared","connected":true}]}}'
     ;;
   "terminal close")
     prev=""
@@ -1407,6 +1499,213 @@ assert W3_no_close_attempted "[[ ! -s \"$W_CLOSE_MARKER\" ]]"
 
 kill -9 "$w3_orig_owner_pid" 2>/dev/null || true
 kill -9 "$w3_new_owner_pid" 2>/dev/null || true
+
+# --- W4: two locks legitimately share a handle (ensure_terminal reuses a
+# live role terminal globally, so two different debates can end up
+# dispatching to, and each registering, the SAME underlying handle). Lock
+# A's owner dies; lock B's owner stays alive and fresh throughout. Lock A's
+# watchdog must NOT close the handle a different, still-live debate (lock
+# B) is actively depending on. ---
+: > "$W_CLOSE_MARKER"
+sleep 300 & w4a_owner_pid=$!
+CLEANUP_PIDS+=("$w4a_owner_pid")
+sleep 300 & w4b_owner_pid=$!
+CLEANUP_PIDS+=("$w4b_owner_pid")
+
+w4a_lock_file="$w_dir/locks/w4a.json"
+w4b_lock_file="$w_dir/locks/w4b.json"
+lock_write "$w4a_lock_file" "$w4a_owner_pid" w4a 1800
+lock_register_handle "$w4a_lock_file" term_w_shared
+lock_merge_and_refresh "$w4a_lock_file"
+lock_write "$w4b_lock_file" "$w4b_owner_pid" w4b 1800
+lock_register_handle "$w4b_lock_file" term_w_shared
+lock_merge_and_refresh "$w4b_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+"$SWEEP" --watchdog --slug w4a --owner-pid "$w4a_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 --max-close-attempts 3 >"$w_dir/w4-watchdog.log" 2>&1 &
+w4_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w4_watchdog_pid")
+
+wait_for 3000 "kill -0 $w4_watchdog_pid 2>/dev/null" || true
+kill -9 "$w4a_owner_pid"
+
+w4_watchdog_gone=0
+wait_for 6000 "! kill -0 $w4_watchdog_pid 2>/dev/null" && w4_watchdog_gone=1
+assert W4_watchdog_a_exits "[[ \"$w4_watchdog_gone\" -eq 1 ]]"
+assert W4_shared_handle_not_closed "! grep -qx term_w_shared \"$W_CLOSE_MARKER\""
+assert W4_lock_a_removed "[[ ! -f \"$w4a_lock_file\" ]]"
+assert W4_lock_b_untouched "[[ -f \"$w4b_lock_file\" ]]"
+
+kill -9 "$w4b_owner_pid" 2>/dev/null || true
+
+# --- W5: two locks share a handle and BOTH owners die (near-simultaneously,
+# so both locks' heartbeats stay well within their 1800s TTL throughout —
+# they are indistinguishable from "fresh" by heartbeat alone). This is the
+# mutual-deference trap found in review: a freshness-only cross-lock check
+# would let EACH watchdog defer to the other (both would see the other
+# lock as still "fresh" and stand down, satisfied someone else has it) and
+# the handle would never be closed by either — the exact permanently-
+# orphaned, permission-bypassed terminal this feature exists to prevent.
+# Requiring the OTHER lock's owner to be a CONFIRMED-ALIVE pid (not
+# freshness alone) breaks the deadlock: once both owners are dead, neither
+# watchdog defers, and the handle gets closed. ---
+: > "$W_CLOSE_MARKER"
+sleep 300 & w5a_owner_pid=$!
+CLEANUP_PIDS+=("$w5a_owner_pid")
+sleep 300 & w5b_owner_pid=$!
+CLEANUP_PIDS+=("$w5b_owner_pid")
+
+w5a_lock_file="$w_dir/locks/w5a.json"
+w5b_lock_file="$w_dir/locks/w5b.json"
+lock_write "$w5a_lock_file" "$w5a_owner_pid" w5a 1800
+lock_register_handle "$w5a_lock_file" term_w_shared
+lock_merge_and_refresh "$w5a_lock_file"
+lock_write "$w5b_lock_file" "$w5b_owner_pid" w5b 1800
+lock_register_handle "$w5b_lock_file" term_w_shared
+lock_merge_and_refresh "$w5b_lock_file"
+
+OLD_PATH="$PATH"
+export PATH="$w_dir/bin:$PATH"
+"$SWEEP" --watchdog --slug w5a --owner-pid "$w5a_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 --max-close-attempts 3 >"$w_dir/w5a-watchdog.log" 2>&1 &
+w5a_watchdog_pid=$!
+"$SWEEP" --watchdog --slug w5b --owner-pid "$w5b_owner_pid" --locks-dir "$w_dir/locks" \
+  --poll-seconds 1 --max-close-attempts 3 >"$w_dir/w5b-watchdog.log" 2>&1 &
+w5b_watchdog_pid=$!
+export PATH="$OLD_PATH"
+CLEANUP_PIDS+=("$w5a_watchdog_pid" "$w5b_watchdog_pid")
+
+wait_for 3000 "kill -0 $w5a_watchdog_pid 2>/dev/null && kill -0 $w5b_watchdog_pid 2>/dev/null" || true
+kill -9 "$w5a_owner_pid"
+kill -9 "$w5b_owner_pid"
+
+w5_closed=0
+wait_for 8000 "grep -qx term_w_shared \"$W_CLOSE_MARKER\" 2>/dev/null" && w5_closed=1
+assert W5_mutual_deference_still_closes "[[ \"$w5_closed\" -eq 1 ]]"
+
+w5a_gone=0
+wait_for 5000 "! kill -0 $w5a_watchdog_pid 2>/dev/null" && w5a_gone=1
+assert W5_watchdog_a_exits "[[ \"$w5a_gone\" -eq 1 ]]"
+w5b_gone=0
+wait_for 5000 "! kill -0 $w5b_watchdog_pid 2>/dev/null" && w5b_gone=1
+assert W5_watchdog_b_exits "[[ \"$w5b_gone\" -eq 1 ]]"
+
+# ----------------------------------------------------------------------------
+# Q-series: the REAL orca-debate.sh's watchdog wiring — lock path
+# construction, the debate_watchdog_start call, cleanup()'s ordering. Every
+# other driver test in this file uses --dry-run, which skips watchdog
+# creation entirely, so none of them exercise this ~15-line integration
+# block; the W-series above calls library functions directly (or a
+# hand-built substitute), not the real script. This runs the ACTUAL
+# orca-debate.sh (copied into an isolated sandbox — never the real
+# project's .orca/ state), with dispatch replaced via this suite's existing
+# ORCA_TEST_DISPATCH seam (so no real terminal ever gets created) but the
+# lock/watchdog machinery fully real.
+# ----------------------------------------------------------------------------
+q_root="$tmpdir/driver-sandbox"
+q_scripts="$q_root/scripts"
+mkdir -p "$q_scripts"
+cp "$ROOT/scripts/orca-debate.sh" "$ROOT/scripts/orca-debate-round.sh" "$ROOT/scripts/orca-debate-lib.sh" \
+   "$ROOT/scripts/orca-roles-lib.sh" "$ROOT/scripts/orca-sweep-orphans.sh" "$ROOT/scripts/orca-close-role.sh" \
+   "$q_scripts/"
+Q_DRIVER="$q_scripts/orca-debate.sh"
+Q_LOCKS_DIR="$q_root/debate-locks"
+
+q_bin="$tmpdir/q-bin"
+mkdir -p "$q_bin"
+cat > "$q_bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "status --json") echo '{"ok":true,"reachable": true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$q_bin/orca"
+# Stub the debater CLIs themselves so preflight's `command -v` checks are
+# deterministic rather than depending on what happens to be installed on
+# the machine running this suite (a real, pre-existing gap the F-series
+# driver tests above already silently rely on; this test does not need to
+# inherit it).
+for _q_cli in claude codex grok agy; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$q_bin/$_q_cli"
+  chmod +x "$q_bin/$_q_cli"
+done
+
+q_stub_dir="$tmpdir/q-stub"
+mkdir -p "$q_stub_dir"
+q_dispatch_log="$tmpdir/q-dispatch.log"
+: > "$q_dispatch_log"
+cat > "$q_stub_dir/orca-dispatch-role.sh" <<SH
+#!/usr/bin/env bash
+role="\$1"; shift
+spec=""
+persist=0
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --spec) spec="\$2"; shift 2 ;;
+    --persist) persist=1; shift ;;
+    *) shift ;;
+  esac
+done
+target="\$(printf '%s' "\$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+mkdir -p "\$(dirname "\$target")"
+{
+  echo "# stub"
+  echo "## Prior art"
+  echo "## Proposals"
+  echo "- Weakest link: stub"
+  echo "## Directions I deliberately rejected"
+} > "\$target"
+echo "STUB_DISPATCH role=\$role persist=\$persist lockfile=\${ORCA_ROLE_LOCK_FILE:-<unset>}" >> "$q_dispatch_log"
+echo "task_id=task_\${role}"
+SH
+chmod +x "$q_stub_dir/orca-dispatch-role.sh"
+
+q_debates_dir="$q_root/debates"
+Q_OLD_PATH="$PATH"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+"$Q_DRIVER" --topic "watchdog wiring test" --slug qwiring --rounds 1 --dir-root "$q_debates_dir" \
+  --lock-ttl-seconds 1800 >"$q_root/driver.out" 2>"$q_root/driver.err" &
+q_driver_pid=$!
+export PATH="$Q_OLD_PATH"
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+CLEANUP_PIDS+=("$q_driver_pid")
+
+# Grab the watchdog's own pid WHILE the driver is still running — cleanup()
+# removes its pidfile on normal exit, so it must be captured before that.
+q_watchdog_pidfile="$Q_LOCKS_DIR/qwiring.watchdog.pid"
+wait_for 5000 "[[ -f \"$q_watchdog_pidfile\" ]]" || true
+q_watchdog_pid="$(cat "$q_watchdog_pidfile" 2>/dev/null || true)"
+[[ -n "$q_watchdog_pid" ]] && CLEANUP_PIDS+=("$q_watchdog_pid")
+
+q_rc=0
+wait "$q_driver_pid" || q_rc=$?
+
+assert Q1_driver_exits_ok "[[ \"$q_rc\" -eq 0 ]]"
+assert Q2_watchdog_pid_was_captured "[[ -n \"$q_watchdog_pid\" ]]"
+assert Q3_watchdog_log_shows_real_driver_pid \
+  "grep -q \"watching owner pid=$q_driver_pid\" \"$Q_LOCKS_DIR/qwiring.watchdog.log\""
+assert Q4_lock_removed_by_real_cleanup "[[ ! -f \"$Q_LOCKS_DIR/qwiring.json\" ]]"
+assert Q5_pidfile_removed_by_real_cleanup "[[ ! -f \"$q_watchdog_pidfile\" ]]"
+
+q_watchdog_gone=0
+wait_for 3000 "! kill -0 $q_watchdog_pid 2>/dev/null" && q_watchdog_gone=1
+assert Q6_watchdog_process_exits_after_normal_run "[[ \"$q_watchdog_gone\" -eq 1 ]]"
+
+# Proves the ORCA_ROLE_LOCK_FILE export (orca-debate.sh) actually reaches a
+# --persist dispatch child process, not just that the driver believes it
+# set it — nothing else in this suite exercises that specific env-var
+# hand-off through the real script (P3 covers the registration behavior
+# itself, directly, without going through orca-debate.sh).
+assert Q7_dispatch_saw_persist "grep -q 'persist=1' \"$q_dispatch_log\""
+assert Q8_dispatch_saw_real_lock_file "! grep -q 'lockfile=<unset>' \"$q_dispatch_log\""
+assert Q8_dispatch_lock_file_matches "grep -q \"lockfile=$Q_LOCKS_DIR/qwiring.json\" \"$q_dispatch_log\""
 
 echo
 echo "Results: $pass passed, $fail failed"

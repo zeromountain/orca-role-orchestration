@@ -719,3 +719,53 @@ lock_remove() {
   local path="$1"
   rm -f "$path" "${path%.json}.handles.jsonl" 2>/dev/null || true
 }
+
+lock_handle_claimed_elsewhere() {
+  # $1=locks_dir $2=handle $3=exclude_lock_file -> exit 0 if some OTHER lock
+  # file in locks_dir claims $2 (in its merged "handles" array OR its
+  # not-yet-merged sidecar — a handle a --persist dispatch just registered
+  # can sit in the sidecar for up to one whole poll cycle before that lock's
+  # own watchdog folds it in, and reading only "handles" would wrongly say
+  # "not claimed" during that window) AND that other lock is both fresh
+  # AND its own recorded owner pid is confirmed alive; exit 1 otherwise.
+  #
+  # Two different roles reuse the SAME underlying terminal handle for a
+  # role key across debates (ensure_terminal reuses a live role terminal
+  # globally), so two different debates can legitimately share one
+  # debater's handle, each having registered it into its own lock. Before
+  # closing a handle, a caller must check whether some OTHER lock still
+  # actively depends on it.
+  #
+  # Requiring the OTHER lock's owner pid to be alive (not freshness alone)
+  # closes a real gap found in review: if two locks share a handle and
+  # BOTH owners die within moments of each other, a freshness-only check
+  # would let each lock's watchdog defer to the other (both locks then
+  # remove themselves, satisfied nobody needs to act) and the handle would
+  # never be closed by either — the exact permanently-orphaned,
+  # permission-bypassed terminal this whole feature exists to prevent.
+  # Requiring proof the other lock's owner is still around means at least
+  # one watchdog (whichever's peer is already gone) still closes it.
+  local locks_dir="$1" handle="$2" exclude="$3" lf sidecar other_pid claims
+  for lf in "$locks_dir"/*.json; do
+    [[ -f "$lf" ]] || continue
+    [[ -n "$exclude" && "$lf" == "$exclude" ]] && continue
+    lock_is_fresh "$lf" || continue
+
+    claims=1
+    if lock_handles "$lf" | grep -qxF "$handle"; then
+      claims=0
+    else
+      sidecar="${lf%.json}.handles.jsonl"
+      if [[ -f "$sidecar" ]] && grep -qxF "$handle" "$sidecar"; then
+        claims=0
+      fi
+    fi
+    [[ "$claims" -eq 0 ]] || continue
+
+    other_pid="$(lock_pid "$lf")"
+    if [[ -n "$other_pid" ]] && kill -0 "$other_pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}

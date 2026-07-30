@@ -242,6 +242,24 @@ def parse_time(text):
     except Exception:
         return None
 
+def pid_alive(pid_val):
+    # True unless we can PROVE the pid is gone (ProcessLookupError). Every
+    # other outcome — unparseable pid, PermissionError (process exists,
+    # just owned by someone else), or any other OSError — defaults to
+    # "alive", matching this whole tool's bias: never treat an inability
+    # to determine liveness as license to act.
+    try:
+        pid = int(pid_val)
+    except Exception:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+    return True
+
 protected = set()
 stale_candidates = {}
 for lf in sorted(glob.glob(os.path.join(locks_dir, "*.json"))):
@@ -249,19 +267,35 @@ for lf in sorted(glob.glob(os.path.join(locks_dir, "*.json"))):
         d = json.load(open(lf))
         hb = parse_time(d.get("heartbeatAt", ""))
         ttl = float(d.get("ttlSeconds", 0))
-        handles = d.get("handles") or []
+        handles = list(d.get("handles") or [])
+        pid = d.get("pid")
         slug = d.get("slug") or os.path.basename(lf)[:-5]
     except Exception:
         continue
     if hb is None:
         continue
+    # Fold in the not-yet-merged sidecar too: a handle a --persist dispatch
+    # just registered can sit there for up to one whole poll cycle before
+    # this lock's own watchdog folds it into "handles" — reading only
+    # "handles" would make a handle look unclaimed during that window.
+    sidecar_path = lf[:-5] + ".handles.jsonl"
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path) as sf:
+                for line in sf:
+                    h = line.strip()
+                    if h and h not in handles:
+                        handles.append(h)
+        except Exception:
+            pass
     age = (now - hb).total_seconds()
     if age < ttl:
         for h in handles:
             protected.add(h)
     else:
         for h in handles:
-            stale_candidates[h] = slug
+            if h not in stale_candidates:
+                stale_candidates[h] = (slug, pid)
 
 handle_title = {}
 journal_candidates = []
@@ -305,11 +339,24 @@ for handle, title, role, created_raw in journal_candidates:
     seen.add(handle)
     print("CANDIDATE\t%s\t%s\t%s\tjournal-orphan createdAt=%s" % (handle, field(title), field(role), created_raw))
 
-for handle, slug in stale_candidates.items():
+for handle, (slug, owner_pid) in stale_candidates.items():
     if handle in seen:
         continue
-    if handle in tracked:
-        print("SKIP\t%s\t%s\t%s\tstale lock %s but still tracked in handles.json" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), slug))
+    # Deliberately NOT gated on "handle in tracked": orca-close-role.sh does
+    # not edit handles.json on close ("next dispatch recreates via
+    # ensure_terminal"), so a debater's handle sits there permanently from
+    # creation, tracked forever whether its terminal is alive, closed, or
+    # abandoned — presence in handles.json carries no liveness information
+    # for this class of handle and cannot be the protection rule. A stale
+    # lock naming a handle is the opposite of protection: it is the
+    # strongest evidence available that whoever was responsible for it is
+    # gone. What DOES protect it: something else CURRENTLY claiming
+    # responsibility.
+    if handle in protected:
+        print("SKIP\t%s\t%s\t%s\tstale lock %s but also claimed by a different, still-fresh lock" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), slug))
+        continue
+    if pid_alive(owner_pid):
+        print("SKIP\t%s\t%s\t%s\tstale lock %s but owner pid=%s is still alive (its watchdog may have died, not the debate itself)" % (handle, field(handle_title.get(handle, "(unknown)")), field(""), slug, owner_pid))
         continue
     title = handle_title.get(handle, "(unknown)")
     print("CANDIDATE\t%s\t%s\t%s\tstale-lock slug=%s" % (handle, field(title), field(""), slug))
@@ -426,6 +473,19 @@ run_watchdog() {
     still_file="$(mktemp)"
     while IFS= read -r h; do
       [[ -z "$h" ]] && continue
+      # ensure_terminal reuses a live role terminal globally, so two
+      # different debates can legitimately share one debater's underlying
+      # handle (each having registered it into its own, separate lock).
+      # Before closing, confirm no OTHER fresh lock (with a confirmed-alive
+      # owner — see lock_handle_claimed_elsewhere's own comment for why
+      # freshness alone is not enough) still actively depends on this
+      # handle. Treated as resolved, not retried: "someone else owns this"
+      # is a fact this cycle already has full information about, not a
+      # liveness ambiguity that might resolve differently later.
+      if lock_handle_claimed_elsewhere "$LOCKS_DIR" "$h" "$lock_file"; then
+        echo "watchdog[$SLUG]: $h is also claimed by a different, still-active debate — leaving it alone"
+        continue
+      fi
       hrc=0
       close_handle_if_live "$h" "debate:$SLUG" "$ACT" || hrc=$?
       [[ "$hrc" -eq 2 ]] && printf '%s\n' "$h" >> "$still_file"
