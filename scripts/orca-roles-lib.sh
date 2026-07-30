@@ -520,6 +520,69 @@ terminal_wait_ready() {
   return 1
 }
 
+terminal_created_epoch() {
+  # $1=handle -> epoch seconds of that handle's create_role journal entry
+  # on stdout, or nothing (empty output, exit 0) if not found/unparseable.
+  #
+  # Fix round 1: seed() (below) needs a creation timestamp for
+  # terminal_wait_ready's minimum-elapsed floor, but seed() is called by
+  # MORE than one caller — ensure_terminal, which has a creation timestamp
+  # readily at hand (it just called create_role itself), and
+  # orca-bootstrap-roles.sh, whose create phase does not otherwise expose
+  # one to seed() at all (creates happen in one phase, seeds in a later,
+  # separate one). Rather than requiring every current and future caller to
+  # track and pass its own timestamp, this reads the ONE place create_role
+  # already durably records createdAt for every handle it produces, for
+  # every caller, unconditionally: terminal-journal.jsonl. A single,
+  # caller-agnostic source beats N caller-specific ones.
+  #
+  # Same scratch-file + plain `cat` precaution as create_role/lock_pid/
+  # _terminal_ready_check above (this function's stdout is meant to be
+  # captured via `$(...)`).
+  local handle="$1" journal_file="${ORCH:-.}/terminal-journal.jsonl" scratch
+  [[ -f "$journal_file" ]] || return 0
+  scratch="$(mktemp)"
+  python3 - "$journal_file" "$handle" >"$scratch" <<'PY'
+import json, sys, datetime
+
+path, handle = sys.argv[1], sys.argv[2]
+
+# Scan the whole (append-only) journal and keep the LAST matching row, in
+# case a handle were ever reused (not expected in practice -- orca terminal
+# create hands back a fresh, effectively-unique handle every time -- but
+# "most recent entry wins" is the correct choice if it ever happened, and
+# costs nothing when it doesn't).
+created_at = None
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(row, dict) and row.get("handle") == handle and row.get("createdAt"):
+                created_at = row["createdAt"]
+except Exception:
+    created_at = None
+
+if not created_at:
+    raise SystemExit(0)
+
+try:
+    dt = datetime.datetime.fromisoformat(created_at)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    print(int(dt.timestamp()))
+except Exception:
+    pass
+PY
+  cat "$scratch"
+  rm -f "$scratch"
+}
+
 persona_body() {
   # $1 = role key. Echo persona file content minus the H1 and the STANCE comment.
   # Return non-zero if the file is absent (caller falls back to a hardcoded one-liner).
@@ -562,15 +625,17 @@ seed() {
   # $1=handle $2=role $3=model $4=fallback_body
   #
   # Verifies its own send instead of discarding the result: (a) refuses a
-  # target that isn't shaped like a real terminal handle, (b) requires the
-  # send call to structurally report success, (c) confirms the exact handle
-  # is still a live, readable terminal right after sending. Any of these
-  # failing is echoed to stderr and returns 1 — never swallowed. seed_text's
-  # output itself is untouched by any of this (non-debater seed text is
-  # byte-frozen).
+  # target that isn't shaped like a real terminal handle, (b) gates on the
+  # terminal actually being ready to receive input (see below), (c)
+  # requires the send call to structurally report success, (d) confirms
+  # the exact handle is still a live, readable terminal right after
+  # sending. Any of these failing is echoed to stderr and returns 1 —
+  # never swallowed. seed_text's output itself is untouched by any of this
+  # (non-debater seed text is byte-frozen).
   local handle="$1" role="$2" model="$3" fallback_body="$4"
   local body text send_json accepted read_ok attempt read_json marker
   local marker_seen marker_read_json
+  local cli created_epoch not_before
 
   case "$handle" in
     term_*) ;;
@@ -579,6 +644,36 @@ seed() {
       return 1
       ;;
   esac
+
+  # Readiness gate (Task 2; moved here in fix round 1). It used to live
+  # only in ensure_terminal, called once immediately before ITS OWN call to
+  # seed. That left orca-bootstrap-roles.sh — a second, independent caller
+  # of seed(), never routed through ensure_terminal — seeding on tui-idle
+  # alone: its apparent safety was a timing accident (bootstrap creates all
+  # four terminals in one phase, then seeds in a later phase, so the first
+  # role created happens to get real boot time before its seed call), not a
+  # guarantee, and a single slow boot or new first-run screen would hit
+  # exactly the defect that produced five empty debate runs. Living inside
+  # seed() itself means ensure_terminal, orca-bootstrap-roles.sh, and any
+  # future caller all get it by construction, not by remembering a separate
+  # call — ensure_terminal no longer calls terminal_wait_ready itself; see
+  # its own comment.
+  #
+  # The minimum-elapsed floor's creation timestamp comes from
+  # terminal_created_epoch (terminal-journal.jsonl), not a caller-supplied
+  # value — see that function's own comment for why a single, caller-
+  # agnostic source was chosen over asking every caller to track one.
+  cli="$(role_meta "$role" | cut -f3)"
+  created_epoch="$(terminal_created_epoch "$handle")"
+  if [[ -n "$created_epoch" ]]; then
+    not_before=$((created_epoch + ROLE_READY_MIN_ELAPSED_SECONDS))
+  else
+    not_before=0
+  fi
+  if ! terminal_wait_ready "$handle" "$cli" "$not_before"; then
+    echo "seed: $handle (role=$role) never showed a ready screen — refusing to send; see the screen dump above for what to clear by hand." >&2
+    return 1
+  fi
 
   if body="$(persona_body "$role")" && [[ -n "${body// }" ]]; then
     : # use full persona file
@@ -853,7 +948,7 @@ ensure_terminal() {
   # returns 1 with nothing on stdout; recovery state (if any) lives in
   # $HANDLES_FILE and terminal-journal.jsonl, never only in this function's
   # local variables — so a seed failure still leaves a closable terminal.
-  local role="$1" handle title model agent live_rc=0 created_epoch
+  local role="$1" handle title model agent live_rc=0
   handle="$(handles_get "$HANDLES_FILE" "$role")"
   if [[ -n "$handle" ]]; then
     terminal_is_live "$handle" || live_rc=$?
@@ -878,7 +973,6 @@ ensure_terminal() {
     echo "Role $role has no handle — creating…" >&2
   fi
 
-  created_epoch="$(date +%s)"
   IFS=$'\t' read -r title model agent < <(role_meta "$role")
   handle="$(create_role "$title" "$(role_launch_cmd "$role")" "$role")" || {
     echo "ensure_terminal: create_role failed for role=$role — see terminal-journal.jsonl for the raw create response" >&2
@@ -886,9 +980,10 @@ ensure_terminal() {
   }
 
   # Durable before anything that can fail: a wait_idle timeout, a
-  # readiness-gate timeout, or a seed failure below must still leave this
-  # handle closable via handles_get → terminal_is_live → close, instead of
-  # leaking an untracked bypass-permissions session.
+  # readiness-gate timeout (now inside seed() itself — see its own
+  # comment), or a seed failure below must still leave this handle closable
+  # via handles_get → terminal_is_live → close, instead of leaking an
+  # untracked bypass-permissions session.
   if ! handles_set "$HANDLES_FILE" "$role" "$handle"; then
     echo "ensure_terminal: handles_set failed to record handle=$handle for role=$role — terminal exists but is NOT durably tracked in $HANDLES_FILE (see terminal-journal.jsonl)" >&2
     return 1
@@ -896,14 +991,13 @@ ensure_terminal() {
 
   wait_idle "$handle"
 
-  # Gate (Task 2): confirm the actual screen, not tui-idle alone, before
-  # seeding — this is the fix. See the "Terminal readiness gate" section
-  # above terminal_wait_ready's definition for the full composition.
-  if ! terminal_wait_ready "$handle" "$agent" "$((created_epoch + ROLE_READY_MIN_ELAPSED_SECONDS))"; then
-    echo "ensure_terminal: $handle for role=$role never showed a ready screen — refusing to seed. Handle is recorded in $HANDLES_FILE so it can still be closed/retried; see the screen dump above for what to clear by hand." >&2
-    return 1
-  fi
-
+  # Fix round 1: the readiness gate that used to be called explicitly HERE
+  # moved into seed() itself, so orca-bootstrap-roles.sh's direct seed()
+  # calls get it too, by construction, instead of relying on every caller
+  # to remember a separate gate call (see seed()'s own comment for the
+  # full rationale). Calling seed() is sufficient on its own now — do not
+  # re-add a gate call here, or every fresh-creation dispatch pays for the
+  # readiness classifier twice.
   if ! seed "$handle" "$role" "$model" "$(role_fallback_body "$role")"; then
     echo "ensure_terminal: seed failed for role=$role handle=$handle — handle is recorded in $HANDLES_FILE so it can still be closed/retried; not printing it as a ready handle" >&2
     return 1

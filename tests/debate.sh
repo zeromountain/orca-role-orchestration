@@ -855,6 +855,11 @@ mkdir -p "$h7_dir/bin"
 cat > "$h7_dir/bin/orca" <<'ORCASTUB'
 #!/usr/bin/env bash
 case "$1 $2" in
+  # seed() now gates on readiness BEFORE ever sending (fix round 1) —
+  # architect -> cli claude, so "terminal read" must show a real claude-
+  # ready screen here or this test would exercise the readiness gate's own
+  # refusal instead of the "send not accepted" path it is actually about.
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_h7","status":"running","tail":["❯ ","bypass permissions on"]}}}' ;;
   "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_h7","accepted":false}}}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -868,11 +873,29 @@ if h7a_err="$(
 assert H7_not_accepted_fails "[[ \"$h7a_rc\" -ne 0 ]]"
 assert H7_not_accepted_message "printf '%s' \"\$h7a_err\" | grep -qi 'not accepted'"
 
-cat > "$h7_dir/bin/orca" <<'ORCASTUB'
+# fix round 1: "terminal read" must now succeed (with a real ready screen)
+# for the PRE-send readiness gate, then fail for seed's own POST-send
+# read-back check — the two calls are distinguished by a marker file
+# `terminal send` touches, since both come from the same stub script and
+# the fixture needs to model "was ready to seed into, but then vanished/
+# went unreadable right after the send landed," not "was never ready at
+# all" (that scenario is what TR8a covers separately).
+h7b_send_marker="$h7_dir/h7b-send-happened"
+rm -f "$h7b_send_marker"
+cat > "$h7_dir/bin/orca" <<ORCASTUB
 #!/usr/bin/env bash
-case "$1 $2" in
-  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_h7b","accepted":true}}}' ;;
-  "terminal read") echo "read failed" >&2; exit 9 ;;
+case "\$1 \$2" in
+  "terminal send")
+    touch "$h7b_send_marker"
+    echo '{"ok":true,"result":{"send":{"handle":"term_h7b","accepted":true}}}'
+    ;;
+  "terminal read")
+    if [[ -f "$h7b_send_marker" ]]; then
+      echo "read failed" >&2
+      exit 9
+    fi
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_h7b","status":"running","tail":["❯ ","bypass permissions on"]}}}'
+    ;;
   *) echo '{"ok":true}' ;;
 esac
 exit 0
@@ -3082,7 +3105,15 @@ assert TG3_stuck_close_reported_loudly \
 # match — passes for every role whose send succeeded).
 tg_bootstrap_stub() {
   # $1=bin_dir $2=fail_create_title (or "") $3=fail_send_title (or "")
-  local dir="$1" fail_create="$2" fail_send="$3"
+  # $4=unready_title (or "") — fix round 1: seed() now gates on readiness
+  # for EVERY caller, including orca-bootstrap-roles.sh's direct seed()
+  # calls, so "terminal read" must model a real per-CLI ready screen (by
+  # title substring: opus->claude, grok->grok, agy->antigravity, sol-> no
+  # pattern required for codex) rather than the old blank tail, or every
+  # role's seed would now refuse at the gate. $4, when set, makes exactly
+  # that one title's terminal permanently blank — the readiness gate's own
+  # not-ready path, distinct from $3's send-call failure.
+  local dir="$1" fail_create="$2" fail_send="$3" unready="${4:-}"
   cat > "$dir/orca" <<ORCASTUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
@@ -3127,7 +3158,16 @@ case "\$1 \$2" in
       if [[ "\$prev" == "--terminal" ]]; then term="\$a"; fi
       prev="\$a"
     done
-    echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","tail":[]}}}'
+    if [[ -n "$unready" && "\$term" == "term_$unready" ]]; then
+      echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","status":"running","tail":[]}}}'
+    else
+      case "\$term" in
+        *opus*) echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","status":"running","tail":["❯ ","bypass permissions on"]}}}' ;;
+        *grok*) echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","status":"running","tail":["❯ "]}}}' ;;
+        *agy*)  echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","status":"running","tail":["Antigravity CLI","> "]}}}' ;;
+        *)      echo '{"ok":true,"result":{"terminal":{"handle":"'"\$term"'","status":"running","tail":["ready, ordinary non-blank output"]}}}' ;;
+      esac
+    fi
     ;;
   "status --json") echo '{"ok": true, "reachable": true}' ;;
   *) echo '{"ok":true}' ;;
@@ -3205,6 +3245,38 @@ assert TG6_all_succeed_exits_zero "[[ \"$tg6_rc\" -eq 0 ]]"
 assert TG6_all_succeed_says_done "grep -q '^Done\\.' \"$tg6_dir/out.log\""
 assert TG6_all_four_recorded \
   "python3 -c \"import json; d=json.load(open('$tg6_dir/orch/handles.json')); assert sorted(d['roles'].keys())==['architect','executor','fallback','thrifty'], d['roles'].keys()\""
+
+# TG7 (fix round 1, Task 2): orca-bootstrap-roles.sh calls seed() directly
+# for its four roles, never through ensure_terminal — before this round,
+# that meant bootstrap's only protection against seeding a not-ready
+# terminal was a timing accident (create-phase-then-seed-phase happens to
+# give the first-created role real boot time). Now that the readiness gate
+# lives inside seed() itself, bootstrap gets it too, with zero changes to
+# orca-bootstrap-roles.sh's own code. thrifty (grok) is made permanently
+# not-ready here; failure isolation (Task 1) must still hold — the other
+# three roles are created, recorded, AND seeded regardless.
+tg7_dir="$tmpdir/tg7"
+mkdir -p "$tg7_dir/orch/scripts" "$tg7_dir/orch/bin"
+cp "$ROOT/scripts/orca-bootstrap-roles.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg7_dir/orch/scripts/"
+tg_bootstrap_stub "$tg7_dir/orch/bin" "" "" "role-grok-thrifty"
+tg7_send_log="$tg7_dir/send.log"
+: > "$tg7_send_log"
+tg7_rc=0
+(
+  cd "$tg7_dir"
+  export TG_SEND_LOG="$tg7_send_log"
+  PATH="$tg7_dir/orch/bin:$PATH" "$tg7_dir/orch/scripts/orca-bootstrap-roles.sh" --worktree active --project-name tg7
+) >"$tg7_dir/out.log" 2>"$tg7_dir/err.log" || tg7_rc=$?
+assert TG7_unready_role_exits_nonzero "[[ \"$tg7_rc\" -ne 0 ]]"
+assert TG7_names_failed_role "grep -q 'thrifty' \"$tg7_dir/out.log\" \"$tg7_dir/err.log\""
+assert TG7_reports_never_ready "grep -q 'never became ready' \"$tg7_dir/err.log\""
+assert TG7_reports_screen_content "grep -q '(blank)' \"$tg7_dir/err.log\""
+assert TG7_all_four_handles_recorded \
+  "python3 -c \"import json; d=json.load(open('$tg7_dir/orch/handles.json')); assert sorted(d['roles'].keys())==['architect','executor','fallback','thrifty'], d['roles'].keys()\""
+assert TG7_thrifty_never_seeded \
+  "! grep -qx term_role-grok-thrifty \"$tg7_send_log\""
+assert TG7_other_three_still_seeded \
+  "grep -qx term_role-opus-architect \"$tg7_send_log\" && grep -qx term_role-sol-executor \"$tg7_send_log\" && grep -qx term_role-agy-fallback \"$tg7_send_log\""
 
 # ----------------------------------------------------------------------------
 # TR (terminal-readiness-gate Task 2): the actual fix. terminal_wait_ready /
@@ -3478,8 +3550,12 @@ assert TR6d_unrecognized_status_does_not_veto \
 
 # --- TR7 (Step 6): debater_* roles get a HARD marker gate with retries;
 # the six pre-existing roles keep the pre-Task-2 soft/informational check,
-# unchanged. Same stub for both — never contains the "ROLE=..." marker,
-# simulating a seed that landed somewhere the marker never rendered. ---
+# unchanged. The stub's tail satisfies the readiness gate (claude: prompt +
+# bypass-permissions line, both roles below resolve to cli claude) but
+# never contains the "ROLE=..." marker, simulating a seed that landed on a
+# genuinely ready screen where the marker itself never rendered — the
+# scenario this specific check exists for, distinct from TR8a's "never
+# became ready at all." ---
 tr7_dir="$tmpdir/tr7"
 mkdir -p "$tr7_dir/bin"
 tr7_read_calls="$tr7_dir/read-calls.log"
@@ -3489,7 +3565,7 @@ case "\$1 \$2" in
   "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_tr7","accepted":true}}}' ;;
   "terminal read")
     echo call >> "$tr7_read_calls"
-    echo '{"ok":true,"result":{"terminal":{"handle":"term_tr7","tail":["some unrelated content, never the seed marker"]}}}'
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_tr7","status":"running","tail":["❯ ","bypass permissions on","some unrelated content, never the seed marker"]}}}'
     ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -3515,7 +3591,12 @@ tr7b_err="$(
 )" || tr7b_rc=$?
 assert TR7b_nondebater_soft_succeeds "[[ \"$tr7b_rc\" -eq 0 ]]"
 assert TR7b_nondebater_info_only "printf '%s' \"\$tr7b_err\" | grep -q '(info)'"
-assert TR7b_nondebater_not_retried "[[ \"\$(wc -l < \"$tr7_read_calls\" | tr -d ' ')\" -eq 1 ]]"
+# Baseline is 2 now, not 1: the readiness gate (fix round 1, unconditional
+# for every role) contributes one read, seed's own structural read-back
+# contributes a second — what this assertion actually proves is that NO
+# further reads happen beyond that baseline, i.e. the non-debater marker
+# check does not retry (unlike TR7a's debater path, which adds more).
+assert TR7b_nondebater_not_retried "[[ \"\$(wc -l < \"$tr7_read_calls\" | tr -d ' ')\" -eq 2 ]]"
 
 # --- TR8 (Step 5, persistent post-fix regression coverage — the pre-fix
 # reproduction proving the OLD code seeds/injects into these same fixtures
@@ -3587,6 +3668,48 @@ tr8b_rc=0
 assert TR8b_dispatch_refuses_inject "[[ \"$tr8b_rc\" -ne 0 ]]"
 assert TR8b_inject_never_called "[[ ! -f \"$tr8b_dir/inject-was-called\" ]]"
 assert TR8b_reports_screen "grep -q 'never showed a ready screen' \"$tr8b_dir/err.log\""
+
+# --- TR9 (fix round 1): seed()'s minimum-elapsed floor is sourced from
+# terminal-journal.jsonl via terminal_created_epoch, not a value the caller
+# passes in — this is the mechanism that lets orca-bootstrap-roles.sh's
+# direct seed() calls get the SAME floor protection ensure_terminal's
+# fresh-creation path gets, given bootstrap's own create phase never
+# tracked a per-role creation timestamp of its own. Proven directly:
+# create_role writes a REAL journal entry, the terminal is ready from the
+# very first poll, and seed() still takes at least the floor duration
+# before ever sending — the floor is doing real work via the journal, not
+# a no-op.
+tr9_dir="$tmpdir/tr9"
+mkdir -p "$tr9_dir/bin" "$tr9_dir/orch"
+cat > "$tr9_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr9"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_tr9","accepted":true}}}' ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr9","status":"running","tail":["❯ ","bypass permissions on"]}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr9_dir/bin/orca"
+tr9_start=$(date +%s)
+tr9_rc=0
+(
+  export PATH="$tr9_dir/bin:$PATH"
+  export ORCH="$tr9_dir/orch"
+  export ROLE_READY_MIN_ELAPSED_SECONDS=2
+  export ROLE_READY_TIMEOUT_SECONDS=10
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  WORKTREE=active
+  handle="$(create_role "role-tr9-test" "irrelevant command" architect)"
+  seed "$handle" architect claude-opus-5 "fallback body"
+) >"$tr9_dir/out.log" 2>"$tr9_dir/err.log" || tr9_rc=$?
+tr9_end=$(date +%s)
+tr9_elapsed=$((tr9_end - tr9_start))
+assert TR9_seed_succeeds "[[ \"$tr9_rc\" -eq 0 ]]"
+assert TR9_floor_enforced_via_journal "[[ \"$tr9_elapsed\" -ge 2 ]]"
+assert TR9_journal_entry_written "[[ -s \"$tr9_dir/orch/terminal-journal.jsonl\" ]]"
 
 echo
 echo "Results: $pass passed, $fail failed"
