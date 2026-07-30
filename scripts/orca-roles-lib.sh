@@ -230,6 +230,296 @@ wait_idle() {
     || echo "  (warn) tui-idle wait timed out for $1" >&2
 }
 
+# ---------------------------------------------------------------------------
+# Terminal readiness gate (Task 2 — the fix the whole plan exists for).
+#
+# THE DEFECT: `wait_idle` above waits on `orca terminal wait --for tui-idle`,
+# which means only "the TUI stopped redrawing" — a blank, not-yet-drawn
+# screen satisfies that instantly. A four-model debate built on this repo
+# produced zero output across five live runs: every debater's terminal was
+# seeded, and later dispatched into via `--inject`, while it was still
+# booting (claude/codex hadn't reached a prompt yet, codex had exited, grok
+# was on its first-run menu, agy sat on an empty screen) — tui-idle alone
+# had already reported success in every one of those states.
+#
+# THE FIX: `terminal_wait_ready` below POLLS (never answers from a single
+# snapshot) up to a deadline, combining three independent signals rather
+# than trusting any one alone (a positive prompt pattern alone would
+# silently break at the next CLI release):
+#   1. a minimum elapsed-time FLOOR — only when the caller knows a genuine
+#      creation timestamp (see the ensure_terminal-vs-dispatch-role
+#      discussion on terminal_wait_ready below); even a snapshot that
+#      matches every other signal is not trusted before this floor;
+#   2. tui-idle, the same primitive `wait_idle` uses ("as today") — reused
+#      here as a per-iteration settle/pace wait, not removed;
+#   3. actual screen content, read via `orca terminal read` and classified
+#      by `_terminal_ready_check` into READY / NOT_READY(reason): a known
+#      not-ready marker (first-run menu text, a trust/theme prompt, a
+#      terminal whose process has exited) vetoes readiness; a positive
+#      per-CLI prompt pattern, when one is known, is REQUIRED for READY —
+#      but is checked BEFORE the negative markers, so a CLI whose working
+#      prompt can legitimately coexist with leftover first-run text (see
+#      the grok note inside _terminal_ready_check) is not permanently
+#      blocked by that text once it truly is ready.
+#
+# This never sends a keystroke to dismiss anything. A first-run trust/theme
+# screen is reported — with its exact matched text — so a human can clear it
+# once, by hand. See task-2-report.md for the full pattern-set rationale,
+# the grok menu-vs-prompt decision, and the pre/post-fix demonstrations.
+# ---------------------------------------------------------------------------
+
+# Overridable for tests. Production defaults are deliberately conservative:
+# this task's whole premise is that a real CLI cold start takes longer than
+# a glance suggests, and misjudging a READY terminal as not-ready blocks
+# ordinary dispatch for all six pre-existing roles, not just debaters — so
+# the bias throughout is toward waiting longer, never toward failing fast.
+: "${ROLE_READY_TIMEOUT_SECONDS:=60}"
+: "${ROLE_READY_POLL_INTERVAL_SECONDS:=2}"
+: "${ROLE_READY_MIN_ELAPSED_SECONDS:=3}"
+: "${ROLE_SEED_MARKER_RETRIES:=5}"
+: "${ROLE_SEED_MARKER_INTERVAL_SECONDS:=1}"
+
+_terminal_ready_check() {
+  # $1=handle $2=cli (claude|codex|grok|antigravity|"" for unknown) → stdout
+  # line 1 is the verdict ("READY" or "NOT_READY: <reason>"); remaining
+  # lines are the raw screen tail, always included (never discarded on a
+  # not-ready verdict) so a caller can report exactly what was on screen.
+  #
+  # Same scratch-file + plain `cat` precaution used by create_role/lock_pid/
+  # lock_handles above: this function's own stdout is meant to be captured
+  # via `$(...)` by terminal_wait_ready below, so the python heredoc writes
+  # to a scratch file via a plain `>` redirect instead of being captured in
+  # the same step — never `verdict="$(python3 ... <<'PY' ... PY)"` directly.
+  local handle="$1" cli="$2" read_json scratch
+  read_json="$(orca terminal read --terminal "$handle" --limit 200 --json 2>/dev/null)" || read_json=""
+  scratch="$(mktemp)"
+  # $read_json is passed as an argv element, NOT piped to stdin: `python3 -`
+  # already claims stdin for the heredoc script body below, so piping data
+  # into the same fd would collide with it (concatenating onto the script
+  # source rather than being readable as separate input). Same argv-not-
+  # stdin data-passing convention create_role uses for its own `$raw`.
+  python3 - "$handle" "$cli" "$read_json" >"$scratch" <<'PY'
+import json, sys
+
+handle, cli, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def emit(verdict, lines):
+    print(verdict)
+    for ln in lines:
+        print(ln)
+
+
+try:
+    d = json.loads(raw) if raw.strip() else None
+except Exception:
+    d = None
+
+if not isinstance(d, dict) or not d.get("ok"):
+    emit(
+        "NOT_READY: could not read terminal (orca terminal read failed or "
+        "returned no output) -- transient, not a verdict on the screen itself",
+        ["(unreadable)"],
+    )
+    raise SystemExit(0)
+
+term = (d.get("result") or {}).get("terminal")
+if not isinstance(term, dict) or term.get("handle") != handle:
+    emit(
+        "NOT_READY: terminal read did not return this handle's own terminal "
+        "(structural mismatch) -- transient",
+        ["(unreadable)"],
+    )
+    raise SystemExit(0)
+
+tail = term.get("tail")
+if not isinstance(tail, list):
+    emit("NOT_READY: terminal read returned no tail array -- transient", ["(unreadable)"])
+    raise SystemExit(0)
+
+lines = [str(x) for x in tail]
+joined = "\n".join(lines)
+status = term.get("status")
+
+# A terminal whose process has already exited (codex's observed pre-fix
+# failure mode) will never become ready no matter how long we poll. Only a
+# small, explicit "known dead" set vetoes on status -- an unrecognized
+# future status string is left alone, so it can never silently misjudge a
+# genuinely-running terminal as gone.
+BAD_STATUSES = {"exited", "dead", "stopped", "crashed", "terminated", "closed"}
+if isinstance(status, str) and status.strip().lower() in BAD_STATUSES:
+    emit(f"NOT_READY: terminal status={status!r} -- the CLI process is not running", lines or ["(no output)"])
+    raise SystemExit(0)
+
+if not joined.strip():
+    emit("NOT_READY: blank screen (no output yet -- CLI still booting)", ["(blank)"])
+    raise SystemExit(0)
+
+
+def has_prompt_line(needle):
+    return any(ln.strip().startswith(needle) for ln in lines)
+
+
+# Positive per-CLI ready pattern, checked BEFORE negative markers below. See
+# the grok row of the observed-data table: its ready prompt "may sit below a
+# first-run menu" -- the menu text can be genuinely present on a terminal
+# that, right now, is fully able to receive input (confirmed directly: text
+# sent to a grok terminal on this exact screen was accepted and answered
+# normally). Vetoing on menu text regardless of prompt presence would also
+# risk misjudging `thrifty` (a pre-existing PRODUCTION role that launches
+# grok, not a debater) as not-ready every time that menu lingers on screen --
+# exactly the regression this task warns against. So a CLI's own positive
+# prompt match, when it matches, wins outright; negative markers are only
+# evaluated when the positive check does not (yet) confirm readiness.
+positive_known = True
+if cli == "claude":
+    ready = has_prompt_line("❯") and ("bypass permissions on" in joined)
+    positive_desc = "'❯' prompt + 'bypass permissions on' status line"
+elif cli == "grok":
+    ready = has_prompt_line("❯")
+    positive_desc = "'❯' prompt"
+elif cli == "antigravity":
+    # Two sub-cases, not one: the observed-data table's phrasing ("'>'
+    # prompt AFTER an Antigravity CLI banner") describes a BOOT SEQUENCE,
+    # and ensure_terminal's gate (fresh creation only -- the reuse path
+    # never re-seeds or re-gates) is the only caller that is guaranteed to
+    # see that banner still on screen. orca-dispatch-role.sh's own gate
+    # runs on every dispatch, including to a WARM, already-running ui/
+    # fallback terminal (ordinary dispatch reuses live terminals) whose
+    # banner may have scrolled out of a full-screen TUI's current frame
+    # long ago -- requiring it unconditionally would risk misjudging an
+    # ordinary, already-ready production terminal as not-ready on every
+    # dispatch (advisor review flagged this directly: unverified against a
+    # real live agy session, and the safer assumption is that it might not
+    # persist). So: banner present -> corroborate with ANY prompt-shaped
+    # line (matches the boot sequence verbatim). Banner absent (warm case)
+    # -> require the prompt to be the CURRENT LAST non-blank line, not just
+    # present anywhere -- a stricter, position-based signal a bare
+    # "anywhere in the tail" check can't give, and specifically one a
+    # mid-response markdown blockquote ("> quoted text") would NOT satisfy
+    # unless it happened to be the terminal's literal last rendered line.
+    def is_agy_prompt_line(ln):
+        s = ln.strip()
+        return s == ">" or s.startswith("> ")
+
+    banner_present = "Antigravity CLI" in joined
+    nonblank_lines = [ln for ln in lines if ln.strip()]
+    if banner_present:
+        ready = any(is_agy_prompt_line(ln) for ln in lines)
+    else:
+        ready = bool(nonblank_lines) and is_agy_prompt_line(nonblank_lines[-1])
+    positive_desc = (
+        "'Antigravity CLI' banner + any '>' prompt line (fresh boot), "
+        "or a trailing '>' prompt as the terminal's current last line (warm)"
+    )
+else:
+    # codex (no ready screen was ever captured -- the brief is explicit
+    # about this; inventing a pattern we have no evidence for is worse than
+    # having none) and any unrecognized/empty cli.
+    positive_known = False
+    ready = False
+    positive_desc = ""
+
+if positive_known and ready:
+    emit("READY", lines)
+    raise SystemExit(0)
+
+GENERIC_NEGATIVE = [
+    # Real, known first-run screens for `claude` specifically (this
+    # project's own CLI): a trust dialog and a theme-selection wizard.
+    # Treated as generic (checked for every cli) rather than claude-only,
+    # since we have no positive evidence they are impossible on any other
+    # CLI either, and false-veto risk here is low -- both phrases are
+    # distinctive, multi-word, and not the kind of text a normal ready
+    # prompt would ever incidentally contain.
+    "Do you trust the files in this folder",
+    "Select a theme",
+]
+CLI_NEGATIVE = {
+    # Verbatim from the observed-data table. Deliberately EXCLUDES the
+    # table's own "Quit" entry: it is a single common word plausibly present
+    # in an ordinary ready screen's own footer/hint text (e.g. "ctrl+c to
+    # quit"), and the self-review directive here is to bias against
+    # misjudging a genuinely ready terminal as not-ready -- precision over
+    # recall for this one marker. The other three are multi-word, specific,
+    # and were not observed on any ready screen.
+    "grok": ["New worktree", "Resume session", "Changelog"],
+}
+for marker in GENERIC_NEGATIVE + CLI_NEGATIVE.get(cli, []):
+    if marker in joined:
+        emit(f"NOT_READY: matched not-ready marker {marker!r} (cli={cli or 'unknown'})", lines)
+        raise SystemExit(0)
+
+if positive_known:
+    emit(f"NOT_READY: no {cli} ready prompt matched yet (looking for {positive_desc})", lines)
+    raise SystemExit(0)
+
+# No known positive pattern for this CLI (codex; also an unrecognized/empty
+# cli) and nothing vetoed it -- readiness rests on the other two signals
+# (elapsed floor + tui-idle, both applied by the caller) plus "not blank,
+# nothing bad matched". Per the brief: a positive pattern, when available,
+# is confirmation, not the sole requirement -- so its ABSENCE must not
+# itself block a CLI we simply have no captured ready screen for.
+emit("READY", lines)
+PY
+  cat "$scratch"
+  rm -f "$scratch"
+}
+
+terminal_wait_ready() {
+  # $1=handle $2=cli (claude|codex|grok|antigravity|"" for unknown)
+  # $3=not_before_epoch (optional; 0 or omitted = no floor — see below)
+  #
+  # Polls _terminal_ready_check until ROLE_READY_TIMEOUT_SECONDS elapses.
+  # Returns 0 the moment a poll reports READY (and $3's floor, if any, has
+  # passed); returns 1 only after the FULL deadline, printing the LAST
+  # observed screen to stderr. Never a single-shot verdict (a screen that
+  # becomes ready partway through the window is still caught on a later
+  # iteration), and never a silent failure — 25 minutes of silence with no
+  # indication of what the screen showed is the exact failure this task
+  # exists to eliminate.
+  #
+  # $3 is a caller-supplied ABSOLUTE epoch, not "elapsed since this call
+  # started": ensure_terminal knows a genuine creation timestamp for a
+  # terminal it just created and passes created_epoch +
+  # ROLE_READY_MIN_ELAPSED_SECONDS. orca-dispatch-role.sh's own gate (before
+  # --inject) does NOT know a creation time for a handle it merely resolved
+  # (it may have just been created moments ago by ensure_terminal above,
+  # which already applied this floor once before seeding, or it may be a
+  # long-warm terminal from a prior dispatch) and passes no floor at all —
+  # restarting a multi-second floor on every ordinary dispatch to an
+  # already-ready, already-warm terminal would add pure, unrequested latency
+  # to the six pre-existing roles' hot path for no safety benefit.
+  local handle="$1" cli="${2:-}" not_before="${3:-0}"
+  local deadline_epoch now_epoch verdict reason screen
+  now_epoch="$(date +%s)"
+  deadline_epoch=$((now_epoch + ROLE_READY_TIMEOUT_SECONDS))
+  reason="(no check performed)"
+  screen="(none)"
+
+  while :; do
+    now_epoch="$(date +%s)"
+    verdict="$(_terminal_ready_check "$handle" "$cli")"
+    reason="$(printf '%s\n' "$verdict" | head -n1)"
+    screen="$(printf '%s\n' "$verdict" | tail -n +2)"
+
+    if [[ "$reason" == "READY" ]] && { [[ "$not_before" -eq 0 ]] || [[ "$now_epoch" -ge "$not_before" ]]; }; then
+      return 0
+    fi
+
+    [[ "$now_epoch" -ge "$deadline_epoch" ]] && break
+    orca terminal wait --terminal "$handle" --for tui-idle \
+      --timeout-ms "$((ROLE_READY_POLL_INTERVAL_SECONDS * 1000))" --json >/dev/null 2>&1 || true
+    sleep "$ROLE_READY_POLL_INTERVAL_SECONDS"
+  done
+
+  echo "terminal_wait_ready: $handle (cli=${cli:-unknown}) never became ready within ${ROLE_READY_TIMEOUT_SECONDS}s -- last check: $reason" >&2
+  echo "----- $handle screen (most recent) -----" >&2
+  printf '%s\n' "$screen" >&2
+  echo "-----------------------------------------" >&2
+  return 1
+}
+
 persona_body() {
   # $1 = role key. Echo persona file content minus the H1 and the STANCE comment.
   # Return non-zero if the file is absent (caller falls back to a hardcoded one-liner).
@@ -280,6 +570,7 @@ seed() {
   # byte-frozen).
   local handle="$1" role="$2" model="$3" fallback_body="$4"
   local body text send_json accepted read_ok attempt read_json marker
+  local marker_seen marker_read_json
 
   case "$handle" in
     term_*) ;;
@@ -351,12 +642,41 @@ sys.exit(0 if (d.get("ok") and r.get("handle") == h and isinstance(r.get("tail")
     return 1
   fi
 
-  # Soft, best-effort confirmation only: an info note (not a failure) if the
-  # seed's own opening marker isn't visible yet — the agent's TUI may have
-  # already redrawn past it by the time we read.
+  # Task 2, requirement 4: this marker check becomes a HARD GATE WITH
+  # RETRIES for debater_* roles only. A debate round dispatches into every
+  # seat within seconds of seeding (see the terminal_wait_ready file-header
+  # defect narrative above) with no human watching any individual terminal,
+  # so a seed that silently never landed is indistinguishable from "will
+  # show up eventually" until the whole round times out 25 minutes later.
+  # The six pre-existing roles are dispatched one at a time and this
+  # specific behavior must not change for them — so the non-debater branch
+  # below is the exact pre-Task-2 soft/informational check, untouched.
   marker="ROLE=$role"
-  if ! printf '%s' "$read_json" | grep -qF "$marker"; then
-    echo "seed: (info) marker '$marker' not visible yet in $handle's tail — not a failure, TUI may have redrawn already" >&2
+  if is_debater "$role"; then
+    marker_seen=0
+    marker_read_json="$read_json"
+    attempt=0
+    while [[ "$attempt" -lt "$ROLE_SEED_MARKER_RETRIES" ]]; do
+      attempt=$((attempt + 1))
+      if printf '%s' "$marker_read_json" | grep -qF "$marker"; then
+        marker_seen=1
+        break
+      fi
+      [[ "$attempt" -lt "$ROLE_SEED_MARKER_RETRIES" ]] || break
+      sleep "$ROLE_SEED_MARKER_INTERVAL_SECONDS"
+      marker_read_json="$(orca terminal read --terminal "$handle" --limit 200 --json 2>/dev/null)" || marker_read_json=""
+    done
+    if [[ "$marker_seen" -ne 1 ]]; then
+      echo "seed: HARD FAIL for debater role=$role handle=$handle — marker '$marker' never appeared after $attempt attempt(s). This is a hard gate for debater_* roles only (Task 2): the seed did not land, and the caller must not proceed as if it did." >&2
+      return 1
+    fi
+  else
+    # Unchanged: soft, best-effort confirmation only — an info note (not a
+    # failure) if the seed's own opening marker isn't visible yet — the
+    # agent's TUI may have already redrawn past it by the time we read.
+    if ! printf '%s' "$read_json" | grep -qF "$marker"; then
+      echo "seed: (info) marker '$marker' not visible yet in $handle's tail — not a failure, TUI may have redrawn already" >&2
+    fi
   fi
 
   return 0
@@ -533,7 +853,7 @@ ensure_terminal() {
   # returns 1 with nothing on stdout; recovery state (if any) lives in
   # $HANDLES_FILE and terminal-journal.jsonl, never only in this function's
   # local variables — so a seed failure still leaves a closable terminal.
-  local role="$1" handle title model agent live_rc=0
+  local role="$1" handle title model agent live_rc=0 created_epoch
   handle="$(handles_get "$HANDLES_FILE" "$role")"
   if [[ -n "$handle" ]]; then
     terminal_is_live "$handle" || live_rc=$?
@@ -558,22 +878,31 @@ ensure_terminal() {
     echo "Role $role has no handle — creating…" >&2
   fi
 
+  created_epoch="$(date +%s)"
   IFS=$'\t' read -r title model agent < <(role_meta "$role")
   handle="$(create_role "$title" "$(role_launch_cmd "$role")" "$role")" || {
     echo "ensure_terminal: create_role failed for role=$role — see terminal-journal.jsonl for the raw create response" >&2
     return 1
   }
 
-  # Durable before anything that can fail: a wait_idle timeout or a seed
-  # failure below must still leave this handle closable via
-  # handles_get → terminal_is_live → close, instead of leaking an untracked
-  # bypass-permissions session.
+  # Durable before anything that can fail: a wait_idle timeout, a
+  # readiness-gate timeout, or a seed failure below must still leave this
+  # handle closable via handles_get → terminal_is_live → close, instead of
+  # leaking an untracked bypass-permissions session.
   if ! handles_set "$HANDLES_FILE" "$role" "$handle"; then
     echo "ensure_terminal: handles_set failed to record handle=$handle for role=$role — terminal exists but is NOT durably tracked in $HANDLES_FILE (see terminal-journal.jsonl)" >&2
     return 1
   fi
 
   wait_idle "$handle"
+
+  # Gate (Task 2): confirm the actual screen, not tui-idle alone, before
+  # seeding — this is the fix. See the "Terminal readiness gate" section
+  # above terminal_wait_ready's definition for the full composition.
+  if ! terminal_wait_ready "$handle" "$agent" "$((created_epoch + ROLE_READY_MIN_ELAPSED_SECONDS))"; then
+    echo "ensure_terminal: $handle for role=$role never showed a ready screen — refusing to seed. Handle is recorded in $HANDLES_FILE so it can still be closed/retried; see the screen dump above for what to clear by hand." >&2
+    return 1
+  fi
 
   if ! seed "$handle" "$role" "$model" "$(role_fallback_body "$role")"; then
     echo "ensure_terminal: seed failed for role=$role handle=$handle — handle is recorded in $HANDLES_FILE so it can still be closed/retried; not printing it as a ready handle" >&2

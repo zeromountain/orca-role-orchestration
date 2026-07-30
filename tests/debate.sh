@@ -32,6 +32,24 @@ trap 'for _p in "${CLEANUP_PIDS[@]:-}"; do kill -9 "$_p" 2>/dev/null || true; do
 
 echo "=== tests/debate.sh (tmp=$tmpdir) ==="
 
+# Task 2 (terminal readiness gate): every test in this file that reaches
+# terminal_wait_ready/seed's debater marker gate goes through a STUBBED
+# orca, never a real CLI actually booting — so there is no reason for this
+# file's own run to sit out production-conservative deadlines. Shrinking
+# them here also means a fixture that does NOT model a real ready screen
+# fails FAST (a few seconds, with a debuggable message) instead of silently
+# absorbing up to a 60s hang per call site. Exported (not just assigned) so
+# the value reaches child processes invoked as external scripts (the P-/WD6
+# blocks below run the real orca-dispatch-role.sh, not a sourced function).
+# Production defaults (60s/2s/3s/5/1s), defined in orca-roles-lib.sh itself,
+# are untouched — these exports only affect this test process and whatever
+# it spawns.
+export ROLE_READY_TIMEOUT_SECONDS=3
+export ROLE_READY_POLL_INTERVAL_SECONDS=1
+export ROLE_READY_MIN_ELAPSED_SECONDS=0
+export ROLE_SEED_MARKER_RETRIES=3
+export ROLE_SEED_MARKER_INTERVAL_SECONDS=0
+
 # shellcheck source=../scripts/orca-roles-lib.sh
 source "$ROOT/scripts/orca-roles-lib.sh"
 
@@ -656,6 +674,11 @@ case "$1 $2" in
   "terminal rename") echo '{"ok":true}' ;;
   "terminal wait") echo '{"ok":true}' ;;
   "terminal send") echo "stub: simulated send failure" >&2; exit 1 ;;
+  # Task 2's readiness gate runs BEFORE seed and must see a ready screen
+  # here, or this test would exercise the gate's own timeout instead of
+  # seed()'s send-failure handling (architect -> cli claude: needs both the
+  # prompt glyph and the bypass-permissions status line).
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_h2fail","status":"running","tail":["❯ ","bypass permissions on"]}}}' ;;
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_h2fail","connected":true}]}}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -884,7 +907,10 @@ case "$1 $2" in
     done
     echo '{"ok":true,"result":{"send":{"handle":"term_h8happy","accepted":true}}}'
     ;;
-  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_h8happy","tail":["ROLE=architect on model claude-opus-5"]}}}' ;;
+  # Task 2's readiness gate needs a real claude-ready screen here (prompt
+  # glyph + bypass-permissions status line) or ensure_terminal would refuse
+  # to seed at all, never reaching the happy path this test proves.
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_h8happy","status":"running","tail":["❯ ","bypass permissions on","ROLE=architect on model claude-opus-5"]}}}' ;;
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_h8happy","connected":true}]}}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -1583,7 +1609,12 @@ case "$1 $2" in
     done
     echo '{"ok":true,"result":{"send":{"handle":"term_persisttest","accepted":true}}}'
     ;;
-  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_persisttest","tail":["x"]}}}' ;;
+  # Shared across P1/P2 (debater_claude -> cli claude, needs the prompt
+  # glyph + bypass-permissions line) and P3 (debater_codex -> no known
+  # positive pattern) and P3B (architect -> cli claude, soft marker only).
+  # Also carries every role's own "ROLE=..." marker since debater_claude and
+  # debater_codex are now hard-gated on it (Task 2, requirement 4).
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_persisttest","status":"running","tail":["❯ ","bypass permissions on","ROLE=debater_claude","ROLE=debater_codex","ROLE=architect"]}}}' ;;
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_persisttest","connected":true}]}}' ;;
   "orchestration task-create")
     prev=""
@@ -2823,7 +2854,8 @@ case "$1 $2" in
   "terminal rename") echo '{"ok":true}' ;;
   "terminal wait") echo '{"ok":true}' ;;
   "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_wd6role","accepted":true}}}' ;;
-  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_wd6role","tail":["ROLE=thrifty"]}}}' ;;
+  # thrifty -> cli grok: readiness gate needs the prompt glyph.
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_wd6role","status":"running","tail":["❯","ROLE=thrifty"]}}}' ;;
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_wd6role","connected":true}]}}' ;;
   "orchestration task-create") echo '{"ok":true,"result":{"task":{"id":"task_wd6_target"}}}' ;;
   "orchestration dispatch") echo '{"ok":true,"result":{"dispatch":{"id":"disp_wd6"}}}' ;;
@@ -3173,6 +3205,388 @@ assert TG6_all_succeed_exits_zero "[[ \"$tg6_rc\" -eq 0 ]]"
 assert TG6_all_succeed_says_done "grep -q '^Done\\.' \"$tg6_dir/out.log\""
 assert TG6_all_four_recorded \
   "python3 -c \"import json; d=json.load(open('$tg6_dir/orch/handles.json')); assert sorted(d['roles'].keys())==['architect','executor','fallback','thrifty'], d['roles'].keys()\""
+
+# ----------------------------------------------------------------------------
+# TR (terminal-readiness-gate Task 2): the actual fix. terminal_wait_ready /
+# _terminal_ready_check poll actual screen content instead of trusting
+# tui-idle alone; seed()'s debater marker check becomes a hard gate with
+# retries. Pre-fix reproductions (this exact defect, against the UNMODIFIED
+# pre-Task-2 code) are recorded verbatim — command and output — in
+# task-2-report.md, matching this file's established convention (see the TG
+# section's own header comment above): these tests assert only the FIXED
+# behavior, with mutation checks (also in the report) standing in for "does
+# this test even fail without the fix".
+# ----------------------------------------------------------------------------
+
+# --- TR1 (Step 1): a permanently blank screen never reports ready, and the
+# gate POLLS (calls `orca terminal read` more than once) rather than
+# answering from a single snapshot. ---
+tr1_dir="$tmpdir/tr1"
+mkdir -p "$tr1_dir/bin"
+tr1_calls="$tr1_dir/read-calls.log"
+: > "$tr1_calls"
+cat > "$tr1_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal read")
+    echo call >> "$tr1_calls"
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_tr1","status":"running","tail":[]}}}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr1_dir/bin/orca"
+tr1_rc=0
+(
+  export PATH="$tr1_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=2
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  terminal_wait_ready term_tr1 claude
+) >"$tr1_dir/out.log" 2>"$tr1_dir/err.log" || tr1_rc=$?
+assert TR1_not_ready "[[ \"$tr1_rc\" -ne 0 ]]"
+assert TR1_polled_multiple_times "[[ \"\$(wc -l < \"$tr1_calls\" | tr -d ' ')\" -ge 2 ]]"
+assert TR1_reports_blank "grep -qi 'blank screen' \"$tr1_dir/err.log\""
+assert TR1_reports_screen_section "grep -q 'screen (most recent)' \"$tr1_dir/err.log\""
+
+# --- TR2 (Step 2): a first-run menu (grok, no prompt yet) reports not-ready
+# and the message NAMES the marker it matched. ---
+tr2_dir="$tmpdir/tr2"
+mkdir -p "$tr2_dir/bin"
+cat > "$tr2_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr2","status":"running","tail":["splash art placeholder","New worktree","Resume session","Changelog","Quit"]}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr2_dir/bin/orca"
+tr2_rc=0
+tr2_err="$(
+  export PATH="$tr2_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=1
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  terminal_wait_ready term_tr2 grok 2>&1
+)" || tr2_rc=$?
+assert TR2_not_ready "[[ \"$tr2_rc\" -ne 0 ]]"
+assert TR2_names_marker "printf '%s' \"\$tr2_err\" | grep -qF \"matched not-ready marker 'New worktree'\""
+
+# --- TR3 (Step 3 + self-review "can a genuinely ready terminal be
+# misjudged"): each CLI's captured READY appearance is classified READY.
+# TR3e is the grok menu-vs-prompt decision exercised directly: the menu text
+# is present in the SAME tail as a working prompt (the observed-data table's
+# own "may sit below a first-run menu" note), and must still classify READY
+# — this is the concrete proof behind the design decision documented at
+# _terminal_ready_check's positive-check-before-negative-check comment. ---
+# Direct classifier calls below use per-case one-shot stubs; each gets its
+# own tmpdir to avoid PATH/stub bleed between assertions.
+tr3_claude_dir="$tmpdir/tr3-claude"; mkdir -p "$tr3_claude_dir/bin"
+cat > "$tr3_claude_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["❯ ","some-project · bypass permissions on · 28%"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_claude_dir/bin/orca"
+tr3_claude_out="$(export PATH="$tr3_claude_dir/bin:$PATH"; _terminal_ready_check term_tr3 claude)"
+assert TR3a_claude_ready "printf '%s\n' \"\$tr3_claude_out\" | head -n1 | grep -qx READY"
+
+tr3_grok_dir="$tmpdir/tr3-grok"; mkdir -p "$tr3_grok_dir/bin"
+cat > "$tr3_grok_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["❯ "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_grok_dir/bin/orca"
+tr3_grok_out="$(export PATH="$tr3_grok_dir/bin:$PATH"; _terminal_ready_check term_tr3 grok)"
+assert TR3b_grok_clean_ready "printf '%s\n' \"\$tr3_grok_out\" | head -n1 | grep -qx READY"
+
+tr3_grokmenu_dir="$tmpdir/tr3-grokmenu"; mkdir -p "$tr3_grokmenu_dir/bin"
+cat > "$tr3_grokmenu_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["New worktree","Resume session","Changelog","Quit","❯ "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_grokmenu_dir/bin/orca"
+tr3_grokmenu_out="$(export PATH="$tr3_grokmenu_dir/bin:$PATH"; _terminal_ready_check term_tr3 grok)"
+assert TR3c_grok_menu_plus_prompt_still_ready \
+  "printf '%s\n' \"\$tr3_grokmenu_out\" | head -n1 | grep -qx READY"
+
+tr3_agy_dir="$tmpdir/tr3-agy"; mkdir -p "$tr3_agy_dir/bin"
+cat > "$tr3_agy_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["Antigravity CLI","> "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_agy_dir/bin/orca"
+tr3_agy_out="$(export PATH="$tr3_agy_dir/bin:$PATH"; _terminal_ready_check term_tr3 antigravity)"
+assert TR3d_antigravity_ready "printf '%s\n' \"\$tr3_agy_out\" | head -n1 | grep -qx READY"
+
+# TR3f/TR3g (advisor-review hardening): the antigravity pattern's "fresh
+# boot" half (banner + any prompt line) is what TR3d above proves. Its
+# "warm terminal" half is a SEPARATE code path (banner absent) that no
+# fresh-creation fixture can exercise — orca-dispatch-role.sh's own gate
+# runs against exactly this shape on ordinary dispatch to a reused, already-
+# running ui/fallback terminal whose one-time boot banner may be long gone
+# from the current screen. TR3f proves a trailing '>' prompt with no banner
+# still classifies READY (the fix); TR3g proves this is a PRECISE fix, not
+# a blanket "any '>' anywhere" relaxation — a markdown-blockquote-shaped
+# '>' line that is NOT the terminal's current last line must NOT satisfy
+# it, or an agent mid-response quoting something would be misread as idle.
+tr3_agywarm_dir="$tmpdir/tr3-agywarm"; mkdir -p "$tr3_agywarm_dir/bin"
+cat > "$tr3_agywarm_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["some earlier response content, banner long scrolled off","> "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_agywarm_dir/bin/orca"
+tr3_agywarm_out="$(export PATH="$tr3_agywarm_dir/bin:$PATH"; _terminal_ready_check term_tr3 antigravity)"
+assert TR3f_antigravity_warm_no_banner_still_ready \
+  "printf '%s\n' \"\$tr3_agywarm_out\" | head -n1 | grep -qx READY"
+
+tr3_agyblockquote_dir="$tmpdir/tr3-agyblockquote"; mkdir -p "$tr3_agyblockquote_dir/bin"
+cat > "$tr3_agyblockquote_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["> this looks like a quoted line but is NOT the current prompt","still generating more response content after it, banner long gone"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_agyblockquote_dir/bin/orca"
+tr3_agyblockquote_out="$(export PATH="$tr3_agyblockquote_dir/bin:$PATH"; _terminal_ready_check term_tr3 antigravity)"
+assert TR3g_antigravity_blockquote_not_last_line_not_ready \
+  "printf '%s\n' \"\$tr3_agyblockquote_out\" | head -n1 | grep -q NOT_READY"
+
+tr3_codex_dir="$tmpdir/tr3-codex"; mkdir -p "$tr3_codex_dir/bin"
+cat > "$tr3_codex_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr3","status":"running","tail":["codex> some ordinary non-blank output"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr3_codex_dir/bin/orca"
+tr3_codex_out="$(export PATH="$tr3_codex_dir/bin:$PATH"; _terminal_ready_check term_tr3 codex)"
+assert TR3e_codex_no_known_pattern_still_ready \
+  "printf '%s\n' \"\$tr3_codex_out\" | head -n1 | grep -qx READY"
+
+# --- TR4 (Step 4): a screen that becomes ready PARTWAY through the polling
+# window is caught — the gate must not latch its first (not-ready) verdict.
+# A call-count stub returns blank for the first two reads, then a ready
+# claude screen from the third read onward. ---
+tr4_dir="$tmpdir/tr4"
+mkdir -p "$tr4_dir/bin"
+tr4_counter="$tr4_dir/counter"
+echo 0 > "$tr4_counter"
+cat > "$tr4_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal read")
+    n=\$(cat "$tr4_counter")
+    n=\$((n + 1))
+    echo "\$n" > "$tr4_counter"
+    if [[ "\$n" -lt 3 ]]; then
+      echo '{"ok":true,"result":{"terminal":{"handle":"term_tr4","status":"running","tail":[]}}}'
+    else
+      echo '{"ok":true,"result":{"terminal":{"handle":"term_tr4","status":"running","tail":["❯ ","bypass permissions on"]}}}'
+    fi
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr4_dir/bin/orca"
+tr4_rc=0
+(
+  export PATH="$tr4_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=6
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  terminal_wait_ready term_tr4 claude
+) >"$tr4_dir/out.log" 2>"$tr4_dir/err.log" || tr4_rc=$?
+assert TR4_eventually_ready "[[ \"$tr4_rc\" -eq 0 ]]"
+assert TR4_not_latched_to_first_verdict "[[ \"\$(cat \"$tr4_counter\")\" -ge 3 ]]"
+
+# --- TR5: the minimum-elapsed-time FLOOR is enforced even when content is
+# ready from the very first poll — defense in depth against a positive
+# pattern matching too early (the composition's 3rd independent signal). ---
+tr5_dir="$tmpdir/tr5"
+mkdir -p "$tr5_dir/bin"
+cat > "$tr5_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr5","status":"running","tail":["❯ ","bypass permissions on"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr5_dir/bin/orca"
+tr5_start=$(date +%s)
+tr5_rc=0
+(
+  export PATH="$tr5_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=10
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  not_before=$(( $(date +%s) + 2 ))
+  terminal_wait_ready term_tr5 claude "$not_before"
+) || tr5_rc=$?
+tr5_end=$(date +%s)
+tr5_elapsed=$((tr5_end - tr5_start))
+assert TR5_gate_eventually_passes "[[ \"$tr5_rc\" -eq 0 ]]"
+assert TR5_floor_enforced "[[ \"$tr5_elapsed\" -ge 2 ]]"
+
+# --- TR6 (self-review "can a booting terminal be misjudged ready", and
+# per-CLI NOT-READY appearances): a claude trust dialog, a claude theme
+# dialog, an exited terminal (codex's observed pre-fix failure mode), and an
+# UNRECOGNIZED future status string (must NOT veto — never fail on a signal
+# we don't understand) are each classified correctly. ---
+tr6_trust_dir="$tmpdir/tr6-trust"; mkdir -p "$tr6_trust_dir/bin"
+cat > "$tr6_trust_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"running","tail":["Do you trust the files in this folder?","❯ 1. Yes, proceed"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr6_trust_dir/bin/orca"
+tr6_trust_out="$(export PATH="$tr6_trust_dir/bin:$PATH"; _terminal_ready_check term_tr6 claude)"
+assert TR6a_trust_dialog_not_ready "printf '%s\n' \"\$tr6_trust_out\" | head -n1 | grep -q NOT_READY"
+assert TR6a_trust_dialog_names_marker \
+  "printf '%s\n' \"\$tr6_trust_out\" | head -n1 | grep -qF 'Do you trust the files in this folder'"
+
+tr6_theme_dir="$tmpdir/tr6-theme"; mkdir -p "$tr6_theme_dir/bin"
+cat > "$tr6_theme_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"running","tail":["Select a theme:","❯ Dark mode"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr6_theme_dir/bin/orca"
+tr6_theme_out="$(export PATH="$tr6_theme_dir/bin:$PATH"; _terminal_ready_check term_tr6 claude)"
+assert TR6b_theme_dialog_not_ready "printf '%s\n' \"\$tr6_theme_out\" | head -n1 | grep -q NOT_READY"
+
+tr6_exited_dir="$tmpdir/tr6-exited"; mkdir -p "$tr6_exited_dir/bin"
+cat > "$tr6_exited_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"exited","tail":["some final output before the process quit"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr6_exited_dir/bin/orca"
+tr6_exited_out="$(export PATH="$tr6_exited_dir/bin:$PATH"; _terminal_ready_check term_tr6 codex)"
+assert TR6c_exited_status_not_ready "printf '%s\n' \"\$tr6_exited_out\" | head -n1 | grep -q NOT_READY"
+assert TR6c_exited_status_named "printf '%s\n' \"\$tr6_exited_out\" | head -n1 | grep -qi 'status='"
+
+tr6_unknownstatus_dir="$tmpdir/tr6-unknownstatus"; mkdir -p "$tr6_unknownstatus_dir/bin"
+cat > "$tr6_unknownstatus_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"some-future-state-nobody-documented","tail":["❯ ","bypass permissions on"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr6_unknownstatus_dir/bin/orca"
+tr6_unknownstatus_out="$(export PATH="$tr6_unknownstatus_dir/bin:$PATH"; _terminal_ready_check term_tr6 claude)"
+assert TR6d_unrecognized_status_does_not_veto \
+  "printf '%s\n' \"\$tr6_unknownstatus_out\" | head -n1 | grep -qx READY"
+
+# --- TR7 (Step 6): debater_* roles get a HARD marker gate with retries;
+# the six pre-existing roles keep the pre-Task-2 soft/informational check,
+# unchanged. Same stub for both — never contains the "ROLE=..." marker,
+# simulating a seed that landed somewhere the marker never rendered. ---
+tr7_dir="$tmpdir/tr7"
+mkdir -p "$tr7_dir/bin"
+tr7_read_calls="$tr7_dir/read-calls.log"
+cat > "$tr7_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal send") echo '{"ok":true,"result":{"send":{"handle":"term_tr7","accepted":true}}}' ;;
+  "terminal read")
+    echo call >> "$tr7_read_calls"
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_tr7","tail":["some unrelated content, never the seed marker"]}}}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr7_dir/bin/orca"
+
+: > "$tr7_read_calls"
+tr7a_rc=0
+tr7a_err="$(
+  export PATH="$tr7_dir/bin:$PATH"
+  seed term_tr7 debater_claude claude-opus-5 "fallback body" 2>&1
+)" || tr7a_rc=$?
+assert TR7a_debater_hard_fails "[[ \"$tr7a_rc\" -ne 0 ]]"
+assert TR7a_debater_message "printf '%s' \"\$tr7a_err\" | grep -q 'HARD FAIL'"
+assert TR7a_debater_retried "[[ \"\$(wc -l < \"$tr7_read_calls\" | tr -d ' ')\" -ge 2 ]]"
+
+: > "$tr7_read_calls"
+tr7b_rc=0
+tr7b_err="$(
+  export PATH="$tr7_dir/bin:$PATH"
+  seed term_tr7 architect claude-opus-5 "fallback body" 2>&1
+)" || tr7b_rc=$?
+assert TR7b_nondebater_soft_succeeds "[[ \"$tr7b_rc\" -eq 0 ]]"
+assert TR7b_nondebater_info_only "printf '%s' \"\$tr7b_err\" | grep -q '(info)'"
+assert TR7b_nondebater_not_retried "[[ \"\$(wc -l < \"$tr7_read_calls\" | tr -d ' ')\" -eq 1 ]]"
+
+# --- TR8 (Step 5, persistent post-fix regression coverage — the pre-fix
+# reproduction proving the OLD code seeds/injects into these same fixtures
+# is recorded, command and output, in task-2-report.md; see this section's
+# own header comment for why it is not re-embedded as a git-pinned test
+# here): ensure_terminal refuses to seed, and orca-dispatch-role.sh refuses
+# to inject, into a not-ready (permanently blank) terminal. ---
+
+# TR8a: ensure_terminal (fresh creation path — exercises its OWN gate,
+# before seed).
+tr8a_dir="$tmpdir/tr8a"
+mkdir -p "$tr8a_dir/bin" "$tr8a_dir/orch"
+cat > "$tr8a_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal create") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr8a"}}}' ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send") touch "$tr8a_dir/send-was-called"; echo '{"ok":true,"result":{"send":{"handle":"term_tr8a","accepted":true}}}' ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr8a","status":"running","tail":[]}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr8a_dir/bin/orca"
+tr8a_rc=0
+(
+  export PATH="$tr8a_dir/bin:$PATH"
+  WORKTREE=active
+  ORCH="$tr8a_dir/orch"
+  HANDLES_FILE="$ORCH/handles.json"
+  ensure_terminal architect
+) >"$tr8a_dir/out.log" 2>"$tr8a_dir/err.log" || tr8a_rc=$?
+assert TR8a_ensure_terminal_refuses "[[ \"$tr8a_rc\" -ne 0 ]]"
+assert TR8a_seed_never_called "[[ ! -f \"$tr8a_dir/send-was-called\" ]]"
+assert TR8a_reports_screen "grep -q 'never became ready' \"$tr8a_dir/err.log\""
+assert TR8a_handle_stays_recorded_for_retry \
+  "grep -q term_tr8a \"$tr8a_dir/orch/handles.json\""
+
+# TR8b: orca-dispatch-role.sh's OWN gate before --inject, isolated from
+# ensure_terminal's gate above by using an ALREADY-live handle (case
+# live_rc==0 returns immediately without seeding at all) — so this proves
+# the second, independent gate, not a repeat of TR8a.
+tr8b_dir="$tmpdir/tr8b"
+mkdir -p "$tr8b_dir/scripts" "$tr8b_dir/bin"
+cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tr8b_dir/scripts/"
+cat > "$tr8b_dir/handles.json" <<'JSON'
+{"version":1,"worktree":"active","roles":{"architect":{"handle":"term_tr8b_existing"}},"architect":"term_tr8b_existing"}
+JSON
+cat > "$tr8b_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_tr8b_existing","connected":true}]}}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr8b_existing","status":"running","tail":[]}}}' ;;
+  "orchestration task-create") echo '{"ok":true,"result":{"task":{"id":"task_tr8b"}}}' ;;
+  "orchestration dispatch") touch "$tr8b_dir/inject-was-called"; echo '{"ok":true,"result":{"dispatch":{"id":"disp_tr8b"}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr8b_dir/bin/orca"
+tr8b_rc=0
+(
+  export PATH="$tr8b_dir/bin:$PATH"
+  cd "$tr8b_dir"
+  ./scripts/orca-dispatch-role.sh architect --spec "irrelevant" --no-reap
+) >"$tr8b_dir/out.log" 2>"$tr8b_dir/err.log" || tr8b_rc=$?
+assert TR8b_dispatch_refuses_inject "[[ \"$tr8b_rc\" -ne 0 ]]"
+assert TR8b_inject_never_called "[[ ! -f \"$tr8b_dir/inject-was-called\" ]]"
+assert TR8b_reports_screen "grep -q 'never showed a ready screen' \"$tr8b_dir/err.log\""
 
 echo
 echo "Results: $pass passed, $fail failed"

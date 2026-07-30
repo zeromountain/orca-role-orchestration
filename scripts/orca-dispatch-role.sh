@@ -161,6 +161,22 @@ echo "task_id=$TASK_ID"
 echo "Waiting for worker tui-idle…"
 orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
 
+# Gate (Task 2): confirm the worker's actual screen, not tui-idle alone,
+# before injecting — tui-idle reports success on a terminal that simply
+# never finished booting (the defect this task fixes). No elapsed-time
+# floor is passed here (unlike ensure_terminal's own gate before seeding
+# above): this call site does not know a genuine creation timestamp for
+# $HANDLE (it may have just been created moments ago by ensure_terminal,
+# which already applied that floor once before seeding, or it may be a
+# long-warm terminal from a prior dispatch), and re-flooring from "now" on
+# every ordinary dispatch would add pure, unrequested latency to the six
+# pre-existing roles' hot path for no safety benefit.
+AGENT_CLI="$(role_meta "$ROLE" | cut -f3)"
+if ! terminal_wait_ready "$HANDLE" "$AGENT_CLI"; then
+  echo "orca-dispatch-role.sh: $HANDLE for role=$ROLE never showed a ready screen — refusing to inject. task_id=$TASK_ID was already created and is now stranded undispatched; re-run once the terminal is confirmed ready, or clear its screen by hand if it is sitting on a first-run prompt (see the screen dump above)." >&2
+  exit 1
+fi
+
 echo "Dispatching (inject)…"
 DISPATCH_JSON="$(orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json)"
 printf '%s\n' "$DISPATCH_JSON"
