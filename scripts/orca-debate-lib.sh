@@ -508,21 +508,54 @@ debate_watchdog_start() {
 }
 
 debate_watchdog_stop() {
-  # $1=watchdog_pid_file $2=lock_file
+  # $1=watchdog_pid_file
   # Stops the watchdog (SIGTERM — its own trap exits without touching
   # anything, since a driver reaching this point is exiting deliberately,
-  # whether or not it chooses to close tabs itself right after) and removes
-  # the lock. Idempotent and safe to call even when nothing was ever
-  # started (e.g. --dry-run never calls debate_watchdog_start, so both
-  # files below are simply absent and every step here is a guarded no-op).
-  local pid_file="$1" lock_file="$2" wpid
+  # whether or not it chooses to close tabs itself right after). Idempotent
+  # and safe to call even when nothing was ever started (e.g. --dry-run
+  # never calls debate_watchdog_start, so the pid file is simply absent and
+  # every step here is a guarded no-op).
+  #
+  # Task 3: no longer takes a lock_file argument and no longer removes the
+  # lock itself. Lock disposition (remove it outright once every close is
+  # confirmed, or leave it in place — forced stale — as a breadcrumb when
+  # one is not, via lock_leave_as_breadcrumb) is now the CALLER's decision,
+  # made only after it knows whether every close actually succeeded — see
+  # cleanup() in orca-debate.sh. Removing the lock HERE, unconditionally,
+  # before the caller's own closing loop even ran, was the exact bug this
+  # task fixes: a close that silently failed had its lock erased before the
+  # failure was even known, leaving orca-sweep-orphans.sh's stale-lock path
+  # (the only detector for this class of orphan) nothing to find.
+  #
+  # Waits (bounded, up to 3s) for the watchdog process to actually exit
+  # before returning, not merely for the SIGTERM to be sent: this function
+  # always runs BEFORE the caller decides the lock's fate, and the
+  # watchdog's own last heartbeat refresh (lock_merge_and_refresh, run
+  # inside its own main loop or the start of its close phase) writes
+  # heartbeatAt/handles via a read-then-atomic-replace that could otherwise
+  # race a SUBSEQUENT lock_leave_as_breadcrumb call from this same caller —
+  # if the watchdog's write lands AFTER the breadcrumb's ttl-forcing write,
+  # the breadcrumb would look "fresh" again for up to a full ttlSeconds. A
+  # bounded wait for the watchdog's own process to exit (its SIGTERM
+  # handler is a bare `exit 0`, no further work once it fires) closes this
+  # window deterministically instead of hoping the timing works out. In the
+  # ordinary case this resolves almost immediately (bounded by
+  # sleep_interruptible's ~1s chunk size in the watchdog's own poll loop,
+  # see orca-sweep-orphans.sh) — the 3s ceiling only matters if SIGTERM
+  # somehow does not land at all, in which case this function still returns
+  # rather than hanging the driver's own exit.
+  local pid_file="$1" wpid waited
   if [[ -f "$pid_file" ]]; then
     wpid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
       kill -TERM "$wpid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$wpid" 2>/dev/null && [[ "$waited" -lt 3000 ]]; do
+        sleep 0.1
+        waited=$((waited + 100))
+      done
       echo "debate_watchdog_stop: stopped watchdog pid=$wpid" >&2
     fi
     rm -f "$pid_file"
   fi
-  lock_remove "$lock_file"
 }

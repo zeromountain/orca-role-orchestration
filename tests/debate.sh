@@ -1923,17 +1923,26 @@ assert W1_lock_created "[[ -f \"$w1_lock_file\" ]]"
 # parsing args) startup and reached its steady-state poll loop, THEN give
 # it a beat more to clear one loop iteration's synchronous work (pid
 # compare, kill -0, lock_merge_and_refresh) and actually enter its sleep.
-# Without this, debate_watchdog_stop's lock_remove can race the watchdog's
-# own still-starting-up first loop check and let it exit via "lock file
-# gone" instead of via the SIGTERM this block exists to test — a real gap
-# found empirically: an earlier draft of this test called
-# debate_watchdog_stop immediately after fork, and a mutation that
-# disabled SIGTERM entirely still passed, because the lock-file-gone path
-# papered over it.
+# Calling debate_watchdog_stop before the trap is even registered would
+# let bash's DEFAULT (untrapped) SIGTERM handling kill the process instead
+# of its own custom handler — this block exists to prove the CUSTOM
+# handler exits promptly, not that some signal, any signal, eventually
+# kills it. A real gap found empirically with an earlier draft of this
+# test: calling debate_watchdog_stop immediately after fork let a mutation
+# that disabled the custom SIGTERM trap entirely still pass, because the
+# watchdog died from the default disposition before ever reaching `trap …
+# TERM`, papering over the very regression this test exists to catch.
 wait_for 3000 "grep -q 'watching owner pid=' \"${w1_lock_file%.json}.watchdog.log\" 2>/dev/null" || true
 sleep 1
 
-debate_watchdog_stop "$w1_pidfile" "$w1_lock_file"
+# Task 3: debate_watchdog_stop no longer removes the lock itself (that
+# split is the actual Part A fix — see its own comment in
+# orca-debate-lib.sh and cleanup()'s in orca-debate.sh). This test's own
+# explicit lock_remove right after mirrors exactly what cleanup() does in
+# the all-succeeded case, so W1_lock_removed below still proves the same
+# thing a normal, fully-successful debate exit does.
+debate_watchdog_stop "$w1_pidfile"
+lock_remove "$w1_lock_file"
 
 # A working SIGTERM handler exits promptly — bounded to roughly
 # sleep_interruptible's 1s chunk size (see orca-sweep-orphans.sh), not the
@@ -2276,15 +2285,119 @@ Q_LOCKS_DIR="$q_root/debate-locks"
 
 q_bin="$tmpdir/q-bin"
 mkdir -p "$q_bin"
+# Task 3, Part A: orca-debate.sh's new preflight calls ensure_terminal
+# directly (a bash FUNCTION in orca-roles-lib.sh, not swappable via the
+# ORCA_TEST_DISPATCH seam, which only replaces orca-dispatch-role.sh) for
+# every debater, for every non-dry-run driver test in this file (Q/Z/ZC
+# below all share this stub) — so it must be a real, ensure_terminal-
+# capable stub now, not just `status --json` plus a bare-`{"ok":true}`
+# wildcard. Built once, driven entirely by env vars so every block below
+# can reuse the identical script:
+#   Q_STATE_DIR       (required) persistent state: a monotonic per-title
+#                      creation counter, a handle->title log (for
+#                      "terminal list"/"terminal close" below), and the
+#                      closed-handles marker.
+#   Q_UNREADY_TITLE    (optional) a role's title (role_meta's first field,
+#                      e.g. "debate-sol") whose terminal never shows a
+#                      ready screen — for the preflight-abort tests.
+#   Q_STUCK_TITLE      (optional) a role's title whose handle, once
+#                      "closed", is NEVER actually removed from "terminal
+#                      list" — simulating a close that never verifies, for
+#                      the cleanup-breadcrumb test.
+# Handles are derived from --title plus a counter (never a bare
+# `term_<title>`) specifically so a FRESH creation later in the same test
+# run (e.g. Z1 recreating a handle Q's own cleanup already closed) never
+# collides with an earlier, already-closed handle string of the same
+# title — matching how a real `orca terminal create` always hands back a
+# fresh, effectively-unique handle, and avoiding exactly the kind of
+# order-dependent flake a purely title-derived handle would introduce
+# across the several driver blocks (Q, Z, ZC) that all share this one
+# stub, this one $q_root, and therefore this one handles.json.
 cat > "$q_bin/orca" <<'ORCASTUB'
 #!/usr/bin/env bash
+state="${Q_STATE_DIR:?Q_STATE_DIR must be set}"
+mkdir -p "$state"
+closed_marker="$state/closed.log"
+counter_file="$state/create-counter"
+titles_log="$state/handle-by-title.log"
+
 case "$1 $2" in
   "status --json") echo '{"ok":true,"reachable": true}' ;;
+  "terminal create")
+    title=""
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--title" ]]; then title="$a"; fi
+      prev="$a"
+    done
+    n=0
+    [[ -f "$counter_file" ]] && n="$(cat "$counter_file")"
+    n=$((n + 1))
+    echo "$n" > "$counter_file"
+    handle="term_${title}_${n}"
+    echo "$title $handle" >> "$titles_log"
+    if [[ -n "${Q_UNREADY_TITLE:-}" && "$title" == "$Q_UNREADY_TITLE" ]]; then
+      echo "$handle" > "$state/unready-handle"
+    fi
+    echo "{\"ok\":true,\"result\":{\"terminal\":{\"handle\":\"$handle\"}}}"
+    ;;
+  "terminal rename") echo '{"ok":true}' ;;
+  "terminal wait") echo '{"ok":true}' ;;
+  "terminal send") echo '{"ok":true,"result":{"send":{"accepted":true}}}' ;;
+  "terminal read")
+    term=""
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then term="$a"; fi
+      prev="$a"
+    done
+    unready="$(cat "$state/unready-handle" 2>/dev/null || true)"
+    if [[ -n "$unready" && "$term" == "$unready" ]]; then
+      echo "{\"ok\":true,\"result\":{\"terminal\":{\"handle\":\"$term\",\"status\":\"running\",\"tail\":[]}}}"
+    else
+      # One tail satisfying every CLI's positive readiness pattern AND
+      # every debater's hard "ROLE=debater_X" marker gate at once: "❯ " +
+      # "bypass permissions on" (claude), "❯ " alone (grok), no known
+      # positive pattern needed (codex — just non-blank, no bad markers),
+      # and a trailing bare ">" as the terminal's last line (antigravity's
+      # "warm, no banner" case — see _terminal_ready_check's own comment).
+      echo "{\"ok\":true,\"result\":{\"terminal\":{\"handle\":\"$term\",\"status\":\"running\",\"tail\":[\"❯ \",\"bypass permissions on\",\"ROLE=debater_claude\",\"ROLE=debater_codex\",\"ROLE=debater_grok\",\"ROLE=debater_gemini\",\">\"]}}}"
+    fi
+    ;;
+  "terminal list")
+    entries=""
+    if [[ -f "$titles_log" ]]; then
+      while read -r log_title log_handle; do
+        [[ -z "$log_handle" ]] && continue
+        include=1
+        if grep -qx "$log_handle" "$closed_marker" 2>/dev/null; then
+          include=0
+          if [[ -n "${Q_STUCK_TITLE:-}" && "$log_title" == "$Q_STUCK_TITLE" ]]; then
+            include=1
+          fi
+        fi
+        if [[ "$include" -eq 1 ]]; then
+          entries="${entries}${entries:+,}{\"handle\":\"$log_handle\",\"connected\":true}"
+        fi
+      done < "$titles_log"
+    fi
+    echo "{\"ok\":true,\"result\":{\"terminals\":[$entries]}}"
+    ;;
+  "terminal close")
+    prev=""
+    for a in "$@"; do
+      if [[ "$prev" == "--terminal" ]]; then echo "$a" >> "$closed_marker"; fi
+      prev="$a"
+    done
+    echo '{"ok":true}'
+    ;;
   *) echo '{"ok":true}' ;;
 esac
 exit 0
 ORCASTUB
 chmod +x "$q_bin/orca"
+export Q_STATE_DIR="$q_root/stub-state"
+mkdir -p "$Q_STATE_DIR"
 # Stub the debater CLIs themselves so preflight's `command -v` checks are
 # deterministic rather than depending on what happens to be installed on
 # the machine running this suite (a real, pre-existing gap the F-series
@@ -2366,6 +2479,137 @@ assert Q6_watchdog_process_exits_after_normal_run "[[ \"$q_watchdog_gone\" -eq 1
 assert Q7_dispatch_saw_persist "grep -q 'persist=1' \"$q_dispatch_log\""
 assert Q8_dispatch_saw_real_lock_file "! grep -q 'lockfile=<unset>' \"$q_dispatch_log\""
 assert Q8_dispatch_lock_file_matches "grep -q \"lockfile=$Q_LOCKS_DIR/qwiring.json\" \"$q_dispatch_log\""
+
+# ----------------------------------------------------------------------------
+# PF-series (Task 3, Part A — brief Steps 1-3): the preflight itself, through
+# the REAL orca-debate.sh, reusing the Q-series' already-sandboxed q_scripts/
+# q_bin/Q_STATE_DIR/Q_LOCKS_DIR. orca-debate.sh's own $ORCH (and therefore
+# handles.json, debate-locks/, terminal-journal.jsonl) is always relative to
+# q_scripts' own location — fixed, never overridable via --dir-root — so
+# these reuse the exact same Q_STATE_DIR/handles.json/locks-dir the Q-series
+# above already established rather than inventing separate ones; only
+# --dir-root and --slug change per sub-test, to keep debate OUTPUT isolated.
+# ----------------------------------------------------------------------------
+
+# --- PF1 (Step 1): one seat (debater_codex, title "debate-sol") stubbed via
+# Q_UNREADY_TITLE to NEVER show a ready screen. The driver must abort BEFORE
+# any task-create — proven by never printing orca-debate.sh's own "=== ROUND
+# 1" marker (round 1 is what actually calls the dispatcher that would
+# task-create; "Creating task" itself is a message the REAL
+# orca-dispatch-role.sh prints, which ORCA_TEST_DISPATCH bypasses entirely
+# here, so it is never a meaningful signal against this stub either way) —
+# name the broken seat, and show its screen (terminal_wait_ready's own
+# failure dump,
+# on stderr, folded into $pf1_out by 2>&1 below). ---
+pf1_root="$tmpdir/pf1-debates"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+export Q_UNREADY_TITLE="debate-sol"
+pf1_rc=0
+pf1_out="$("$Q_DRIVER" --topic "preflight should catch a broken seat" --slug pf1slug --rounds 1 \
+  --dir-root "$pf1_root" --lock-ttl-seconds 1800 2>&1)" || pf1_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB Q_UNREADY_TITLE
+export PATH="$Q_OLD_PATH"
+
+assert PF1_aborts_nonzero "[[ \"$pf1_rc\" -ne 0 ]]"
+assert PF1_never_creates_a_task "! printf '%s' \"\$pf1_out\" | grep -q '=== ROUND'"
+assert PF1_names_broken_seat "printf '%s' \"\$pf1_out\" | grep -q 'debater_codex'"
+assert PF1_shows_screen "printf '%s' \"\$pf1_out\" | grep -qi 'never became ready'"
+assert PF1_no_round_dir "[[ ! -d \"$pf1_root/pf1slug/round-1\" ]]"
+
+# --- PF2 (Step 2): with every seat ready (no Q_UNREADY_TITLE/Q_STUCK_TITLE
+# set — the Q-series' own default stub behavior), the driver proceeds
+# exactly as today: preflight passes, task-create fires, the round
+# completes. Q1 above already proves the end-to-end "everyone ready" path
+# through this exact stub; this adds the preflight's own messages, which Q1
+# never checked for. ---
+pf2_root="$tmpdir/pf2-debates"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+pf2_rc=0
+pf2_out="$("$Q_DRIVER" --topic "preflight should not block a healthy roster" --slug pf2slug --rounds 1 \
+  --dir-root "$pf2_root" --lock-ttl-seconds 1800 2>&1)" || pf2_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Q_OLD_PATH"
+
+assert PF2_run_exits_ok "[[ \"$pf2_rc\" -eq 0 ]]"
+assert PF2_preflight_passed "printf '%s' \"\$pf2_out\" | grep -q 'preflight: all 4 debater'"
+# "Creating task" itself is a message the REAL orca-dispatch-role.sh
+# prints, bypassed here by ORCA_TEST_DISPATCH — "=== ROUND 1" is
+# orca-debate.sh's own marker for "the round loop (which is what calls the
+# dispatcher) actually started", the dispatcher-implementation-independent
+# signal PF1 above also relies on.
+assert PF2_dispatches_normally "printf '%s' \"\$pf2_out\" | grep -q '=== ROUND 1'"
+assert PF2_round_produced_output "[[ -d \"$pf2_root/pf2slug/round-1\" ]]"
+
+# --- BC1 (Step 3): one seat (debater_codex again)'s CLOSE never verifies
+# (Q_STUCK_TITLE — "terminal list" reports it connected no matter how many
+# times "terminal close" is called against it). cleanup() must report the
+# failure, leave the lock file in place FORCED STALE (not merely
+# un-removed — see lock_leave_as_breadcrumb's own comment for why), and a
+# subsequent sweep run must report that exact handle as a candidate. ---
+bc1_root="$tmpdir/bc1-debates"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+export Q_STUCK_TITLE="debate-sol"
+bc1_rc=0
+bc1_out="$("$Q_DRIVER" --topic "cleanup must verify its closes" --slug bc1slug --rounds 1 \
+  --dir-root "$bc1_root" --lock-ttl-seconds 1800 2>&1)" || bc1_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Q_OLD_PATH"
+# Q_STUCK_TITLE stays set past the driver's own exit, through the sweep
+# verification below — the whole point of "stuck" is that the terminal is
+# STILL actually live in reality; unsetting it before the sweep check would
+# make the stub itself pretend the close suddenly succeeded the moment
+# nobody but the sweeper was looking, which is exactly backwards.
+
+bc1_lock_file="$Q_LOCKS_DIR/bc1slug.json"
+# The lock's own "handles" array carries all 4 debaters (round 1 registers
+# every one), so grep the stub's OWN handle-by-title log for the actual
+# handle string BC1 itself created for the stuck title — the most recent
+# creation for "debate-sol" at this point in the suite's run is exactly the
+# one this run got stuck on (any earlier PF1/PF2/Q1 handle for the same
+# title was already closed by ITS OWN cleanup, forcing ensure_terminal to
+# recreate here) — rather than a looser "some handle, some candidate" check
+# that could pass even if BC1's own mechanism were broken.
+# `|| true` guards the same masking gotcha documented repeatedly elsewhere
+# in this file: a bare (non-`local`) assignment does NOT swallow a failing
+# right-hand side under this file's `set -euo pipefail` — unlike
+# handle-by-title.log missing entirely (e.g. under a mutation that disables
+# preflight so nothing ever calls "terminal create"), which would abort the
+# WHOLE suite here rather than just this assertion. BC1_stuck_handle_captured
+# right below is what actually verifies this resolved to something real.
+bc1_stuck_handle="$(grep '^debate-sol ' "$Q_STATE_DIR/handle-by-title.log" 2>/dev/null | tail -1 | awk '{print $2}')" || true
+
+assert BC1_driver_still_exits_ok "[[ \"$bc1_rc\" -eq 0 ]]"
+assert BC1_round_still_completed "[[ -d \"$bc1_root/bc1slug/round-1\" ]]"
+assert BC1_stuck_handle_captured "[[ -n \"$bc1_stuck_handle\" ]]"
+assert BC1_reports_close_failed "printf '%s' \"\$bc1_out\" | grep -q 'close FAILED for codex'"
+assert BC1_reports_breadcrumb_message "printf '%s' \"\$bc1_out\" | grep -qi 'breadcrumb'"
+assert BC1_lock_survives_cleanup "[[ -f \"$bc1_lock_file\" ]]"
+# Deliberately requires BOTH file existence AND staleness in one condition,
+# same reasoning as W7_breadcrumb_is_forced_stale above — `! lock_is_fresh`
+# alone is also (uselessly) true for a lock file that is simply GONE.
+assert BC1_lock_is_forced_stale \
+  "[[ -f \"$bc1_lock_file\" ]] && ! lock_is_fresh \"$bc1_lock_file\""
+
+# Step 3's own acceptance criterion: the sweeper subsequently reports that
+# exact handle as a candidate. Same q_root (ORCH, handles.json, locks-dir)
+# the driver itself just used — a bogus --journal/--handles-file path
+# keeps this call from depending on any OTHER fixture's journal state, since
+# the stale-lock candidate path needs neither.
+bc1_sweep_out="$(
+  export PATH="$q_bin:$PATH"
+  export Q_STUCK_TITLE="debate-sol"
+  "$SWEEP" --locks-dir "$Q_LOCKS_DIR" --orch-dir "$q_root" \
+    --journal "$q_root/no-such-journal-for-bc1.jsonl" --handles-file "$q_root/handles.json" 2>&1
+)"
+unset Q_STUCK_TITLE
+assert BC1_sweeper_reports_candidate \
+  "printf '%s' \"\$bc1_sweep_out\" | grep -q \"\$bc1_stuck_handle.*WOULD CLOSE\""
 
 # ============================================================================
 # Z-series: Task 3 (label-native anonymization) full lifecycle + concurrency

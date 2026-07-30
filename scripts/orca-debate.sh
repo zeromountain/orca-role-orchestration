@@ -23,6 +23,23 @@ source "$HERE/orca-roles-lib.sh"
 # shellcheck source=orca-debate-lib.sh
 source "$HERE/orca-debate-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
+# Task 3: needed before the preflight block below can call ensure_terminal
+# directly (create_role, orca-roles-lib.sh, does `orca terminal create
+# --worktree "$WORKTREE"`). Mirrors orca-dispatch-role.sh's own resolution
+# exactly (same default, same handles.json lookup) — this script never
+# needed WORKTREE before because it never created a terminal itself; every
+# debater terminal was created lazily, later, by orca-dispatch-role.sh
+# (called from orca-debate-round.sh). Under set -euo pipefail, calling
+# ensure_terminal with WORKTREE unset would abort on "unbound variable"
+# inside create_role's command substitution, misreporting every fresh
+# create as a generic "create_role failed".
+WORKTREE="active"
+WORKTREE="$(python3 - "$HANDLES_FILE" <<'PY' 2>/dev/null || echo active
+import json, sys
+with open(sys.argv[1]) as stream:
+    print(json.load(stream).get("worktree") or "active")
+PY
+)"
 
 TOPIC=""
 TOPIC_FILE=""
@@ -344,15 +361,24 @@ fi
 
 # --- close debater tabs on any exit ---
 cleanup() {
-  # Stop the watchdog and remove the lock FIRST, unconditionally — even
-  # under --keep-tabs. A driver reaching cleanup() is exiting deliberately;
-  # the dead-man's-switch concern (an owner that stops proving it is alive)
-  # is over regardless of whether tabs are being kept open on purpose for
-  # debugging. Doing this before the KEEP_TABS/DRY_RUN early return below,
-  # and before this function's own tab-closing loop, means the watchdog can
-  # never race this driver's own close attempts. debate_watchdog_stop is a
-  # guarded no-op when nothing was ever started (--dry-run).
-  debate_watchdog_stop "$WATCHDOG_PID_FILE" "$LOCK_FILE"
+  # Stop the watchdog FIRST, unconditionally — even under --keep-tabs. A
+  # driver reaching cleanup() is exiting deliberately; the dead-man's-switch
+  # concern (an owner that stops proving it is alive) is over regardless of
+  # whether tabs are being kept open on purpose for debugging.
+  # debate_watchdog_stop is a guarded no-op when nothing was ever started
+  # (--dry-run), and now (Task 3) ONLY stops the watchdog process — it no
+  # longer touches the lock file. That split is the actual Part A fix: the
+  # OLD debate_watchdog_stop removed the lock right here, unconditionally,
+  # BEFORE this function's own closing loop below had even run — so a
+  # close that silently failed had its lock erased before the failure was
+  # even known, leaving the sweeper's stale-lock path (the ONLY detector
+  # for a handle this driver believed it had handled — a debater's handle
+  # is tracked in handles.json permanently, so the journal-orphan path
+  # never catches it either) nothing to find. Observed live: a genuine
+  # orphan produced sweep's "candidates=0". The lock's fate is now decided
+  # at the BOTTOM of this function, once every close has actually been
+  # attempted and its real outcome is known.
+  debate_watchdog_stop "$WATCHDOG_PID_FILE"
 
   # Defensive, idempotent second release of the startup mutex (see the
   # explicit release right after debate_watchdog_start, and the temporary
@@ -370,6 +396,12 @@ cleanup() {
   fi
 
   if [[ "$KEEP_TABS" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
+    # Neither path ever attempts a close (tabs are deliberately left open,
+    # or nothing was ever created), so there is nothing "unconfirmed" —
+    # remove the lock unconditionally here, exactly as debate_watchdog_stop
+    # itself used to, so these two paths' behavior is byte-identical to
+    # before this task.
+    lock_remove "$LOCK_FILE"
     return 0
   fi
   local old="$IFS" short
@@ -379,15 +411,21 @@ cleanup() {
     roster+=("$short")
   done
   IFS="$old"
+  # Task 3, Part A: tracks whether EVERY debater's close was actually
+  # confirmed. A handle with no recorded value, or one claimed by a
+  # different still-active debate, is a legitimate no-op — neither counts
+  # against this. Only a real close attempt that comes back anything other
+  # than "confirmed gone" sets this, and it is what decides the lock's fate
+  # below (leave it as a breadcrumb vs. remove it outright).
+  local any_unconfirmed=0
   for short in "${roster[@]}"; do
     # ensure_terminal reuses a live role terminal globally, so a debater's
     # handle here can be the exact same underlying terminal a DIFFERENT,
     # still-running debate is depending on right now — this driver ending
     # normally is not evidence that handle is safe to close. Same check,
     # same reasoning, as the watchdog's own close-phase guard in
-    # orca-sweep-orphans.sh (our own lock was already removed by
-    # debate_watchdog_stop above, so this only ever matches an OTHER
-    # debate's lock).
+    # orca-sweep-orphans.sh (our own lock's fate hasn't been decided yet at
+    # this point, so this only ever matches an OTHER debate's lock).
     local role_key handle
     role_key="$(debate_role_key "$short")"
     handle="$(handles_get "$HANDLES_FILE" "$role_key" 2>/dev/null || true)"
@@ -395,17 +433,54 @@ cleanup() {
       echo "cleanup: leaving $short ($handle) alone — claimed by a different, still-active debate" >&2
       continue
     fi
-    # Outcomes are observable (not silenced to /dev/null) — a driver that
-    # cannot see why a close failed cannot diagnose exactly the class of
-    # failure this task exists to fix.
-    local close_out close_rc=0
-    close_out="$("$HERE/orca-close-role.sh" "$role_key" 2>&1)" || close_rc=$?
-    if [[ "$close_rc" -eq 0 ]]; then
-      echo "cleanup: closed $short — $close_out" >&2
-    else
-      echo "cleanup: close FAILED for $short (rc=$close_rc) — $close_out" >&2
+    if [[ -z "$handle" ]]; then
+      echo "cleanup: no handle recorded for $short — nothing to close" >&2
+      continue
     fi
+    # Calls terminal_close_and_verify directly (orca-roles-lib.sh, already
+    # sourced) instead of shelling out to orca-close-role.sh: that script
+    # maps BOTH "confirmed gone" and "undetermined" to its own exit 0 (see
+    # its own header — a human running it by hand only needs to know
+    # "did I need to do anything else", not the fine-grained distinction),
+    # which loses exactly the granularity this function needs to decide
+    # whether a breadcrumb is required. `rc=0; cmd || rc=$?` (never a bare
+    # call) because cleanup() runs inside an EXIT trap under `set -e` — an
+    # unguarded non-zero return here would abort cleanup() itself partway
+    # through, skipping the very breadcrumb logic below that a close
+    # failure exists to trigger.
+    local verify_rc=0
+    terminal_close_and_verify "$handle" || verify_rc=$?
+    case "$verify_rc" in
+      0)
+        echo "cleanup: closed $short ($handle) — confirmed gone" >&2
+        ;;
+      1)
+        echo "cleanup: close FAILED for $short ($handle) — still live after a close attempt" >&2
+        any_unconfirmed=1
+        ;;
+      2)
+        echo "cleanup: close for $short ($handle) could not be confirmed (liveness undetermined)" >&2
+        any_unconfirmed=1
+        ;;
+    esac
   done
+
+  if [[ "$any_unconfirmed" -eq 1 ]]; then
+    # Leave the lock in place — forced immediately stale, not merely
+    # un-removed — as a breadcrumb for orca-sweep-orphans.sh's stale-lock
+    # path (the only detector left for a handle this driver believed it had
+    # handled). See lock_leave_as_breadcrumb's own comment (orca-roles-
+    # lib.sh) for why forcing staleness matters just as much as leaving the
+    # file at all: an untouched "fresh" breadcrumb would hide from the
+    # sweeper for up to a full ttlSeconds AND could wrongfully block a
+    # different, legitimate debate's cross-slug concurrency check for that
+    # same window — the same mechanism orca-sweep-orphans.sh's run_watchdog
+    # now uses when IT cannot resolve a handle (Task 3, Part B).
+    lock_leave_as_breadcrumb "$LOCK_FILE"
+    echo "cleanup: at least one debater close could not be confirmed — leaving $LOCK_FILE in place (forced stale) as a breadcrumb for orca-sweep-orphans.sh, instead of erasing the only remaining trail to a handle we believe we handled" >&2
+  else
+    lock_remove "$LOCK_FILE"
+  fi
 }
 # A single `trap cleanup EXIT INT TERM` looks right but is not: cleanup()
 # never calls exit, and in bash, a trap on a terminating signal (INT/TERM)
@@ -424,6 +499,77 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# --- preflight: confirm every debater seat is created, seeded, and ready
+# BEFORE creating any orchestration task (Task 3, Part A) ---
+#
+# THE DEFECT: without this, round 1's own fan-out loop
+# (orca-debate-round.sh) dispatches each debater via orca-dispatch-role.sh
+# (which calls ensure_terminal internally); if ONE debater's ensure_terminal
+# fails, that debater is forfeited (tid=none, status=failed — its dispatcher
+# call is wrapped in `|| true`) but the for-loop keeps dispatching the
+# OTHERS regardless — i.e. task-create already fires for every working seat
+# before the round ever notices the broken one, and if quorum (3 of 4) is
+# still met the round simply proceeds one debater short, silently, for the
+# rest of the debate. Only when two or more seats are bad does anything
+# visible happen at all, and even then not until the full round timeout (up
+# to 30 minutes for R1) — the exact "discovering the failure at the round
+# timeout" this task exists to eliminate.
+#
+# THE FIX: create+seed+confirm every seat up front, in one place, before any
+# task is ever created. ensure_terminal (orca-roles-lib.sh) already does
+# exactly "create, durably record, seed", and seed() already gates on
+# terminal_wait_ready (Task 2) — so a seat that can never become ready fails
+# HERE, with its screen already dumped to stderr by seed()/
+# terminal_wait_ready's own failure path, instead of at a round timeout.
+#
+# Skipped entirely under --dry-run: a preview creates no terminals (see
+# --dry-run's own doc comment above), and every step below is real terminal
+# I/O. Must run AFTER the lock/watchdog setup above (so $LOCK_FILE exists
+# on disk for lock_register_handle below) and after the traps are
+# registered (so a preflight failure still runs cleanup() — stopping the
+# watchdog and closing/breadcrumbing whatever WAS already created before
+# the failing seat — instead of a bespoke abort path).
+#
+# NOTE ON WARM SEATS: for an ALREADY-live handle, ensure_terminal's fast
+# path returns immediately without re-seeding or re-gating (see its own
+# comment) — this preflight therefore guarantees "created + seeded at least
+# once + currently live" for a reused seat, not "ready at this exact
+# instant". Real-time readiness right before injection remains the job of
+# orca-dispatch-role.sh's own terminal_wait_ready gate before --inject,
+# which still runs on every dispatch regardless of this preflight.
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  echo
+  echo "=== preflight: confirming all $COUNT debater seat(s) are created, seeded, and ready ==="
+  OLD_IFS="$IFS"
+  IFS=','
+  for short in $DEBATERS; do
+    [[ -z "${short// }" ]] && continue
+    role_key="$(debate_role_key "$short")"
+    echo "  checking $short ($role_key)…"
+    preflight_handle=""
+    if preflight_handle="$(ensure_terminal "$role_key")"; then
+      # Register with THIS debate's lock now, not only at round-1 dispatch
+      # time (orca-dispatch-role.sh's own lock_register_handle call) — a
+      # driver that dies between finishing preflight and round 1's first
+      # dispatch would otherwise leave a handle the watchdog never learned
+      # about: lock_handles would come back empty, "all owned handles
+      # resolved" would fire trivially, and the lock — the only detector
+      # for this class of orphan — would be removed instead of left as a
+      # breadcrumb. Sidecar-append is race-safe (see lock_register_handle's
+      # own comment) and idempotent if round 1's own dispatch registers the
+      # same handle again moments later.
+      lock_register_handle "$LOCK_FILE" "$preflight_handle" \
+        || echo "(warn) could not register $preflight_handle with $LOCK_FILE — the watchdog owning that lock will not know about it until round 1's own dispatch registers it" >&2
+    else
+      IFS="$OLD_IFS"
+      echo "Preflight FAILED: debater '$short' ($role_key) could not be made ready — see its terminal's screen state above (from ensure_terminal/seed's own diagnostics). Aborting BEFORE creating any orchestration task, so a bad seat costs seconds, not a round timeout." >&2
+      exit 1
+    fi
+  done
+  IFS="$OLD_IFS"
+  echo "=== preflight: all $COUNT debater seat(s) ready ==="
+fi
 
 phase_for_round() {
   case "$1" in
