@@ -33,63 +33,119 @@ print(slug or "debate")
 PY
 }
 
-debate_label_map_create() {
-  # $1=map_path $2=csv shorts. Creates once; later calls return the existing map.
-  python3 - "$1" "$2" <<'PY'
-import json, os, sys
-path, names = sys.argv[1:3]
+debate_label_map_ensure() {
+  # $1=map_path $2=slug $3=csv shorts (this run's roster)
+  #
+  # Task 3: label-native anonymization. Ownership is deliberately narrow —
+  # ONLY orca-debate.sh (the driver) ever calls this function, before round 1
+  # starts, and passes the resulting path down to orca-debate-round.sh via
+  # --label-map. orca-debate-round.sh (and every debater dispatch spec) only
+  # ever READS this file (debate_label_of / debate_short_for_label below); it
+  # never creates or rewrites it. This is what makes it possible for a fresh
+  # subprocess (each round is a separate orca-debate-round.sh invocation) to
+  # agree with the previous round's subprocess on what "Proposal C" means,
+  # without any round script ever deciding label policy itself.
+  #
+  # Labels are SHUFFLED per debate (python's random, freshly seeded per
+  # process from OS entropy — not the roster's CSV order), because the
+  # roster's default order (DEBATERS_DEFAULT above) is a public constant in
+  # this very file: a positional A=first-in-roster assignment is derivable
+  # from source alone regardless of where the map file lives.
+  #
+  # Creates fresh if absent. If present AND its recorded "roster" (as a set,
+  # order-independent) matches the given roster, reuses the existing
+  # mapping unchanged — labels must stay stable across round 1→2→3 of the
+  # SAME driver invocation. If the roster differs (a re-run of the same slug
+  # with a changed --debaters), rebuilds with a fresh shuffle for the new
+  # roster and prints a loud warning to stderr — never silently reuses a
+  # stale mapping, which would otherwise either drop a participant's
+  # contribution (an old label with no current debater behind it) or leave a
+  # newly-added participant with no label at all (a ghost). Rebuilding here
+  # is safe specifically because orca-debate.sh wipes that slug's previous
+  # round-*/transcript.md/manifest before calling this — if that wipe is
+  # ever removed, this rebuild-on-mismatch would need to become a hard
+  # refusal instead, since a rebuilt map could then mix with output written
+  # under the old one.
+  local path="$1" slug="$2" names="$3"
+  mkdir -p "$(dirname "$path")" 2>/dev/null || true
+  python3 - "$path" "$slug" "$names" <<'PY'
+import json, os, random, sys
+
+path, slug, names_csv = sys.argv[1:4]
+roster = [n.strip() for n in names_csv.split(",") if n.strip()]
+
+existing = None
 if os.path.exists(path):
-    sys.stdout.write(open(path).read())
-    raise SystemExit(0)
-labels = "ABCDEFGH"
-mapping = {}
-for i, name in enumerate([n for n in names.split(",") if n.strip()]):
-    mapping[name.strip()] = labels[i]
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-with open(path, "w") as f:
-    json.dump(mapping, f, indent=2, ensure_ascii=False)
+    try:
+        existing = json.load(open(path))
+    except Exception:
+        existing = None
+
+if existing is not None and sorted(existing.get("roster") or []) == sorted(roster):
+    sys.stdout.write(json.dumps(existing, ensure_ascii=False))
+    sys.exit(0)
+
+if existing is not None:
+    old_roster = existing.get("roster") or []
+    print(
+        "debate_label_map_ensure: roster changed for slug '%s' (was: %s; now: %s) "
+        "— rebuilding the label map with a fresh shuffle, NOT reusing the stale one"
+        % (slug, ",".join(old_roster), ",".join(roster)),
+        file=sys.stderr,
+    )
+
+letters = list("ABCDEFGH"[: len(roster)])
+random.shuffle(letters)
+mapping = dict(zip(roster, letters))
+data = {"slug": slug, "roster": roster, "labels": mapping}
+
+tmp_path = path + ".tmp." + str(os.getpid())
+with open(tmp_path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-print(json.dumps(mapping, ensure_ascii=False))
+os.replace(tmp_path, path)
+print(json.dumps(data, ensure_ascii=False))
 PY
 }
 
 debate_label_of() {
-  # $1=map_path $2=short → label (empty if unknown)
+  # $1=map_path $2=short → label (empty if unknown, missing, or malformed)
   python3 - "$1" "$2" <<'PY'
 import json, sys
 try:
-    print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+    d = json.load(open(sys.argv[1]))
+    print((d.get("labels") or {}).get(sys.argv[2], ""))
 except Exception:
     print("")
 PY
 }
 
-debate_anonymize() {
-  # $1=map_path $2=src_dir $3=dst_dir $4=prefix(proposal|critique)
-  # Copies <src>/<short>.md → <dst>/<prefix>-<LABEL>.md, dropping H1 lines that
-  # would identify the author. Missing sources are skipped (forfeits).
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
-import json, pathlib, sys
-map_path, src, dst, prefix = sys.argv[1:5]
+debate_short_for_label() {
+  # $1=map_path $2=label $3=expected_slug → short name, or empty if unknown,
+  # missing, malformed, OR the map's own recorded "slug" does not match
+  # $3. That last guard matters only for build_transcript: if a slug's label
+  # map was later rebuilt (roster changed) after an OLDER debate directory's
+  # round output was produced under the earlier mapping, reverse-lookups
+  # through the now-current map would silently misattribute that older
+  # content. Used only by the driver's transcript builder — never by a
+  # debater's dispatch spec.
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+path, label, expected_slug = sys.argv[1:4]
 try:
-    mapping = json.load(open(map_path))
-except Exception as e:
-    print(f"debate_anonymize: cannot read label map {map_path}: {e}", file=sys.stderr)
-    sys.exit(1)
-dst_p = pathlib.Path(dst)
-dst_p.mkdir(parents=True, exist_ok=True)
-written = []
-for short, label in sorted(mapping.items(), key=lambda kv: kv[1]):
-    source = pathlib.Path(src) / f"{short}.md"
-    if not source.is_file() or not source.read_text().strip():
-        continue
-    body = "\n".join(
-        line for line in source.read_text().splitlines() if not line.startswith("# ")
-    ).strip("\n")
-    out = dst_p / f"{prefix}-{label}.md"
-    out.write_text(f"# {prefix.capitalize()} {label}\n\n{body}\n")
-    written.append(out.name)
-print("\n".join(written))
+    d = json.load(open(path))
+except Exception:
+    print("")
+    raise SystemExit(0)
+if expected_slug and d.get("slug") != expected_slug:
+    print("")
+    raise SystemExit(0)
+labels = d.get("labels") or {}
+for short, lab in labels.items():
+    if lab == label:
+        print(short)
+        raise SystemExit(0)
+print("")
 PY
 }
 
@@ -220,15 +276,16 @@ What you considered and dropped, and why. At least two.
 EOF
       ;;
     critique)
+      local prev_round=$((round - 1))
       cat <<EOF
 IDEA DEBATE — ROUND $round of 3: CRITIQUE
 
 TOPIC
 $topic
 
-The other participants' round-1 proposals are on disk, anonymized. Read every
-file matching:
-  $dir/round-2/proposal-*.md
+The other participants' round-$prev_round proposals are on disk, anonymized under
+labels. Read every file matching:
+  $dir/round-$prev_round/*.md
 
 Proposal $own is your own — skip it in the per-proposal section below, but you
 may still retract it at the end. You do not know who wrote the others, and you
@@ -269,16 +326,18 @@ here only if you say what would have changed your mind.
 EOF
       ;;
     converge)
+      local prev_round=$((round - 1))
       cat <<EOF
 IDEA DEBATE — ROUND $round of 3: CONVERGE ON A NICHE
 
 TOPIC
 $topic
 
-Everyone's round-2 critiques are on disk, anonymized. Read every file matching:
-  $dir/round-3/critique-*.md
-Your own round-1 proposals are at:
-  $dir/round-1/$short.md
+Everyone's round-$prev_round critiques are on disk, anonymized under labels. Read
+every file matching:
+  $dir/round-$prev_round/*.md
+Your own round-1 proposal is at:
+  $dir/round-1/$own.md
 
 Your job now is to NARROW. A niche is a deliberately small target that
 incumbents cannot or will not chase — not a smaller version of a big market.

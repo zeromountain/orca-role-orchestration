@@ -260,15 +260,33 @@ Three rounds, four models in parallel each round:
 | R2 | critique | Attacks the other three proposals **anonymized**, ranks them, proposes merges |
 | R3 | converge | Narrows to 1-2 niche candidates with kill conditions and a first experiment |
 
-Proposals circulate under labels (Proposal A-D), never model names — a model that knows
-"Opus wrote this" defers instead of arguing.
+Proposals circulate under labels (e.g. Proposal A-D), never model names — a model that knows
+"Opus wrote this" defers instead of arguing. Round output is written under its label from the
+start (`round-1/A.md`, never a model-named file), labels are shuffled per debate (not derived
+from `--debaters` order), and the label map + per-round manifest live outside the debate
+directory entirely — only the driver (`orca-debate.sh`/`orca-debate-round.sh`) ever reads them.
+
+**Honest limit:** this is not cryptographic. The guarantee is that nothing instructs a debater
+to deanonymize, and no single `diff`, `glob`, or file read *inside the debate directory* reveals
+authorship. Debaters run under the same permission-bypass CLI flags as every other role (see
+`role_launch_cmd`), so a debater that went off-script could still read `dispatch-ledger.jsonl`,
+`handles.json`, `terminal-journal.jsonl`, or `orca terminal list` titles — none of which are
+inside the debate directory, none of which any spec ever points a debater at, but none of which
+are cryptographically hidden either.
 
 Outputs: `.orca/orchestration/debates/<slug>/transcript.md` (local, gitignored). Then write the
 decision to `docs/ideas/<date>-<slug>.md` with `## Decision` / `## Runner-up` / `## Dissent`,
-or pass `--judge architect` to have a separate Opus tab write it.
+or pass `--judge architect` to have a separate Opus tab write it. The transcript is the one place
+a debater's real short name (e.g. "claude") is re-attributed for the human reader — it is written
+only after the debate concludes and no round spec ever points a debater at it.
 
-Debaters are **read-only**: their only writable path is their own round output file. Quorum is 3 —
+Debaters are **read-only by prompt, not by sandbox** — their dispatch spec and persona instruct
+them to write only their own round output file, but nothing in the CLI enforces that. Quorum is 3 —
 if two or more fail, the round stops. Round prompt text lives in `scripts/orca-debate-lib.sh`.
+
+Only one debate may run at a time: starting a second one while another slug's debate is still
+live is refused (`ensure_terminal` reuses each role's terminal globally, so two concurrent debates
+would otherwise dispatch into the SAME four agent sessions).
 
 ## Routing cheat sheet
 

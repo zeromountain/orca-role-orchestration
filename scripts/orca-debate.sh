@@ -36,6 +36,14 @@ DRY_RUN=0
 DIR_ROOT="$ORCH/debates"
 BUILD_ONLY=""
 LOCK_TTL_SECONDS="$DEBATE_LOCK_TTL_SECONDS_DEFAULT"
+# Task 3: label map + manifest are driver-only state and live OUTSIDE the
+# debate directory (never inside $DIR_ROOT/<slug>/) — nothing a debater can
+# glob or read may ever reveal a short name. Overridable so tests (and a
+# standalone --build-transcript invocation) can sandbox them without having
+# to copy this whole script tree, matching --dir-root's existing precedent.
+LABELS_DIR="$ORCH/debate-labels"
+MANIFESTS_DIR="$ORCH/debate-manifests"
+EPHEMERAL_LABEL_MAP=""
 
 # Per-round defaults: R1 carries the research obligation and gets longer.
 R1_TIMEOUT_MS=1800000
@@ -53,15 +61,32 @@ Usage:
   --judge <role>   Dispatch this role to write the decision document
                    (default: leave it to the coordinator).
   --keep-tabs      Do not close debater tabs on exit (debugging).
-  --dry-run        Print every round's specs; create no terminals.
+  --dry-run        Print every round's specs; create no terminals. Never
+                   writes the real label map (uses a throwaway one instead).
   --lock-ttl-seconds N  Dead-man watchdog staleness threshold (default 1800 —
                    see orca-debate-lib.sh for reasoning). Mainly for tests.
+  --labels-dir <path>     Where the per-slug label map lives (default
+                   $ORCH/debate-labels). Driver-only state; mainly for tests.
+  --manifests-dir <path>  Where per-round manifests live (default
+                   $ORCH/debate-manifests). Driver-only state; mainly for tests.
 EOF
 }
 
 build_transcript() {
   # $1=debate dir
-  local dir="$1" out="$1/transcript.md" round file short
+  #
+  # This is the ONE deliberate place a short model name is meant to appear
+  # (see "Ambiguity resolved" in task-3-report.md): the transcript is for the
+  # human, never read by a debater (no round spec ever points at it, and it
+  # is only written once the debate itself has concluded), so it re-attributes
+  # each round-*/​<LABEL>.md file back to its real short name via the external
+  # label map. Falls back to printing the raw label if the map is missing or
+  # unreadable, or if its own recorded slug doesn't match this directory's
+  # (debate_short_for_label's guard) — e.g. this directory was copied
+  # elsewhere, or its label map was later rebuilt for a different roster.
+  local dir="$1" out="$1/transcript.md" round file label short slug label_map
+  slug="$(basename "$dir")"
+  label_map="$LABELS_DIR/$slug.json"
   {
     echo "# Debate transcript"
     echo
@@ -74,12 +99,10 @@ build_transcript() {
       echo "## Round $round"
       for file in "$dir/round-$round"/*.md; do
         [[ -f "$file" ]] || continue
-        short="$(basename "$file" .md)"
-        case "$short" in
-          proposal-*|critique-*) continue ;;
-        esac
+        label="$(basename "$file" .md)"
+        short="$(debate_short_for_label "$label_map" "$label" "$slug")"
         echo
-        echo "### $short"
+        echo "### ${short:-$label}"
         echo
         cat "$file"
       done
@@ -101,6 +124,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --dir-root) DIR_ROOT="${2:?}"; shift 2 ;;
     --lock-ttl-seconds) LOCK_TTL_SECONDS="${2:?}"; shift 2 ;;
+    --labels-dir) LABELS_DIR="${2:?}"; shift 2 ;;
+    --manifests-dir) MANIFESTS_DIR="${2:?}"; shift 2 ;;
     --build-transcript) BUILD_ONLY="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; usage; exit 1 ;;
@@ -163,30 +188,114 @@ fi
 if [[ -z "$SLUG" ]]; then
   SLUG="$(debate_slugify "$TOPIC")"
 fi
+# Deferred minor (d): --slug reaches `mkdir -p` raw. debate_slugify's own
+# output can never produce '/', '..', or empty, but an explicit --slug is
+# user-supplied text with no such guarantee — reject anything that could
+# escape $DIR_ROOT before it is ever used to build a path.
+case "$SLUG" in
+  ""|*/*|*..*)
+    echo "Invalid --slug '$SLUG': must be non-empty and must not contain '/' or '..'." >&2
+    exit 1
+    ;;
+esac
 DEBATE_DIR="$DIR_ROOT/$SLUG"
+# Belt-and-suspenders on top of the sanitization above: assert the computed
+# path actually landed under $DIR_ROOT before anything below ever runs
+# `rm -rf` against it.
+case "$DEBATE_DIR" in
+  "$DIR_ROOT"/*) ;;
+  *) echo "internal error: computed debate dir '$DEBATE_DIR' is not under dir-root '$DIR_ROOT'" >&2; exit 1 ;;
+esac
 mkdir -p "$DEBATE_DIR"
 printf '%s\n' "$TOPIC" > "$DEBATE_DIR/topic.md"
 echo "Debate: $SLUG"
 echo "  dir: $DEBATE_DIR"
 echo "  debaters: $DEBATERS"
 
-# --- dead-man watchdog (Task 2) ---
-# Computed unconditionally (cheap — just paths) so cleanup()/stop_debate_watchdog
-# below can always reference them; only actually created when DRY_RUN=0, since
-# a --dry-run debate creates no terminals and has nothing for a watchdog to own.
+# --- dead-man watchdog (Task 2) + label map (Task 3) ---
+# Computed unconditionally (cheap — just paths) so cleanup()/build_transcript
+# below can always reference them; only actually created/mutated when
+# DRY_RUN=0, since a --dry-run debate creates no terminals and has nothing
+# for a watchdog to own.
 LOCK_DIR="$ORCH/debate-locks"
 LOCK_FILE="$LOCK_DIR/$SLUG.json"
 WATCHDOG_PID_FILE="$LOCK_DIR/$SLUG.watchdog.pid"
+mkdir -p "$LABELS_DIR"
+LABEL_MAP_FILE="$LABELS_DIR/$SLUG.json"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$LOCK_DIR"
+
+  # --- Task 3 extra scope: refuse to start if a DIFFERENT slug's lock is
+  # currently live. ensure_terminal (orca-roles-lib.sh) reuses a live role
+  # terminal GLOBALLY (one terminal per role key, not per debate), so two
+  # concurrent debates under different slugs would dispatch into the SAME
+  # four agent sessions — observed live: a second driver's cleanup closed
+  # the first driver's tabs mid-round. This uses only the existing
+  # lock_is_fresh/lock_pid primitives (see their contract in
+  # orca-roles-lib.sh, which prescribes exactly this check) — no new
+  # liveness logic. A STALE other-slug lock (no heartbeat within its own
+  # ttlSeconds) is presumed abandoned and does not block a new debate; the
+  # existing same-slug-fresh-lock warning below is unrelated and unchanged.
+  for lf in "$LOCK_DIR"/*.json; do
+    [[ -f "$lf" ]] || continue
+    other_slug="$(basename "$lf" .json)"
+    [[ "$other_slug" == "$SLUG" ]] && continue
+    if lock_is_fresh "$lf"; then
+      other_pid="$(lock_pid "$lf")"
+      alive_note="cannot confirm a pid"
+      if [[ -n "$other_pid" ]]; then
+        if kill -0 "$other_pid" 2>/dev/null; then
+          alive_note="pid $other_pid is alive"
+        else
+          alive_note="pid $other_pid is NOT running — its watchdog likely has not noticed yet"
+        fi
+      fi
+      echo "Refusing to start: debate '$other_slug' has a live lock ($lf, $alive_note). Starting a second debate now would make ensure_terminal dispatch into the SAME four agent sessions '$other_slug' is using, corrupting both. Wait for '$other_slug' to finish, or — only if you are certain it is actually dead — remove $lf yourself and retry." >&2
+      exit 1
+    fi
+  done
+
   if [[ -f "$LOCK_FILE" ]] && lock_is_fresh "$LOCK_FILE"; then
     echo "(warn) a fresh debate lock already exists for slug '$SLUG' (pid=$(lock_pid "$LOCK_FILE")) — overwriting it. If that debate is still actually running, its watchdog will notice the pid no longer matches this run and stand down without closing anything (see orca-sweep-orphans.sh), but two drivers now believe they own the same tabs. Consider --slug to pick a different slug if that was not intended." >&2
   fi
+
+  # Deferred finding I1: every real run of a slug is treated as fresh. There
+  # is no partial-resume feature (the round loop below always restarts at
+  # round 1), so a prior run's leftover round output / transcript / manifest
+  # must never be mistaken for THIS run's — otherwise a stale file can pass
+  # the collection step's `-s` usability check even though nothing this run
+  # actually produced it. --dry-run never reaches this branch, so a preview
+  # never destroys real data.
+  if [[ -d "$DEBATE_DIR/round-1" || -d "$DEBATE_DIR/round-2" || -d "$DEBATE_DIR/round-3" || -f "$DEBATE_DIR/transcript.md" ]]; then
+    echo "(info) clearing previous round output for slug '$SLUG' — every real run starts fresh" >&2
+  fi
+  rm -rf "${DEBATE_DIR:?}"/round-* 2>/dev/null || true
+  rm -f "$DEBATE_DIR/transcript.md"
+  rm -rf "${MANIFESTS_DIR:?}/$SLUG" 2>/dev/null || true
+
+  # Only the driver ever creates/rebuilds the label map (Task 3) — see
+  # debate_label_map_ensure's own header comment for the full contract.
+  # Safe to rebuild on a roster mismatch specifically because the wipe just
+  # above already guarantees no old-mapping output can still be lying around.
+  debate_label_map_ensure "$LABEL_MAP_FILE" "$SLUG" "$DEBATERS" >/dev/null
+
   WATCHDOG_PID="$(debate_watchdog_start "$HERE" "$LOCK_FILE" "$SLUG" "$$" "$LOCK_DIR" "$LOCK_TTL_SECONDS")"
   printf '%s\n' "$WATCHDOG_PID" > "$WATCHDOG_PID_FILE"
   export ORCA_ROLE_LOCK_FILE="$LOCK_FILE"
   echo "  watchdog: pid=$WATCHDOG_PID ttl=${LOCK_TTL_SECONDS}s lock=$LOCK_FILE"
+else
+  # --dry-run must NEVER write the real label map: a partial-roster preview
+  # (e.g. --debaters claude,grok --dry-run) would otherwise leave a 2-seat
+  # roster recorded at the real path, and a later real run with the full
+  # roster would needlessly see that as a "roster changed" rebuild — or, in
+  # the bug this replaces, the old code reused that stale 2-seat map
+  # outright for a real run. Use a throwaway path instead (cleaned up in
+  # cleanup() below).
+  EPHEMERAL_LABEL_MAP="$(mktemp "${TMPDIR:-/tmp}/orca-debate-labels.XXXXXX")"
+  rm -f "$EPHEMERAL_LABEL_MAP"   # debate_label_map_ensure creates it fresh
+  LABEL_MAP_FILE="$EPHEMERAL_LABEL_MAP"
+  debate_label_map_ensure "$LABEL_MAP_FILE" "$SLUG" "$DEBATERS" >/dev/null
 fi
 
 # --- close debater tabs on any exit ---
@@ -200,6 +309,13 @@ cleanup() {
   # never race this driver's own close attempts. debate_watchdog_stop is a
   # guarded no-op when nothing was ever started (--dry-run).
   debate_watchdog_stop "$WATCHDOG_PID_FILE" "$LOCK_FILE"
+
+  # Throwaway --dry-run label map (never the real $LABELS_DIR/<slug>.json —
+  # see the DRY_RUN branch above): tidy it up regardless of KEEP_TABS/DRY_RUN,
+  # since it was never a debater-facing artifact and has nothing to keep.
+  if [[ -n "$EPHEMERAL_LABEL_MAP" ]]; then
+    rm -f "$EPHEMERAL_LABEL_MAP"
+  fi
 
   if [[ "$KEEP_TABS" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
     return 0
@@ -276,10 +392,28 @@ for round in $(seq 1 "$ROUNDS"); do
   fi
   echo
   echo "=== ROUND $round: $phase (timeout ${t}ms) ==="
-  ARGS=(--dir "$DEBATE_DIR" --round "$round" --phase "$phase" --debaters "$DEBATERS" --timeout-ms "$t")
+  ARGS=(--dir "$DEBATE_DIR" --round "$round" --phase "$phase" --debaters "$DEBATERS" \
+        --timeout-ms "$t" --label-map "$LABEL_MAP_FILE" \
+        --manifest "$MANIFESTS_DIR/$SLUG/round-$round.json")
   [[ "$DRY_RUN" -eq 1 ]] && ARGS+=(--dry-run)
-  if ! "$HERE/orca-debate-round.sh" "${ARGS[@]}"; then
-    echo "Round $round did not meet quorum — stopping." >&2
+  # Deferred minor (a): orca-debate-round.sh's exit codes are NOT
+  # interchangeable — 2 means quorum genuinely failed (fewer than 3 usable
+  # outputs), but 1 means a usage/internal error in the round script itself
+  # (e.g. a missing --label-map), and anything else (notably 130/143 if the
+  # round script is itself signaled) is neither. Treating every non-zero
+  # exit as "did not meet quorum" would misreport a usage bug as a debate
+  # that genuinely failed to converge — exactly backwards for live
+  # debugging. `rc=0; cmd || rc=$?` (rather than a bare `if ! cmd`) is what
+  # makes the real code observable here under `set -e`.
+  rc=0
+  "$HERE/orca-debate-round.sh" "${ARGS[@]}" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    :
+  elif [[ "$rc" -eq 2 ]]; then
+    echo "Round $round did not meet quorum (need 3 usable outputs) — stopping." >&2
+    break
+  else
+    echo "Round $round exited with code $rc — a usage error, crash, or interruption in the round script itself, NOT a quorum failure — stopping." >&2
     break
   fi
 done

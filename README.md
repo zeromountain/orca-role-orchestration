@@ -145,13 +145,30 @@ then converge:
 ```
 
 Transcript lands in `.orca/orchestration/debates/<slug>/` (gitignored); the decision document goes
-to `docs/ideas/`.
+to `docs/ideas/`. Round output is written under a shuffled label from the start (`round-1/A.md`,
+never a model-named file); the label map and per-round manifest live outside the debate directory
+entirely, in `.orca/orchestration/debate-labels/` and `debate-manifests/` — nothing inside the
+debate directory itself, in a filename or in file contents, ever names a debater. See the
+anonymity guarantee and its limits under Security below. Only one debate runs at a time: starting
+a second one while another slug's debate is still live is refused, since terminals are reused
+per-role globally and two concurrent debates would otherwise collide in the same four sessions.
 
 ## Security
 
 The default launch commands disable or bypass agent permission checks. Use them only in trusted repositories and review the commands before running `orca-bootstrap-roles.sh`. Remove the bypass flags if you want each provider's normal approval boundaries.
 
 Generated `.orca/orchestration/handles.json` files are local runtime state and must not be committed.
+
+**Idea-debate anonymity is not cryptographic.** The achievable guarantee is: nothing instructs a
+debater to deanonymize, and no single `diff`, `glob`, or file read *inside the debate directory*
+reveals authorship. Debaters run under the same permission-bypass flags as every other role, so
+this is enforced by the dispatch spec and persona (`templates/roles.yaml`'s `read_only` field is
+prompt-enforced, not a sandboxing fact) — a debater that ignored its instructions could still read
+`dispatch-ledger.jsonl`, `handles.json`, `terminal-journal.jsonl`, or `orca terminal list` titles,
+none of which live inside the debate directory but none of which are hidden from that process
+either. The transcript (`transcript.md`, inside the debate directory) is the one deliberate
+exception: it re-attributes each contribution by real short name for the human reader, written
+only after the debate has concluded and never referenced by any round spec.
 
 ## License
 

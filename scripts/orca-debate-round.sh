@@ -2,13 +2,22 @@
 # One round of a multi-model idea debate.
 #
 # Fans out one dispatch per debater, waits for every dispatch to reach a terminal
-# state by polling dispatch-show (never consumes the orchestration inbox), collects
-# each debater's output file from disk, lints it, and prepares the next round's
-# anonymized copies.
+# state by polling dispatch-show (never consumes the orchestration inbox), and
+# collects each debater's output file from disk (already written under its
+# label name — see --label-map below) and lints it.
 #
 # Usage:
 #   orca-debate-round.sh --dir <debate-dir> --round <N> --phase propose|critique|converge
+#                        --label-map <path> [--manifest <path>]
 #                        [--debaters claude,codex,grok,gemini] [--timeout-ms N] [--dry-run]
+#
+# --label-map and --manifest are external to <debate-dir> by design (Task 3):
+# the label map (roster + shuffled label assignment) and the per-round
+# manifest (real debater names + task ids + statuses) are driver-only state —
+# nothing inside <debate-dir> may ever reveal a debater's identity. This
+# script never creates or owns either file; --label-map must already exist
+# (for a real, non-dry-run round — orca-debate.sh creates/rebuilds it before
+# calling here) and --manifest, if given, is written to directly.
 #
 # Exit: 0 quorum met (3+ usable outputs) · 2 quorum failed · 1 usage error
 set -euo pipefail
@@ -29,6 +38,8 @@ TIMEOUT_MS=900000
 POLL_S=5
 DRY_RUN=0
 QUORUM=3
+LABEL_MAP=""
+MANIFEST=""
 
 # Test seams: allow the dispatcher and the status source to be stubbed. These
 # are ORCA_TEST_-prefixed (not ORCA_DEBATE_-prefixed) because they are live env
@@ -42,8 +53,18 @@ usage() {
   cat <<'EOF'
 Usage:
   orca-debate-round.sh --dir <debate-dir> --round <N> --phase propose|critique|converge
+                       --label-map <path> [--manifest <path>]
                        [--debaters claude,codex,grok,gemini] [--timeout-ms N] [--dry-run]
 
+  --label-map <path>  Required. Path to the label map (roster + shuffled
+                      label assignment) that orca-debate.sh already created
+                      for this slug. Must exist for a real (non-dry-run)
+                      round; tolerated missing only under --dry-run (where
+                      each debater's own label falls back to "?" in the
+                      printed preview, since nothing is actually dispatched).
+  --manifest <path>   Optional. Where to record this round's per-debater
+                      task id / status / lint flags (by real short name —
+                      driver-only state, outside <debate-dir>). Omit to skip.
   --dry-run   Print the spec each debater would receive; dispatch nothing.
 Exit codes: 0 quorum met · 2 quorum failed (fewer than 3 usable outputs)
 EOF
@@ -57,13 +78,15 @@ while [[ $# -gt 0 ]]; do
     --debaters) DEBATERS="${2:?}"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     --poll-s) POLL_S="${2:?}"; shift 2 ;;
+    --label-map) LABEL_MAP="${2:?}"; shift 2 ;;
+    --manifest) MANIFEST="${2:?}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-if [[ -z "$DIR" || -z "$ROUND" || -z "$PHASE" ]]; then
+if [[ -z "$DIR" || -z "$ROUND" || -z "$PHASE" || -z "$LABEL_MAP" ]]; then
   usage
   exit 1
 fi
@@ -71,17 +94,15 @@ case "$PHASE" in
   propose|critique|converge) ;;
   *) echo "phase must be propose|critique|converge" >&2; exit 1 ;;
 esac
+if [[ "$DRY_RUN" -eq 0 && ! -f "$LABEL_MAP" ]]; then
+  echo "label map not found: $LABEL_MAP — the driver (orca-debate.sh) must create this before dispatching any real round; this script never creates its own" >&2
+  exit 1
+fi
 
 TOPIC_FILE="$DIR/topic.md"
 ROUND_DIR="$DIR/round-$ROUND"
-NEXT_DIR="$DIR/round-$((ROUND + 1))"
-MANIFEST="$ROUND_DIR/manifest.json"
-MAP_FILE="$DIR/round-2/label-map.json"
+MAP_FILE="$LABEL_MAP"
 mkdir -p "$ROUND_DIR"
-
-# Label map is created up front so every round can address participants by label.
-mkdir -p "$DIR/round-2"
-debate_label_map_create "$MAP_FILE" "$DEBATERS" >/dev/null
 
 NAMES=()
 OLD_IFS="$IFS"
@@ -101,8 +122,34 @@ echo "Round $ROUND ($PHASE): ${#NAMES[@]} debaters — ${NAMES[*]}" >&2
 for i in "${!NAMES[@]}"; do
   short="${NAMES[$i]}"
   role="$(debate_role_key "$short")"
-  out="$ROUND_DIR/$short.md"
   own="$(debate_label_of "$MAP_FILE" "$short")"
+  if [[ -z "$own" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      # No real driver-created map behind this preview (e.g. this script
+      # invoked directly, without going through orca-debate.sh) — "own" is
+      # only ever interpolated into preview text here, never used to decide
+      # anything, so a placeholder keeps the preview complete instead of
+      # silently dropping this debater from it.
+      own="?"
+    else
+      echo "  (warn) $short: no label assigned in $MAP_FILE — forfeiting (driver/label-map bug?)" >&2
+      TASK_IDS+=("none")
+      STATUSES+=("failed")
+      continue
+    fi
+  fi
+  out="$ROUND_DIR/$own.md"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    # A stale file left at this exact path by a PREVIOUS run must never be
+    # mistaken for this run's output: if this dispatch reports "completed"
+    # without actually writing anything, the collection step below gates
+    # usability on `-s "$file"` (non-empty) — without this removal, that
+    # check could see old content and silently count a forfeit as usable
+    # (deferred finding I1). orca-debate.sh already wipes round-*/ for this
+    # slug before round 1 of a real run, so this is defense in depth for any
+    # direct/partial invocation of this script that skips that wipe.
+    rm -f "$out"
+  fi
   spec="$(debate_spec "$PHASE" "$short" "$DIR" "$ROUND" "$out" "$own" "$TOPIC_FILE")"
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -167,24 +214,37 @@ while true; do
 done
 
 # --- collect, lint, quorum ---
-rm -f "$MANIFEST"
+# $MANIFEST is optional and, when given, lives OUTSIDE <debate-dir> (the
+# driver computes it under $ORCH/debate-manifests/<slug>/round-N.json) —
+# it records real short names, so it must never sit anywhere a debater's
+# glob/read could reach it. rm -f guards against a re-invocation of this
+# exact round leaving duplicate rows in an already-existing manifest file.
+if [[ -n "$MANIFEST" ]]; then
+  mkdir -p "$(dirname "$MANIFEST")" 2>/dev/null || true
+  rm -f "$MANIFEST"
+fi
 usable=0
 for i in "${!NAMES[@]}"; do
   short="${NAMES[$i]}"
-  file="$ROUND_DIR/$short.md"
+  own="$(debate_label_of "$MAP_FILE" "$short")"
+  file="$ROUND_DIR/$own.md"
   flags=""
-  if [[ "${STATUSES[$i]}" == "completed" && -s "$file" ]]; then
+  if [[ -n "$own" && "${STATUSES[$i]}" == "completed" && -s "$file" ]]; then
     usable=$((usable + 1))
     flags="ok"
-    if ! debate_lint "$file" "$PHASE" 2>/dev/null; then
+    lint_out=""
+    if ! lint_out="$(debate_lint "$file" "$PHASE" 2>&1)"; then
       flags="lint-fail"
       echo "  (warn) $short: output missing required headings — kept, flagged" >&2
+      printf '%s\n' "$lint_out" | sed 's/^/    /' >&2
     fi
   else
     flags="forfeit"
     echo "  (warn) $short: forfeit (status=${STATUSES[$i]})" >&2
   fi
-  debate_manifest_append "$MANIFEST" "$short" "${TASK_IDS[$i]}" "${STATUSES[$i]}" "$flags"
+  if [[ -n "$MANIFEST" ]]; then
+    debate_manifest_append "$MANIFEST" "$short" "${TASK_IDS[$i]}" "${STATUSES[$i]}" "$flags"
+  fi
 done
 
 echo "Round $ROUND: $usable/${#NAMES[@]} usable" >&2
@@ -193,10 +253,9 @@ if [[ "$usable" -lt "$QUORUM" ]]; then
   exit 2
 fi
 
-# --- prepare the next round's anonymized inputs ---
-case "$PHASE" in
-  propose)  debate_anonymize "$MAP_FILE" "$ROUND_DIR" "$NEXT_DIR" proposal >/dev/null ;;
-  critique) debate_anonymize "$MAP_FILE" "$ROUND_DIR" "$NEXT_DIR" critique >/dev/null ;;
-esac
+# Nothing to prepare for the next round: output was already written directly
+# under its label name above (round-$ROUND/$own.md) — there is no named
+# original to copy or redact. The next round's spec (debate_spec, in
+# orca-debate-lib.sh) points straight at this round's directory.
 
 exit 0

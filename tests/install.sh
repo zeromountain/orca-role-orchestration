@@ -184,6 +184,14 @@ assert T12_gitignore_locks "grep -qF '.orca/orchestration/debate-locks/' \"$tmpd
 gi_locks_count=$(grep -cF '.orca/orchestration/debate-locks/' "$tmpdir/.gitignore" 2>/dev/null || true)
 assert T12_gitignore_no_dup "[[ \"$gi_locks_count\" -eq 1 ]]"
 
+# --- T13 label map / manifest scaffold (Task 3) — same local-runtime-state
+# gitignore treatment as debate-locks/ above, since both hold local, never-
+# committed driver bookkeeping.
+assert T13_gitignore_labels "grep -qF '.orca/orchestration/debate-labels/' \"$tmpdir/.gitignore\""
+assert T13_gitignore_manifests "grep -qF '.orca/orchestration/debate-manifests/' \"$tmpdir/.gitignore\""
+gi_labels_count=$(grep -cF '.orca/orchestration/debate-labels/' "$tmpdir/.gitignore" 2>/dev/null || true)
+assert T13_gitignore_labels_no_dup "[[ \"$gi_labels_count\" -eq 1 ]]"
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then

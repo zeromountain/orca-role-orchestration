@@ -579,6 +579,12 @@ lifecycle:
     # exists to stop two roles editing the same files; debaters edit nothing, so
     # the debate path is exempt.
     max_concurrent: 4
+    # PROMPT-ENFORCED, NOT A FACT: debaters run under the same permission-bypass
+    # CLI flags as every other role (see role_launch_cmd in orca-roles-lib.sh).
+    # Nothing sandboxes them — "read-only" here means the dispatch spec and
+    # persona instruct them to write only their own output file and never touch
+    # git state; a debater that ignored those instructions could write anywhere
+    # its OS user can. Do not read this field as a security boundary.
     read_only: true
     tabs_persist_between_rounds: true   # dispatch --persist; driver closes on exit
     driver_script: .orca/orchestration/scripts/orca-debate.sh

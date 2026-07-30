@@ -154,30 +154,67 @@ assert D2_spaces  "[[ \"\$(debate_slugify 'Local First Note App')\" == 'local-fi
 assert D2_punct   "[[ \"\$(debate_slugify 'A/B: test!!')\" == 'a-b-test' ]]"
 assert D2_empty   "[[ \"\$(debate_slugify '!!!')\" == 'debate' ]]"
 
-# --- D3 label map ---
-MAP="$tmpdir/round-2/label-map.json"
-debate_label_map_create "$MAP" "claude,codex,grok,gemini" >/dev/null
-assert D3_file    "[[ -f \"$MAP\" ]]"
-assert D3_claude  "[[ \"\$(debate_label_of \"$MAP\" claude)\" == 'A' ]]"
-assert D3_gemini  "[[ \"\$(debate_label_of \"$MAP\" gemini)\" == 'D' ]]"
-# stable across calls
-debate_label_map_create "$MAP" "gemini,grok,codex,claude" >/dev/null
-assert D3_stable  "[[ \"\$(debate_label_of \"$MAP\" claude)\" == 'A' ]]"
+# --- D3 label map (Task 3: debate_label_map_ensure — driver-only, shuffled,
+# roster-checked; replaces the old positional debate_label_map_create). ---
+MAP="$tmpdir/labels/test-slug.json"
+map_json="$(debate_label_map_ensure "$MAP" test-slug "claude,codex,grok,gemini")"
+assert D3_file "[[ -f \"$MAP\" ]]"
+assert D3_schema_slug \
+  "printf '%s' \"\$map_json\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"slug\"]==\"test-slug\" else 1)'"
+assert D3_schema_roster \
+  "printf '%s' \"\$map_json\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if sorted(d[\"roster\"])==[\"claude\",\"codex\",\"gemini\",\"grok\"] else 1)'"
+assert D3_all_four_labeled \
+  "[[ -n \"\$(debate_label_of \"$MAP\" claude)\" && -n \"\$(debate_label_of \"$MAP\" codex)\" && -n \"\$(debate_label_of \"$MAP\" grok)\" && -n \"\$(debate_label_of \"$MAP\" gemini)\" ]]"
+assert D3_unknown_short_is_empty "[[ -z \"\$(debate_label_of \"$MAP\" nobody)\" ]]"
 
-# --- D4 anonymize ---
-# Body placeholders deliberately avoid the substring "claude"/"grok" — the H1
-# line is what identifies the author and gets dropped; if the body placeholder
-# itself contained the debater's name, D4_name_gone could never pass even with
-# correct H1-only redaction, since it greps the body, not just the H1.
-mkdir -p "$tmpdir/round-1"
-printf '# R1 proposal — claude (Principle & risk)\n\nBODY_TEXT_ONE\n' > "$tmpdir/round-1/claude.md"
-printf '# R1 proposal — grok (Contrarian)\n\nBODY_TEXT_TWO\n' > "$tmpdir/round-1/grok.md"
-debate_anonymize "$MAP" "$tmpdir/round-1" "$tmpdir/round-2" proposal >/dev/null
-assert D4_a_exists  "[[ -f \"$tmpdir/round-2/proposal-A.md\" ]]"
-assert D4_c_exists  "[[ -f \"$tmpdir/round-2/proposal-C.md\" ]]"
-assert D4_body_kept "grep -q BODY_TEXT_ONE \"$tmpdir/round-2/proposal-A.md\""
-assert D4_name_gone "! grep -qi 'claude' \"$tmpdir/round-2/proposal-A.md\""
-assert D4_missing_skipped "[[ ! -f \"$tmpdir/round-2/proposal-B.md\" ]]"
+# Stable across a re-call with the SAME roster (even reordered CSV) — this is
+# what lets round 1/2/3 (each a SEPARATE orca-debate-round.sh process) agree
+# on what "Proposal C" means without re-shuffling mid-debate.
+claude_label_before="$(debate_label_of "$MAP" claude)"
+debate_label_map_ensure "$MAP" test-slug "gemini,grok,codex,claude" >/dev/null
+assert D3_stable_same_roster "[[ \"\$(debate_label_of \"$MAP\" claude)\" == \"$claude_label_before\" ]]"
+
+# --- D3-mismatch: a re-run with a CHANGED roster must not silently reuse the
+# stale map (Step 4) — it must rebuild (fresh shuffle for the new roster) and
+# say so loudly, dropping the departed member's label (no ghost) while every
+# current member still gets a real one (no silent gap). ---
+mismatch_err="$(debate_label_map_ensure "$MAP" test-slug "claude,codex,grok" 2>&1 >/dev/null)"
+assert D3m_warns_not_silent "printf '%s' \"\$mismatch_err\" | grep -qi 'roster changed'"
+assert D3m_drops_departed_gemini "[[ -z \"\$(debate_label_of \"$MAP\" gemini)\" ]]"
+assert D3m_keeps_claude_labeled "[[ -n \"\$(debate_label_of \"$MAP\" claude)\" ]]"
+assert D3m_roster_field_updated \
+  "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if sorted(d[\"roster\"])==[\"claude\",\"codex\",\"grok\"] else 1)' \"$MAP\""
+
+# --- D3-shuffle: labels are SHUFFLED per debate, not positional from CSV
+# order (the historical bug: A was always whatever came first in
+# --debaters). Every iteration below uses a FRESH, never-before-created map
+# path (a distinct slug each time) — debate_label_map_ensure only shuffles on
+# CREATION, so reusing one path across iterations would just test the
+# already-covered stability path instead. With 4 debaters there are only 24
+# possible assignments, so seeing more than one distinct assignment across
+# 15 independent fresh runs — or claude landing on anything other than "A"
+# even once — all but rules out a fixed/positional scheme, which would
+# produce the IDENTICAL assignment (claude=A always) every single time.
+shuffle_dir="$tmpdir/shuffle-evidence"
+mkdir -p "$shuffle_dir"
+first_assignment=""
+saw_a_difference=0
+saw_claude_non_a=0
+for shuffle_i in $(seq 1 15); do
+  sfile="$shuffle_dir/run-$shuffle_i.json"
+  debate_label_map_ensure "$sfile" "shuffle-slug-$shuffle_i" "claude,codex,grok,gemini" >/dev/null
+  this_assignment="$(python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+print(",".join(d["labels"][k] for k in ["claude", "codex", "grok", "gemini"]))' "$sfile")"
+  if [[ -z "$first_assignment" ]]; then
+    first_assignment="$this_assignment"
+  elif [[ "$this_assignment" != "$first_assignment" ]]; then
+    saw_a_difference=1
+  fi
+  [[ "$(debate_label_of "$sfile" claude)" != "A" ]] && saw_claude_non_a=1
+done
+assert D3s_shuffled_across_runs "[[ \"$saw_a_difference\" -eq 1 ]]"
+assert D3s_claude_not_pinned_to_seat_a "[[ \"$saw_claude_non_a\" -eq 1 ]]"
 
 # --- D5 lint ---
 GOOD="$tmpdir/good.md"
@@ -219,49 +256,83 @@ assert D6_two_rows "[[ \"\$(python3 -c 'import json,sys;print(len(json.load(open
 assert D6_flag     "python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[1][\"flags\"])' \"$MAN\" | grep -q forfeit"
 
 # --- D7 spec builders ---
+# $out paths below are label-shaped (single uppercase letter), matching what
+# orca-debate-round.sh now actually builds ($ROUND_DIR/$own.md) — this is
+# what Steps 1 and 3 require: a debater told to read round-(N-1)/*.md, or its
+# own round-1/<label>.md, must never see a model-named path or filename.
 TOPIC="$tmpdir/topic.md"
 printf 'TOPIC_MARKER\n' > "$TOPIC"
-S1="$(debate_spec propose claude "$tmpdir" 1 "$tmpdir/round-1/claude.md" A "$TOPIC")"
+S1="$(debate_spec propose claude "$tmpdir" 1 "$tmpdir/round-1/A.md" A "$TOPIC")"
 assert D7_propose_topic  "printf '%s' \"\$S1\" | grep -q TOPIC_MARKER"
-assert D7_propose_out    "printf '%s' \"\$S1\" | grep -q 'round-1/claude.md'"
+assert D7_propose_out    "printf '%s' \"\$S1\" | grep -q 'round-1/A.md'"
 assert D7_propose_head   "printf '%s' \"\$S1\" | grep -q '## Prior art'"
 assert D7_propose_source "printf '%s' \"\$S1\" | grep -q '미검증'"
 assert D7_propose_ro     "printf '%s' \"\$S1\" | grep -q 'Never run git commit'"
-S2="$(debate_spec critique codex "$tmpdir" 2 "$tmpdir/round-2/codex.md" B "$TOPIC")"
-assert D7_crit_paths "printf '%s' \"\$S2\" | grep -q 'round-2/proposal-'"
+S2="$(debate_spec critique codex "$tmpdir" 2 "$tmpdir/round-2/B.md" B "$TOPIC")"
+# Defect 1 fixed: critique now reads the PREVIOUS round's own directory
+# (round-1/*.md — every file in it is already label-named), not a copy
+# stashed under round-2/proposal-*.md.
+assert D7_crit_paths "printf '%s' \"\$S2\" | grep -qF 'round-1/*.md'"
 assert D7_crit_own   "printf '%s' \"\$S2\" | grep -q 'Proposal B is your own'"
 assert D7_crit_head  "printf '%s' \"\$S2\" | grep -q '## Ranking'"
-S3="$(debate_spec converge grok "$tmpdir" 3 "$tmpdir/round-3/grok.md" C "$TOPIC")"
-assert D7_conv_paths "printf '%s' \"\$S3\" | grep -q 'round-3/critique-'"
-assert D7_conv_head  "printf '%s' \"\$S3\" | grep -q '## Dissent'"
+assert D7_crit_no_model_name "! printf '%s' \"\$S2\" | grep -qiE 'claude|codex|grok|gemini'"
+S3="$(debate_spec converge grok "$tmpdir" 3 "$tmpdir/round-3/C.md" C "$TOPIC")"
+# Defect 3 fixed: converge points a debater at its OWN round-1 file by LABEL
+# (round-1/<own-label>.md), never by short/model name (the literal
+# round-1/<short>.md leak this replaces).
+assert D7_conv_paths     "printf '%s' \"\$S3\" | grep -qF 'round-2/*.md'"
+assert D7_conv_own_path  "printf '%s' \"\$S3\" | grep -qF 'round-1/C.md'"
+assert D7_conv_head      "printf '%s' \"\$S3\" | grep -q '## Dissent'"
+assert D7_conv_no_model_name "! printf '%s' \"\$S3\" | grep -qiE 'claude|codex|grok|gemini'"
 
 # --- E1 round script dry-run (no Orca runtime touched) ---
 ROUND="$ROOT/scripts/orca-debate-round.sh"
 DEB="$tmpdir/debate"
 mkdir -p "$DEB"
 printf 'TOPIC_E1\n' > "$DEB/topic.md"
+E1_LABEL_MAP="$tmpdir/e1-no-such-label-map.json"   # deliberately never created
 
 assert E1_exec "[[ -x \"$ROUND\" ]]"
 assert E1_needs_args "! \"$ROUND\" >/dev/null 2>&1"
+# --label-map is now a required flag (Task 3) — omitting it entirely must be
+# a usage error, same as omitting --dir/--round/--phase.
+assert E1_requires_label_map \
+  "! \"$ROUND\" --dir \"$DEB\" --round 1 --phase propose --dry-run >/dev/null 2>&1"
 
-OUT="$("$ROUND" --dir "$DEB" --round 1 --phase propose --dry-run 2>&1)"
+# A --dry-run preview tolerates a label map that does not exist at all (own
+# label falls back to "?" — see orca-debate-round.sh) since nothing is
+# actually dispatched; this also proves a bare preview invocation (no driver,
+# no real map) still works.
+OUT="$("$ROUND" --dir "$DEB" --round 1 --phase propose --label-map "$E1_LABEL_MAP" --dry-run 2>&1)"
 assert E1_dry_four   "[[ \"\$(printf '%s' \"\$OUT\" | grep -c '^===== debater_')\" == '4' ]]"
 assert E1_dry_topic  "printf '%s' \"\$OUT\" | grep -q TOPIC_E1"
 assert E1_dry_nodisp "! printf '%s' \"\$OUT\" | grep -q 'Creating task'"
-assert E1_dry_subset "[[ \"\$(\"$ROUND\" --dir \"$DEB\" --round 1 --phase propose --debaters claude,grok --dry-run 2>&1 | grep -c '^===== debater_')\" == '2' ]]"
+assert E1_dry_subset "[[ \"\$(\"$ROUND\" --dir \"$DEB\" --round 1 --phase propose --debaters claude,grok --label-map \"$E1_LABEL_MAP\" --dry-run 2>&1 | grep -c '^===== debater_')\" == '2' ]]"
 
 # --- E2 collection + quorum, with dispatch and polling stubbed ---
 STUB="$tmpdir/stubbin"
 mkdir -p "$STUB"
 cat > "$STUB/orca-dispatch-role.sh" <<'SH'
 #!/usr/bin/env bash
-# stub: echo a task id, write the debater's output file from the spec's target path
+# stub: echo a task id, write the debater's output file from the spec's target
+# path. The target is extracted from the exact "- Write your answer ONLY to
+# this file: <path>" line (debate_common_rules) — this is what makes the stub
+# use the path debate_spec/orca-debate-round.sh ACTUALLY told it to write to,
+# rather than a path the stub invented itself; a stub that computed its own
+# label-to-path mapping independently could pass even if the real code
+# regressed to short-name paths. A cruder "any /round-N/<label>.md-shaped
+# substring" extraction is NOT equivalent and was tried first: the converge
+# phase's own spec text also contains "Your own round-1 proposal is at:
+# .../round-1/<label>.md" BEFORE the real output-file line, so a first-match
+# extraction silently grabs the wrong path for that phase (own round-1
+# self-reference instead of round-N's actual output) — found by this task's
+# own self-review, not by a failing assertion; see task-3-report.md.
 role="$1"; shift
 spec=""
 while [[ $# -gt 0 ]]; do
   case "$1" in --spec) spec="$2"; shift 2 ;; *) shift ;; esac
 done
-target="$(printf '%s' "$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+target="$(printf '%s' "$spec" | sed -n 's/.*this file: //p' | head -1)"
 mkdir -p "$(dirname "$target")"
 {
   echo "# stub"
@@ -277,29 +348,42 @@ chmod +x "$STUB/orca-dispatch-role.sh"
 DEB2="$tmpdir/debate2"
 mkdir -p "$DEB2"
 printf 'TOPIC_E2\n' > "$DEB2/topic.md"
+E2_LABEL_MAP="$tmpdir/labels-e2.json"
+E2_MANIFEST="$tmpdir/manifests-e2/round-1.json"
+# The label map is created here exactly as orca-debate.sh (the driver) would
+# — this script never creates its own (Task 3: only the driver owns it).
+debate_label_map_ensure "$E2_LABEL_MAP" e2slug "claude,codex,grok,gemini" >/dev/null
 ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role.sh" \
 ORCA_TEST_STATUS_STUB=completed \
-"$ROUND" --dir "$DEB2" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1
-assert E2_files "[[ -f \"$DEB2/round-1/claude.md\" && -f \"$DEB2/round-1/gemini.md\" ]]"
-assert E2_manifest "[[ -f \"$DEB2/round-1/manifest.json\" ]]"
-assert E2_anon "[[ -f \"$DEB2/round-2/proposal-A.md\" ]]"
-assert E2_map "[[ -f \"$DEB2/round-2/label-map.json\" ]]"
+"$ROUND" --dir "$DEB2" --round 1 --phase propose --timeout-ms 5000 \
+  --label-map "$E2_LABEL_MAP" --manifest "$E2_MANIFEST" >/dev/null 2>&1
+e2_claude_label="$(debate_label_of "$E2_LABEL_MAP" claude)"
+e2_gemini_label="$(debate_label_of "$E2_LABEL_MAP" gemini)"
+assert E2_files "[[ -f \"$DEB2/round-1/$e2_claude_label.md\" && -f \"$DEB2/round-1/$e2_gemini_label.md\" ]]"
+assert E2_manifest_outside_debate_dir "[[ -f \"$E2_MANIFEST\" ]]"
+assert E2_manifest_not_in_debate_dir "[[ ! -f \"$DEB2/round-1/manifest.json\" ]]"
+assert E2_manifest_has_real_name "grep -q '\"debater\": \"claude\"' \"$E2_MANIFEST\""
+assert E2_no_copies_written "[[ ! -d \"$DEB2/round-2\" ]]"
+assert E2_label_map_not_in_debate_dir "[[ ! -f \"$DEB2/round-1/label-map.json\" && ! -f \"$DEB2/round-2/label-map.json\" ]]"
 
 # quorum failure: stub reports failed for everyone
 DEB3="$tmpdir/debate3"
 mkdir -p "$DEB3"
 printf 'TOPIC_E3\n' > "$DEB3/topic.md"
+E3_LABEL_MAP="$tmpdir/labels-e3.json"
+debate_label_map_ensure "$E3_LABEL_MAP" e3slug "claude,codex,grok,gemini" >/dev/null
 # The round script exits 2 here by design, so the call must be if-guarded:
 # tests/debate.sh runs under `set -e`, which would otherwise abort the suite.
 if ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role.sh" \
    ORCA_TEST_STATUS_STUB=failed \
-   "$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1; then
+   "$ROUND" --dir "$DEB3" --round 1 --phase propose --timeout-ms 5000 \
+     --label-map "$E3_LABEL_MAP" >/dev/null 2>&1; then
   QUORUM_RC=0
 else
   QUORUM_RC=$?
 fi
 assert E2_quorum_exit "[[ $QUORUM_RC -eq 2 ]]"
-assert E2_quorum_no_anon "[[ ! -f \"$DEB3/round-2/proposal-A.md\" ]]"
+assert E2_quorum_no_round2_dir "[[ ! -d \"$DEB3/round-2\" ]]"
 
 # --- E4 a single dispatcher failure is forfeited, not fatal ---
 # Regression for `tid=$(dispatch | awk ...)` under `set -euo pipefail`: if the
@@ -320,7 +404,7 @@ if [[ "$role" == "debater_codex" ]]; then
   echo "stub: simulated dispatcher failure" >&2
   exit 1
 fi
-target="$(printf '%s' "$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+target="$(printf '%s' "$spec" | sed -n 's/.*this file: //p' | head -1)"
 mkdir -p "$(dirname "$target")"
 {
   echo "# stub"
@@ -336,16 +420,23 @@ chmod +x "$STUB/orca-dispatch-role-fail1.sh"
 DEB4="$tmpdir/debate4"
 mkdir -p "$DEB4"
 printf 'TOPIC_E4\n' > "$DEB4/topic.md"
+E4_LABEL_MAP="$tmpdir/labels-e4.json"
+debate_label_map_ensure "$E4_LABEL_MAP" e4slug "claude,codex,grok,gemini" >/dev/null
 # Quorum (3 of 4) should still be met, so the round script is expected to exit 0 —
 # but capture the real exit code rather than assuming it, since a regression here
 # would abort the whole script, not merely flip 0 to 2.
 E4_RC=0
 ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role-fail1.sh" \
 ORCA_TEST_STATUS_STUB=completed \
-"$ROUND" --dir "$DEB4" --round 1 --phase propose --timeout-ms 5000 >/dev/null 2>&1 || E4_RC=$?
+"$ROUND" --dir "$DEB4" --round 1 --phase propose --timeout-ms 5000 \
+  --label-map "$E4_LABEL_MAP" >/dev/null 2>&1 || E4_RC=$?
+e4_claude_label="$(debate_label_of "$E4_LABEL_MAP" claude)"
+e4_gemini_label="$(debate_label_of "$E4_LABEL_MAP" gemini)"
+e4_grok_label="$(debate_label_of "$E4_LABEL_MAP" grok)"
+e4_codex_label="$(debate_label_of "$E4_LABEL_MAP" codex)"
 assert E4_survives_fail   "[[ $E4_RC -eq 0 ]]"
-assert E4_others_present  "[[ -f \"$DEB4/round-1/claude.md\" && -f \"$DEB4/round-1/gemini.md\" && -f \"$DEB4/round-1/grok.md\" ]]"
-assert E4_forfeit_missing "[[ ! -s \"$DEB4/round-1/codex.md\" ]]"
+assert E4_others_present  "[[ -f \"$DEB4/round-1/$e4_claude_label.md\" && -f \"$DEB4/round-1/$e4_gemini_label.md\" && -f \"$DEB4/round-1/$e4_grok_label.md\" ]]"
+assert E4_forfeit_missing "[[ ! -s \"$DEB4/round-1/$e4_codex_label.md\" ]]"
 
 # --- F1 driver argument handling and preflight ---
 DRIVER="$ROOT/scripts/orca-debate.sh"
@@ -392,23 +483,38 @@ assert F2_rounds "[[ \"\$(printf '%s' \"\$OUT2\" | grep -c 'ROUND')\" -ge 3 ]]"
 assert F2_slug_override "\"$DRIVER\" --topic 'x' --slug custom-slug --dir-root \"$tmpdir/debates\" --dry-run >/dev/null 2>&1 && [[ -d \"$tmpdir/debates/custom-slug\" ]]"
 
 # --- F3 transcript assembly is pure and testable ---
-# A dedicated dir (not $tmpdir/debate4, already owned by the E4 block above)
-# — reusing that path would silently mix this fixture with E4's leftover
-# round-1/round-2 files (label-map.json, proposal-*.md, gemini.md, grok.md);
-# harmless to these specific assertions since the transcript builder filters
-# proposal-*/critique-* and the greps below don't assert absence-of-content,
-# but there's no reason to depend on that and every reason to keep F3 isolated.
+# A dedicated dir (not $tmpdir/debate4, already owned by the E4 block above).
+# Round files are LABEL-named now (round-1/A.md, not round-1/claude.md) —
+# realistic post-Task-3 fixture — and re-attribution happens via an external
+# label map, so this test supplies one via --labels-dir rather than invoking
+# the real (un-sandboxed) $DRIVER's own default $ORCH/debate-labels, which
+# would resolve to this checkout's actual orchestration root. --labels-dir is
+# exactly the override Task 3 added for this reason (see orca-debate.sh).
 DEBF3="$tmpdir/debate-f3"
-mkdir -p "$DEBF3/round-1" "$DEBF3/round-3"
+DEBF3_LABELS="$tmpdir/debate-f3-labels"
+mkdir -p "$DEBF3/round-1" "$DEBF3/round-3" "$DEBF3_LABELS"
 printf 'TOPIC_F3\n' > "$DEBF3/topic.md"
-printf '# a\nAAA\n' > "$DEBF3/round-1/claude.md"
-printf '# b\nBBB\n' > "$DEBF3/round-3/grok.md"
-source "$ROOT/scripts/orca-debate-lib.sh"
-"$DRIVER" --build-transcript "$DEBF3" >/dev/null 2>&1
+printf '# a\nAAA\n' > "$DEBF3/round-1/A.md"
+printf '# b\nBBB\n' > "$DEBF3/round-3/B.md"
+cat > "$DEBF3_LABELS/debate-f3.json" <<'JSON'
+{"slug": "debate-f3", "roster": ["claude", "grok"], "labels": {"claude": "A", "grok": "B"}}
+JSON
+"$DRIVER" --build-transcript "$DEBF3" --labels-dir "$DEBF3_LABELS" >/dev/null 2>&1
 assert F3_transcript "[[ -f \"$DEBF3/transcript.md\" ]]"
 assert F3_has_topic  "grep -q TOPIC_F3 \"$DEBF3/transcript.md\""
 assert F3_has_both   "grep -q AAA \"$DEBF3/transcript.md\" && grep -q BBB \"$DEBF3/transcript.md\""
-assert F3_attributed "grep -q 'claude' \"$DEBF3/transcript.md\""
+assert F3_attributed_claude "grep -q 'claude' \"$DEBF3/transcript.md\""
+assert F3_attributed_grok   "grep -q 'grok' \"$DEBF3/transcript.md\""
+
+# Missing/unreadable label map: falls back to the raw label rather than
+# crashing or leaving the section header blank.
+DEBF3B="$tmpdir/debate-f3b"
+mkdir -p "$DEBF3B/round-1"
+printf 'TOPIC_F3B\n' > "$DEBF3B/topic.md"
+printf '# a\nCCC\n' > "$DEBF3B/round-1/Z.md"
+"$DRIVER" --build-transcript "$DEBF3B" --labels-dir "$tmpdir/no-such-labels-dir" >/dev/null 2>&1
+assert F3B_falls_back_to_label "grep -q '### Z' \"$DEBF3B/transcript.md\""
+assert F3B_body_kept          "grep -q CCC \"$DEBF3B/transcript.md\""
 
 # --- F5 SIGTERM actually stops the driver (regression for the split trap) ---
 # The brief's original code shared one handler across EXIT/INT/TERM
@@ -1917,7 +2023,7 @@ while [[ \$# -gt 0 ]]; do
     *) shift ;;
   esac
 done
-target="\$(printf '%s' "\$spec" | grep -m1 -o '/[^ ]*/round-[0-9]*/[a-z]*\.md')"
+target="\$(printf '%s' "\$spec" | sed -n 's/.*this file: //p' | head -1)"
 mkdir -p "\$(dirname "\$target")"
 {
   echo "# stub"
@@ -1972,6 +2078,236 @@ assert Q6_watchdog_process_exits_after_normal_run "[[ \"$q_watchdog_gone\" -eq 1
 assert Q7_dispatch_saw_persist "grep -q 'persist=1' \"$q_dispatch_log\""
 assert Q8_dispatch_saw_real_lock_file "! grep -q 'lockfile=<unset>' \"$q_dispatch_log\""
 assert Q8_dispatch_lock_file_matches "grep -q \"lockfile=$Q_LOCKS_DIR/qwiring.json\" \"$q_dispatch_log\""
+
+# ============================================================================
+# Z-series: Task 3 (label-native anonymization) full lifecycle + concurrency
+# refusal. Reuses the Q-series' already-sandboxed copies of the real driver
+# scripts (q_scripts) and stubbed orca/CLI binaries (q_bin) — pure copies of
+# the fixed source, unaffected by slug/topic, so there is no reason to
+# re-copy them for a different scenario.
+# ============================================================================
+
+# --- Z1: a real 3-round debate end to end (propose -> critique -> converge),
+# through the sandboxed driver + round script + a phase-aware dispatch stub
+# that extracts its write target FROM THE SPEC TEXT (never computes its own
+# label-to-path mapping) — the one place a stub could otherwise pass even if
+# debate_spec regressed to short-name paths. Topic text deliberately contains
+# no model name, since topic.md sits inside the debate directory too. ---
+z_root="$tmpdir/z-lifecycle"
+mkdir -p "$z_root"
+Z_DRIVER="$q_scripts/orca-debate.sh"
+Z_LABELS_DIR="$z_root/debate-labels"
+Z_MANIFESTS_DIR="$z_root/debate-manifests"
+Z_TOPIC="improve slow personal search across scattered notes"
+
+z_stub_dir="$tmpdir/z-stub"
+mkdir -p "$z_stub_dir"
+z_spec_log="$tmpdir/z-specs.log"
+: > "$z_spec_log"
+cat > "$z_stub_dir/orca-dispatch-role.sh" <<SH
+#!/usr/bin/env bash
+role="\$1"; shift
+spec=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --spec) spec="\$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+target="\$(printf '%s' "\$spec" | sed -n 's/.*this file: //p' | head -1)"
+mkdir -p "\$(dirname "\$target")"
+{
+  echo "===== \$role ====="
+  printf '%s\n' "\$spec"
+  echo
+} >> "$z_spec_log"
+if printf '%s' "\$spec" | grep -q ': PROPOSE'; then
+  {
+    echo "# stub propose"
+    echo "## Prior art"
+    echo "## Proposals"
+    echo "- Weakest link: stub"
+    echo "## Directions I deliberately rejected"
+  } > "\$target"
+elif printf '%s' "\$spec" | grep -q ': CRITIQUE'; then
+  {
+    echo "# stub critique"
+    echo "## Verdict per proposal"
+    echo "Verdict: SURVIVE"
+    echo "## Ranking"
+    echo "## Merged proposals"
+  } > "\$target"
+else
+  {
+    echo "# stub converge"
+    echo "## Differentiating axes"
+    echo "## Niche candidates"
+    echo "Kill condition: stub"
+    echo "## Dissent"
+  } > "\$target"
+fi
+echo "task_id=task_\${role}"
+SH
+chmod +x "$z_stub_dir/orca-dispatch-role.sh"
+
+Z_OLD_PATH="$PATH"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$z_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+z_rc=0
+"$Z_DRIVER" --topic "$Z_TOPIC" --slug zdebate --rounds 3 \
+  --dir-root "$z_root/debates" --labels-dir "$Z_LABELS_DIR" \
+  --manifests-dir "$Z_MANIFESTS_DIR" --lock-ttl-seconds 1800 \
+  >"$z_root/driver.out" 2>"$z_root/driver.err" || z_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Z_OLD_PATH"
+
+assert Z1_full_run_ok "[[ \"$z_rc\" -eq 0 ]]"
+Z_DEBATE_DIR="$z_root/debates/zdebate"
+assert Z1_debate_dir_exists "[[ -d \"$Z_DEBATE_DIR\" ]]"
+# Each round directory existing is not enough — verify all 4 debaters
+# actually landed usable, phase-appropriate content in EACH round, so a
+# regression that quietly starves one round (as a wrong-path extraction bug
+# in an earlier draft of this stub did to round 3, caught only by hand
+# during this task's own self-review — see task-3-report.md) fails loudly
+# here instead of hiding behind "the directory exists".
+for z_round in 1 2 3; do
+  z_round_file_count="$(find "$Z_DEBATE_DIR/round-$z_round" -maxdepth 1 -name '*.md' -type f | wc -l | tr -d ' ')"
+  assert "Z1_round${z_round}_has_four_files" "[[ \"$z_round_file_count\" -eq 4 ]]"
+done
+# All 4 files per round (not just at least one) carry the phase-appropriate
+# marker — a wrong-path extraction bug (see comment above) would leave some
+# or all of a round's real files EMPTY (never written) while the stub wrote
+# the content somewhere else instead, so this checks the count, not just
+# presence.
+for z_check in '1:propose' '2:critique' '3:converge'; do
+  z_r="${z_check%%:*}"
+  z_marker="stub ${z_check#*:}"
+  # `|| true` guards the same class of gotcha this file documents repeatedly
+  # elsewhere: under this file's `set -o pipefail`, a round directory with
+  # ZERO matching files makes the glob fail to expand, so `grep -l` receives
+  # a literal, nonexistent path and exits non-zero — which pipefail would
+  # otherwise propagate through `wc`/`tr` into this bare assignment and abort
+  # the WHOLE suite via `set -e`, precisely on the exact regression
+  # (round-N producing no real output) this assertion exists to catch. Found
+  # by deliberately reproducing that exact regression during this task's own
+  # self-review — see task-3-report.md.
+  z_marked_count="$(grep -l "$z_marker" "$Z_DEBATE_DIR"/round-"$z_r"/*.md 2>/dev/null | wc -l | tr -d ' ' || true)"
+  assert "Z1_round${z_r}_is_${z_check#*:}_content" "[[ \"${z_marked_count:-0}\" -eq 4 ]]"
+done
+
+# Step 1: nothing inside the completed debate directory names a model — in
+# filenames OR contents — asserted over the WHOLE tree. transcript.md is the
+# ONE deliberate, documented exception (build_transcript's own header
+# comment; "Ambiguity resolved" in task-3-report.md): it is written only
+# after the debate concludes, no round spec or debater instruction ever
+# points a debater at it, and its entire purpose is re-attributing by short
+# name for the human reader — checked separately below (Z1_transcript_is_
+# attributed) so this is an asserted exception, not an unexamined gap.
+z_tree_no_transcript="$tmpdir/z-tree-check"
+rm -rf "$z_tree_no_transcript"
+cp -R "$Z_DEBATE_DIR" "$z_tree_no_transcript"
+rm -f "$z_tree_no_transcript/transcript.md"
+assert Z1_no_model_names_in_contents \
+  "! grep -rqiE 'claude|codex|grok|gemini' \"$z_tree_no_transcript\""
+assert Z1_no_model_names_in_filenames \
+  "[[ -z \"\$(find \"$z_tree_no_transcript\" | grep -iE 'claude|codex|grok|gemini')\" ]]"
+
+# Step 6: the transcript DOES re-attribute by short name — the one place a
+# short name is meant to appear.
+assert Z1_transcript_is_attributed "grep -qi 'claude' \"$Z_DEBATE_DIR/transcript.md\""
+
+# Step 3: round-2 (critique) and round-3 (converge) specs' read paths, taken
+# literally, expose no authorship — verified against the FULL logged spec
+# text of every real dispatch this run made (not just round 2), and none of
+# them ever mentions a model name anywhere in the spec body either. The
+# "===== $role =====" separator lines are this TEST's own logging (the role
+# key, e.g. "debater_claude", is test harness bookkeeping — never sent to any
+# debater), so they are stripped before checking; keeping them in would
+# always fail this assertion regardless of debate_spec's actual output.
+z_spec_log_body="$(grep -v '^===== ' "$z_spec_log" || true)"
+assert Z1_specs_never_mention_model_names \
+  "! printf '%s' \"\$z_spec_log_body\" | grep -qiE 'claude|codex|grok|gemini'"
+assert Z1_critique_reads_round1_glob "grep -qF 'round-1/*.md' \"$z_spec_log\""
+assert Z1_converge_reads_round2_glob "grep -qF 'round-2/*.md' \"$z_spec_log\""
+
+# --- Z5 (Step 5 / deferred finding I1): re-running the SAME slug must not
+# let a previous run's output count as this run's. Plant a leftover file
+# that could not possibly have come from a real dispatch (wrong content) and
+# a stale transcript, then re-run the identical slug for real — the
+# driver's pre-round-1 wipe must remove both before anything is dispatched
+# again. ---
+mkdir -p "$Z_DEBATE_DIR/round-1"
+printf 'THIS-IS-STALE-AND-MUST-NOT-SURVIVE\n' > "$Z_DEBATE_DIR/round-1/ZZ.md"
+printf 'stale transcript from a previous run\n' > "$Z_DEBATE_DIR/transcript.md"
+
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$z_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+z5_rc=0
+"$Z_DRIVER" --topic "$Z_TOPIC" --slug zdebate --rounds 1 \
+  --dir-root "$z_root/debates" --labels-dir "$Z_LABELS_DIR" \
+  --manifests-dir "$Z_MANIFESTS_DIR" --lock-ttl-seconds 1800 \
+  >"$z_root/driver2.out" 2>"$z_root/driver2.err" || z5_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Z_OLD_PATH"
+
+assert Z5_rerun_ok "[[ \"$z5_rc\" -eq 0 ]]"
+assert Z5_stale_leftover_file_wiped "[[ ! -f \"$Z_DEBATE_DIR/round-1/ZZ.md\" ]]"
+assert Z5_stale_transcript_replaced \
+  "[[ -f \"$Z_DEBATE_DIR/transcript.md\" ]] && ! grep -q 'stale transcript' \"$Z_DEBATE_DIR/transcript.md\""
+
+# --- ZC: concurrency refusal (Task 3 extra scope). A live lock for a
+# DIFFERENT slug must block a brand-new debate from starting, with a reason
+# naming the other slug; a STALE other-slug lock must NOT block (positive
+# control — otherwise this would be far too conservative, given
+# lock_is_fresh's own "stays fresh for up to ttlSeconds after the owner
+# actually died" lag documented in orca-roles-lib.sh). Reuses Q_LOCKS_DIR
+# (== "$q_root/debate-locks", since q_scripts' $ORCH resolves to $q_root) and
+# the plain Q-series dispatch stub (--rounds 1, propose-only — no need for
+# the phase-aware Z stub here). ---
+lock_write "$Q_LOCKS_DIR/other-debate.json" "$$" other-debate 1800
+assert ZC0_other_lock_is_fresh "lock_is_fresh \"$Q_LOCKS_DIR/other-debate.json\""
+
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+zc_rc=0
+zc_out="$("$Q_DRIVER" --topic "a second, unrelated debate" --slug new-debate --rounds 1 \
+  --dir-root "$q_root/debates2" --lock-ttl-seconds 1800 2>&1)" || zc_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Z_OLD_PATH"
+
+assert ZC1_refuses_when_other_slug_live "[[ \"$zc_rc\" -ne 0 ]]"
+assert ZC1_names_the_other_slug "printf '%s' \"\$zc_out\" | grep -q 'other-debate'"
+assert ZC1_never_created_own_lock "[[ ! -f \"$Q_LOCKS_DIR/new-debate.json\" ]]"
+assert ZC1_never_dispatched_anything "[[ ! -d \"$q_root/debates2/new-debate/round-1\" ]]"
+
+# Positive control: make that same lock STALE (heartbeat past its own tiny
+# ttlSeconds) and confirm the identical attempt now succeeds.
+python3 - "$Q_LOCKS_DIR/other-debate.json" <<'PY'
+import json, datetime, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+d["ttlSeconds"] = 5
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+assert ZC2_other_lock_now_stale "! lock_is_fresh \"$Q_LOCKS_DIR/other-debate.json\""
+
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+zc2_rc=0
+"$Q_DRIVER" --topic "a second, unrelated debate" --slug new-debate --rounds 1 \
+  --dir-root "$q_root/debates2" --lock-ttl-seconds 1800 \
+  >"$q_root/zc2.out" 2>"$q_root/zc2.err" || zc2_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Z_OLD_PATH"
+
+assert ZC2_stale_other_lock_does_not_block "[[ \"$zc2_rc\" -eq 0 ]]"
+assert ZC2_own_lock_cleaned_up_after_normal_exit "[[ ! -f \"$Q_LOCKS_DIR/new-debate.json\" ]]"
 
 echo
 echo "Results: $pass passed, $fail failed"

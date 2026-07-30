@@ -3,6 +3,17 @@
 Date: 2026-07-29
 Status: approved by user; advisor verdict "수정 후 GO" — findings incorporated below
 
+> **2026-07-30 revision (Task 3, label-native anonymization):** the original design below
+> ("§2 Anonymization") described writing round output under a model's own name and then copying
+> a redacted version elsewhere. That shipped with five confirmed authorship leaks — the anonymized
+> copy differed from its named original by exactly one line, so a single `diff` deanonymized it;
+> the label map itself lived inside the debate directory that every round-2 spec was told to read;
+> round 3 pointed a debater at its own round-1 file by model-named path; the manifest recorded
+> `{"debater": "claude", …}` inside the debate directory; and labels were assigned positionally
+> from `--debaters` order, itself a public constant, so `A=claude` was derivable from source alone
+> regardless of where the key file lived. §2 and §4 below are updated in place to describe what
+> actually ships now, not the original (broken) design. See `task-3-report.md` for the fix.
+
 ## Goal
 
 Add an orchestration mode where Claude, Codex (GPT), Grok, and Gemini propose ideas to each
@@ -62,28 +73,56 @@ R2 critique  each debater reads the other three proposals under anonymous labels
 R3 converge  narrow to 1-2 niche candidates with kill conditions
 ```
 
-### Anonymization
+### Anonymization (label-native — Task 3)
 
-A debater's own output files are named after it (`round-1/claude.md`), so they can never be
-handed to another debater directly. Before each round that consumes prior work, the round script
-writes **anonymized copies** under stable labels:
+Round output is written under its label from the start: `round-1/A.md`, `round-2/B.md`,
+`round-3/C.md`. There is no model-named original anywhere and no copy step — the earlier design
+(write as `round-1/claude.md`, then copy a redacted version to `round-2/proposal-A.md`) is what
+produced the one-line-diff leak above, structurally, regardless of what the copy's header said:
+any two files that both exist and differ by exactly the author line are one `diff` away from
+deanonymizing each other. Removing the named original removes the defect at its root.
 
-- after R1 → `round-2/proposal-{A,B,C,D}.md`
-- after R2 → `round-3/critique-{A,B,C,D}.md`
+**Label assignment is shuffled per debate**, not positional from `--debaters` order — the CSV
+order is itself a public constant (`DEBATERS_DEFAULT` in `orca-debate-lib.sh`), so a positional
+A=first-in-roster scheme is derivable from source alone no matter where the key file lives.
+`debate_label_map_ensure` (in `orca-debate-lib.sh`) shuffles fresh on creation via Python's
+`random`, and is the **only** function that ever creates or rewrites the map.
 
-The label→model mapping is assigned once, recorded in `round-2/label-map.json`, and reused for
-both sets, so "Proposal C" and "Critique C" are the same debater throughout. Model names never
-appear inside a copy. Each spec states which label is that debater's own.
+**Ownership is driver-only.** The label map lives at `$ORCH/debate-labels/<slug>.json` — outside
+the debate directory entirely — and records `{"slug", "roster", "labels"}` (roster recorded so a
+roster change on a re-run is detected and rebuilt, never silently reused — see §3.3). Only
+`orca-debate.sh` (the driver) ever creates, rebuilds, or decides this file's lifecycle;
+`orca-debate-round.sh` only ever reads it, via a required `--label-map <path>` flag the driver
+passes down. The per-round manifest (`{"debater": "claude", "taskId": …, "status": …}` — real
+short names, needed for driver-side debugging) moves the same way, to
+`$ORCH/debate-manifests/<slug>/round-N.json`, passed via an optional `--manifest <path>` flag.
+Neither file is ever named in a debater's dispatch spec.
 
-Rationale: when a model sees "this came from Opus", status deference collapses the debate into
-agreement — and that applies to critiques as much as to proposals. Anonymizing both is one extra
-call to the same helper.
+Rationale for shuffling + external ownership: when a model sees "this came from Opus" — or can
+derive it from a public roster-order constant — status deference collapses the debate into
+agreement. Both proposals and critiques circulate under the same stable per-debate labels, so
+"Proposal C" and "Critique C" are the same debater throughout one debate.
+
+**Honest limit — this is not cryptographic.** The achievable guarantee is: nothing instructs a
+debater to deanonymize, and no single `diff`, `glob`, or file read *inside the debate directory*
+reveals authorship. Debaters run under the same permission-bypass flags as every other role (see
+`role_launch_cmd`), so a debater that went off its instructions could still read
+`dispatch-ledger.jsonl`, `handles.json`, `terminal-journal.jsonl`, or `orca terminal list` titles
+— none of those live inside the debate directory and no spec ever points a debater at them, but
+none are hidden from a process with full filesystem access either. `templates/roles.yaml`'s
+`read_only` field is documented as prompt-enforced, not a sandboxing fact, for the same reason.
+The transcript (`transcript.md`, written only after the debate concludes, never referenced by any
+round spec) is the one deliberate exception: it re-attributes each round file back to its real
+short name for the human reader, via a reverse lookup through the external label map.
 
 ### Context passing
 
-Round specs pass **file paths, not inlined text**. R2 specs point at `round-2/proposal-*.md`;
-R3 specs point at `round-3/critique-*.md`. This keeps the injected preamble small and removes any
-need for character-count truncation of debate content.
+Round specs pass **file paths, not inlined text**, and always point at the PREVIOUS round's own
+directory (every file in it is already label-named — nothing to copy or redact): a critique
+spec (round N=2) reads `round-1/*.md`; a converge spec (round N=3) reads `round-2/*.md` for the
+critiques and its own `round-1/<own-label>.md` for its own earlier proposal — by label, never by
+model-named path (the literal `round-1/<short>.md` path was the R3 leak above). This keeps the
+injected preamble small and removes any need for character-count truncation of debate content.
 
 ### Round output schemas
 
@@ -183,22 +222,34 @@ Closing becomes the driver's responsibility (§3.3).
 ### 3.2 `scripts/orca-debate-round.sh` (primitive — one round)
 
 ```
-orca-debate-round.sh --slug <s> --round <N> --phase propose|critique|converge
-                     --dir <debate-dir> [--debaters a,b,c,d] [--timeout-ms N]
+orca-debate-round.sh --dir <debate-dir> --round <N> --phase propose|critique|converge
+                     --label-map <path> [--manifest <path>]
+                     [--debaters a,b,c,d] [--timeout-ms N]
 ```
 
-1. Build a per-debater spec: phase template + topic + assigned output path + (R2/R3) the paths
-   to read.
+1. Build a per-debater spec: phase template + topic + assigned output path (this round's own
+   directory, named by that debater's LABEL — `round-N/<label>.md`, looked up via
+   `debate_label_of` against `--label-map`) + (critique/converge) the previous round's own
+   directory to read.
 2. Dispatch each debater via `orca-dispatch-role.sh <role> --spec … --persist`, parsing the
    `task_id=` line from its stdout. Reusing that script inherits `ensure_terminal` (recreate dead
-   tabs, reseed persona) and the dispatch ledger.
+   tabs, reseed persona) and the dispatch ledger. Immediately before dispatch, any pre-existing
+   file at that debater's target path is removed — a stale file left by a previous, crashed run
+   at the exact same path must never be mistaken for this run's output (deferred finding I1).
 3. Poll `orca orchestration dispatch-show --task <id> --json` per task until `completed|failed`
    — the same non-consuming mechanism `orca-reap-task.sh` uses. **No inbox consumption**, so the
    round collector never races the reaper, another supervised task, or the coordinator's own
    `check --wait`.
 4. Completion for a debater = `status=completed` **and** its output file exists and is non-empty.
-5. Write the anonymized copies for the next round (`proposal-*.md` after R1, `critique-*.md`
-   after R2), creating `label-map.json` on the first call and reusing it afterwards.
+5. Nothing to prepare for the next round: output was already written directly under its label
+   name in step 1, so there is no copy or redaction step (Task 3 removed it — see §2). The
+   per-round manifest, if `--manifest` was given, is written there directly (real short names —
+   driver-only, outside the debate directory).
+
+`--label-map` is required and must already exist for a real (non-dry-run) round — this script
+never creates or owns it (see §2's "ownership is driver-only"); a missing file is a usage error
+(exit 1), not a quorum failure (exit 2). `--dry-run` tolerates a missing/absent map (falls back to
+a "?" placeholder for the own-label preview text) since nothing is actually dispatched.
 
 **Naming.** A debater's short name is its role key minus the `debater_` prefix — `claude`,
 `codex`, `grok`, `gemini`. Short names are what `--debaters` accepts and what output files are
@@ -221,8 +272,26 @@ orca-debate.sh --topic "…" | --topic-file <f>
 - **Preflight**: `command -v` each selected debater's CLI (`claude`/`codex`/`grok`/`agy`) and
   `orca status --json` reachability. Missing CLIs are dropped from the roster with a warning; if
   fewer than 3 remain, abort before creating anything.
-- Creates the debate directory, writes `topic.md`, runs R1 → R2 → R3 through the round script.
-- Concatenates `transcript.md`.
+- **Refuses to start if another slug's debate is currently live** (Task 3): before writing its own
+  lock, the driver enumerates every OTHER file under `$ORCH/debate-locks/*.json` and refuses (exit
+  1, naming the other slug and its owner pid) if any of them is fresh (`lock_is_fresh`) — because
+  `ensure_terminal` reuses each role's terminal globally, two concurrent debates under different
+  slugs would otherwise dispatch into the SAME four agent sessions (observed live: a second
+  driver's cleanup closed the first driver's tabs mid-round). A stale other-slug lock does not
+  block. `--slug` is sanitized (rejects `/`, `..`, empty) before it is used to build a path.
+- Creates the debate directory, writes `topic.md`. For a real (non-dry-run) run of a given slug,
+  clears any previous run's `round-*/`, `transcript.md`, and manifests for that slug first — there
+  is no partial-resume feature (the loop below always restarts at round 1), so a prior run's
+  leftovers must never be mistaken for this run's (deferred finding I1). Then
+  creates/rebuilds the label map (`debate_label_map_ensure`) before round 1. `--dry-run` never
+  writes the real label map — it uses a throwaway `mktemp` path instead, so a partial-roster
+  preview can never poison a later real run.
+- Runs R1 → R2 → R3 through the round script, passing `--label-map`/`--manifest` down each time.
+  Distinguishes the round script's exit 2 (quorum genuinely failed) from exit 1 (a usage/internal
+  error in the round script itself) — treating them the same would misreport a usage bug as a
+  debate that failed to converge.
+- Concatenates `transcript.md`, re-attributing each round file back to its real short name via the
+  external label map (falling back to the raw label if the map is unavailable).
 - `--judge <role>` dispatches that role to write the decision document; otherwise prints the
   coordinator instruction to write it.
 - **Closes all debater tabs on exit** via `trap … EXIT INT TERM`, reusing `orca-close-role.sh`.
@@ -238,7 +307,9 @@ R2/R3 (15 min each). `--timeout-ms` overrides all rounds.
 value is documentation only — no script enforces it (verified by grep; the sole occurrence is
 `templates/roles.yaml:479`) — and it exists to prevent two roles from editing the same files.
 Debaters never edit project files, so the debate path is exempt. Recorded explicitly as
-`lifecycle.debate` in `roles.yaml` rather than left as an undocumented violation.
+`lifecycle.debate` in `roles.yaml` rather than left as an undocumented violation. Two *debates*
+running at once is a different, cross-slug concurrency problem — see the driver-refusal bullet
+above.
 
 ### 3.4 Schema lint
 
@@ -263,17 +334,25 @@ worth the complexity until we see how often real outputs drift.
 ```
 .orca/orchestration/debates/<slug>/        # gitignored (local runtime state)
   topic.md
-  round-1/{claude,codex,grok,gemini}.md  manifest.json
-  round-2/proposal-{A,B,C,D}.md  label-map.json  {claude,…}.md  manifest.json
-  round-3/critique-{A,B,C,D}.md  {claude,…}.md  manifest.json
-  transcript.md
+  round-1/{A,B,C,D}.md                     # label-named from the start — no model-named file
+  round-2/{A,B,C,D}.md
+  round-3/{A,B,C,D}.md
+  transcript.md                            # the ONE place real short names appear (re-attributed)
 docs/ideas/YYYY-MM-DD-<slug>.md            # decision document (committed)
+
+.orca/orchestration/debate-labels/<slug>.json          # {"slug","roster","labels"} — driver-only
+.orca/orchestration/debate-manifests/<slug>/round-N.json  # real names, task id, status, flags — driver-only
 ```
 
-`manifest.json` per round records, for each debater: task id, status, forfeit/lint flags.
+The label map and per-round manifests are deliberately **outside** `debates/<slug>/` — nothing a
+debater's dispatch spec ever points at, and nothing that would survive a `glob`/`diff`/read of the
+debate directory tree. Only the driver (`orca-debate.sh`/`orca-debate-round.sh`) ever reads them;
+a debater running off its instructions could still find them (see §2's honest limit), but no
+instruction ever tells it to look, and neither lives where "read every file matching
+`round-N/*.md`" would ever reach.
 
-The installer appends `.orca/orchestration/debates/` to the project `.gitignore` alongside the
-existing `handles.json` entry.
+The installer appends `.orca/orchestration/debates/`, `debate-labels/`, and `debate-manifests/` to
+the project `.gitignore` alongside the existing `handles.json` entry.
 
 ### Decision document contract
 
