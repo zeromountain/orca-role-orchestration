@@ -4373,6 +4373,144 @@ assert TR9_seed_succeeds "[[ \"$tr9_rc\" -eq 0 ]]"
 assert TR9_floor_enforced_via_journal "[[ \"$tr9_elapsed\" -ge 2 ]]"
 assert TR9_journal_entry_written "[[ -s \"$tr9_dir/orch/terminal-journal.jsonl\" ]]"
 
+# ----------------------------------------------------------------------------
+# Fix round 2 (Task 2), from live verification: a REAL false not-ready — a
+# genuinely ready grok terminal was refused because its prompt was framed
+# inside a box-drawing border ("  │ ❯"), which `ln.strip().startswith(...)`
+# does not survive (str.strip() removes whitespace only, never "│"). Also:
+# codex's directory-trust dialog matched no negative marker, and since
+# codex has no positive pattern, that screen fell through to
+# _terminal_ready_check's own "nothing vetoed it -- READY" default: a real
+# false-READY, not just a worse diagnostic, caught downstream only because
+# that seat happened to be a debater_* role with its own separate marker
+# hard-gate. Both fixed in scripts/orca-roles-lib.sh; this section proves it.
+# ----------------------------------------------------------------------------
+
+# --- TR10: the exact live grok screen (verbatim, not paraphrased) that
+# exposed the decoration bug, embedded in a quoted heredoc so bash performs
+# zero interpolation on it. TR10_fixture_byte_faithful hardcodes a SHA-256
+# of the intended content and is asserted FIRST, before any behavioral
+# assertion, so a future accidental edit to this fixture (an editor
+# normalizing whitespace, a unicode character silently changed) fails
+# loudly as a wrong-fixture problem rather than a silently-drifted gate
+# test. This same fixture also proves, for real rather than by argument:
+# the "Quit" first-run menu remnant and splash art are on screen at the
+# SAME TIME as the working prompt (live evidence for round 1's positive-
+# before-negative ordering decision), and a version-update notice trails
+# AFTER the prompt as the tail's actual last line (see TR13/TR14 below for
+# why that shape matters for antigravity's own warm-terminal check too).
+tr10_dir="$tmpdir/tr10"
+mkdir -p "$tr10_dir/bin"
+cat > "$tr10_dir/screen.txt" <<'TR10SCREEN'
+   │                   Quit
+   │
+   ╰────────────────────────────────────────────────────────────────────────────
+      ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄
+      ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀
+      ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀
+      ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀
+      ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀
+      ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀
+  Tip:⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀to background a running terminal command.
+  ╭─────────────────────────────────────────────────────────────────────────────
+  │ ❯
+  ╰─────────────────────────────────────────────────────────────────────────────
+  Update: v0.2.117 available — press ctrl+u to restart
+TR10SCREEN
+tr10_expected_sha256="765de698c6270d9cdf7702b72e5f1b95d3ba9ca0ad8c5a629e369d7e356b937d"
+tr10_actual_sha256="$(shasum -a 256 "$tr10_dir/screen.txt" | awk '{print $1}')"
+assert TR10_fixture_byte_faithful "[[ \"$tr10_actual_sha256\" == \"$tr10_expected_sha256\" ]]"
+
+cat > "$tr10_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+python3 - "$TR10_SCREEN_FILE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+lines = text.split("\n")
+if lines and lines[-1] == "":
+    lines = lines[:-1]
+print(json.dumps({"ok": True, "result": {"terminal": {"handle": "term_tr10", "status": "running", "tail": lines}}}))
+PYEOF
+exit 0
+ORCASTUB
+chmod +x "$tr10_dir/bin/orca"
+tr10_out="$(
+  export PATH="$tr10_dir/bin:$PATH"
+  export TR10_SCREEN_FILE="$tr10_dir/screen.txt"
+  _terminal_ready_check term_tr10 grok
+)"
+assert TR10_live_grok_screen_is_ready "printf '%s\n' \"\$tr10_out\" | head -n1 | grep -qx READY"
+assert TR10_quit_and_splash_present_alongside_ready \
+  "printf '%s\n' \"\$tr10_out\" | grep -qF 'Quit'"
+
+# --- TR11: codex's directory-trust dialog, worded as reported live ("You
+# are in <path>. Do you trust the contents of this directory? Working with
+# untrusted..."), must be judged not-ready AND the reason must name the
+# trust dialog specifically -- not a generic "no known pattern" verdict,
+# and certainly not the false READY this exact screen produced before this
+# marker existed (codex has no positive pattern to fall back on).
+tr11_dir="$tmpdir/tr11"
+mkdir -p "$tr11_dir/bin"
+cat > "$tr11_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr11","status":"running","tail":["You are in /Users/example/orca-role-orchestration.","Do you trust the contents of this directory?","Working with untrusted code carries risk."]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr11_dir/bin/orca"
+tr11_out="$(export PATH="$tr11_dir/bin:$PATH"; _terminal_ready_check term_tr11 codex)"
+assert TR11_codex_trust_dialog_not_ready "printf '%s\n' \"\$tr11_out\" | head -n1 | grep -q NOT_READY"
+assert TR11_codex_trust_dialog_names_cause \
+  "printf '%s\n' \"\$tr11_out\" | head -n1 | grep -qF 'Do you trust the contents of this directory'"
+
+# --- TR12: the decoration-tolerance fix applies to every CLI's positive
+# pattern, not just grok's -- claude's own prompt glyph, framed the
+# identical way ("  │ ❯"), plus the bypass-permissions status line, must
+# still classify READY.
+tr12_dir="$tmpdir/tr12"
+mkdir -p "$tr12_dir/bin"
+cat > "$tr12_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr12","status":"running","tail":["  │ ❯","some-project · bypass permissions on · 28%"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr12_dir/bin/orca"
+tr12_out="$(export PATH="$tr12_dir/bin:$PATH"; _terminal_ready_check term_tr12 claude)"
+assert TR12_claude_framed_prompt_still_ready "printf '%s\n' \"\$tr12_out\" | head -n1 | grep -qx READY"
+
+# --- TR13/TR14: antigravity's warm-terminal check must not depend on the
+# prompt being the tail's LAST line -- round 1's design did, and TR10's
+# live evidence (a version-update notice trailing after a genuinely
+# working prompt) proved that axis wrong; CONTENT (bareness), not
+# position, is what actually discriminates a real idle prompt from a
+# mid-response blockquote. Together these two complete the matrix: bare-
+# and-not-last (TR13) must be READY; non-bare-and-last (TR14) must still be
+# NOT_READY -- proving position genuinely does not matter either way (TR3f
+# already covers bare-and-last; TR3g already covers non-bare-and-not-last).
+tr13_dir="$tmpdir/tr13"
+mkdir -p "$tr13_dir/bin"
+cat > "$tr13_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr13","status":"running","tail":["some earlier response content, banner long scrolled off","> ","Update: v1.2.3 available -- press ctrl+u to restart"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr13_dir/bin/orca"
+tr13_out="$(export PATH="$tr13_dir/bin:$PATH"; _terminal_ready_check term_tr13 antigravity)"
+assert TR13_antigravity_bare_prompt_not_last_line_still_ready \
+  "printf '%s\n' \"\$tr13_out\" | head -n1 | grep -qx READY"
+
+tr14_dir="$tmpdir/tr14"
+mkdir -p "$tr14_dir/bin"
+cat > "$tr14_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr14","status":"running","tail":["some earlier response content, banner long gone","> this looks like a quoted line but is NOT the current prompt"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr14_dir/bin/orca"
+tr14_out="$(export PATH="$tr14_dir/bin:$PATH"; _terminal_ready_check term_tr14 antigravity)"
+assert TR14_antigravity_nonbare_last_line_still_not_ready \
+  "printf '%s\n' \"\$tr14_out\" | head -n1 | grep -q NOT_READY"
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

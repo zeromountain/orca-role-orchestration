@@ -356,28 +356,55 @@ if not joined.strip():
     raise SystemExit(0)
 
 
+# Fix round 2 (live verification): a real grok terminal was refused while
+# genuinely ready. Its prompt was framed inside a box-drawing border ("  │
+# ❯", not "❯" at line start) -- the observed-data table said "'❯' prompt"
+# without noting the frame, and round 1 implemented that literally via
+# `ln.strip().startswith(needle)`, which a leading "│" defeats (str.strip()
+# only removes whitespace, never other characters). Fixed by stripping a
+# small, explicit set of leading DECORATION characters -- whitespace plus
+# common box-drawing vertical-bar variants -- before checking the prompt
+# glyph, repeatedly from the left until nothing more can be stripped (so
+# "  │ ❯" reduces to "❯" the same way "  ❯" already did). Applied to every
+# CLI's positive check, not just grok's, per the same live-verification
+# finding: claude happened to pass live, but nothing about its own pattern
+# would have survived the identical framing, and that failure would block
+# ordinary dispatch for the six pre-existing roles, not just a debate seat.
+_DECORATION_CHARS = " \t│┃║|"
+
+
+def _strip_leading_decoration(line):
+    i = 0
+    while i < len(line) and line[i] in _DECORATION_CHARS:
+        i += 1
+    return line[i:]
+
+
 def has_prompt_line(needle):
-    return any(ln.strip().startswith(needle) for ln in lines)
+    return any(_strip_leading_decoration(ln).startswith(needle) for ln in lines)
 
 
 # Positive per-CLI ready pattern, checked BEFORE negative markers below. See
 # the grok row of the observed-data table: its ready prompt "may sit below a
 # first-run menu" -- the menu text can be genuinely present on a terminal
-# that, right now, is fully able to receive input (confirmed directly: text
-# sent to a grok terminal on this exact screen was accepted and answered
-# normally). Vetoing on menu text regardless of prompt presence would also
-# risk misjudging `thrifty` (a pre-existing PRODUCTION role that launches
-# grok, not a debater) as not-ready every time that menu lingers on screen --
-# exactly the regression this task warns against. So a CLI's own positive
-# prompt match, when it matches, wins outright; negative markers are only
-# evaluated when the positive check does not (yet) confirm readiness.
+# that, right now, is fully able to receive input (confirmed directly, twice
+# now: text sent to a grok terminal on this exact screen was accepted and
+# answered normally, and a LIVE run refused a real grok seat showing this
+# exact combination -- splash art, a "Quit" menu remnant, AND a working
+# framed prompt -- before round 2's decoration fix). Vetoing on menu text
+# regardless of prompt presence would also risk misjudging `thrifty` (a
+# pre-existing PRODUCTION role that launches grok, not a debater) as
+# not-ready every time that menu lingers on screen -- exactly the regression
+# this task warns against. So a CLI's own positive prompt match, when it
+# matches, wins outright; negative markers are only evaluated when the
+# positive check does not (yet) confirm readiness.
 positive_known = True
 if cli == "claude":
     ready = has_prompt_line("❯") and ("bypass permissions on" in joined)
-    positive_desc = "'❯' prompt + 'bypass permissions on' status line"
+    positive_desc = "'❯' prompt (decoration-tolerant) + 'bypass permissions on' status line"
 elif cli == "grok":
     ready = has_prompt_line("❯")
-    positive_desc = "'❯' prompt"
+    positive_desc = "'❯' prompt (decoration-tolerant)"
 elif cli == "antigravity":
     # Two sub-cases, not one: the observed-data table's phrasing ("'>'
     # prompt AFTER an Antigravity CLI banner") describes a BOOT SEQUENCE,
@@ -389,28 +416,51 @@ elif cli == "antigravity":
     # banner may have scrolled out of a full-screen TUI's current frame
     # long ago -- requiring it unconditionally would risk misjudging an
     # ordinary, already-ready production terminal as not-ready on every
-    # dispatch (advisor review flagged this directly: unverified against a
-    # real live agy session, and the safer assumption is that it might not
-    # persist). So: banner present -> corroborate with ANY prompt-shaped
-    # line (matches the boot sequence verbatim). Banner absent (warm case)
-    # -> require the prompt to be the CURRENT LAST non-blank line, not just
-    # present anywhere -- a stricter, position-based signal a bare
-    # "anywhere in the tail" check can't give, and specifically one a
-    # mid-response markdown blockquote ("> quoted text") would NOT satisfy
-    # unless it happened to be the terminal's literal last rendered line.
+    # dispatch. So: banner present -> corroborate with ANY prompt-shaped
+    # line (matches the boot sequence verbatim, decoration-tolerant).
+    # Banner absent (warm case) -> round 1 required the prompt to be the
+    # CURRENT LAST non-blank line, on the theory that position alone could
+    # distinguish a real idle prompt from a mid-response markdown
+    # blockquote ("> quoted text"). Round 2's live grok evidence overturned
+    # that theory: a version-update notice was the terminal's actual last
+    # line, AFTER a genuinely working prompt -- a real UI element, not a
+    # contrived edge case, that a last-line requirement would misjudge as
+    # not-ready. Position was never the right axis; CONTENT is -- a bare
+    # prompt (decoration-stripped ">" with nothing but optional trailing
+    # whitespace after it) reads as an idle input box regardless of where
+    # it sits in the tail, while a blockquote's line has real text after
+    # the "> " and is correctly rejected on that basis, not its position.
     def is_agy_prompt_line(ln):
-        s = ln.strip()
+        s = _strip_leading_decoration(ln)
         return s == ">" or s.startswith("> ")
 
+    def is_bare_agy_prompt_line(ln):
+        s = _strip_leading_decoration(ln)
+        if s == ">":
+            return True
+        if s.startswith(">"):
+            return s[1:].strip() == ""
+        return False
+
+    # Note the asymmetry: fresh-boot stays loose (any "> "-prefixed line,
+    # not necessarily bare), warm requires bareness. Not an oversight --
+    # requiring bareness during boot too risks a DIFFERENT false-not-ready:
+    # an idle input box showing inline placeholder text (e.g. "> Type a
+    # message") is a plausible real UI, and boot is corroborated by the
+    # banner besides, so the extra strictness buys nothing there and could
+    # cost a false refusal. The warm case has no such corroboration and is
+    # the one actually exposed to blockquote-shaped content (an agent only
+    # generates prose, and therefore only risks looking like a blockquote,
+    # once it is already past boot and has started responding), so that is
+    # where the stricter check earns its keep.
     banner_present = "Antigravity CLI" in joined
-    nonblank_lines = [ln for ln in lines if ln.strip()]
     if banner_present:
         ready = any(is_agy_prompt_line(ln) for ln in lines)
     else:
-        ready = bool(nonblank_lines) and is_agy_prompt_line(nonblank_lines[-1])
+        ready = any(is_bare_agy_prompt_line(ln) for ln in lines)
     positive_desc = (
         "'Antigravity CLI' banner + any '>' prompt line (fresh boot), "
-        "or a trailing '>' prompt as the terminal's current last line (warm)"
+        "or a bare '>' prompt with nothing after it, anywhere in the tail (warm)"
     )
 else:
     # codex (no ready screen was ever captured -- the brief is explicit
@@ -425,14 +475,27 @@ if positive_known and ready:
     raise SystemExit(0)
 
 GENERIC_NEGATIVE = [
-    # Real, known first-run screens for `claude` specifically (this
-    # project's own CLI): a trust dialog and a theme-selection wizard.
-    # Treated as generic (checked for every cli) rather than claude-only,
-    # since we have no positive evidence they are impossible on any other
-    # CLI either, and false-veto risk here is low -- both phrases are
-    # distinctive, multi-word, and not the kind of text a normal ready
-    # prompt would ever incidentally contain.
+    # Trust/permission dialogs. Originally documented as "claude-specific";
+    # round 2's live verification proved that framing wrong -- a REAL codex
+    # seat sat on a directory-trust dialog worded entirely differently
+    # ("Do you trust the contents of this directory? Working with
+    # untrusted...") from claude's own ("Do you trust the files in this
+    # folder"). Genuinely cross-CLI, not a claude quirk, and the stakes are
+    # higher for codex specifically than a worse diagnostic: codex has NO
+    # positive pattern (see above), so before this marker existed, this
+    # exact screen matched no negative marker either and fell through to
+    # this function's own "nothing vetoed it -- READY" default for
+    # codex -- a genuine false-READY, caught downstream only because that
+    # particular seat happened to be a debater_* role whose separate,
+    # stricter seed-marker hard gate (see seed()) retried and eventually
+    # failed. A pre-existing role on the same CLI (executor launches codex)
+    # has no such downstream net -- its marker check is soft/informational
+    # by design (Task 2 requirement 4) and would have logged an info line
+    # and reported success. Both phrasings are distinctive, multi-word, and
+    # not the kind of text a normal ready prompt would ever incidentally
+    # contain, so adding the second does not raise false-veto risk.
     "Do you trust the files in this folder",
+    "Do you trust the contents of this directory",
     "Select a theme",
 ]
 CLI_NEGATIVE = {
@@ -441,8 +504,14 @@ CLI_NEGATIVE = {
     # in an ordinary ready screen's own footer/hint text (e.g. "ctrl+c to
     # quit"), and the self-review directive here is to bias against
     # misjudging a genuinely ready terminal as not-ready -- precision over
-    # recall for this one marker. The other three are multi-word, specific,
-    # and were not observed on any ready screen.
+    # recall for this one marker. Round 2's live verification confirmed this
+    # directly rather than hypothetically: the real grok seat that exposed
+    # the decoration bug above had "Quit" on screen (a leftover first-run
+    # menu remnant) at the exact same time as a genuinely working prompt --
+    # this marker is also moot regardless, since the positive-before-
+    # negative ordering above means it would never be reached once the
+    # prompt matches anyway. The other three are multi-word, specific, and
+    # were not observed on any ready screen.
     "grok": ["New worktree", "Resume session", "Changelog"],
 }
 for marker in GENERIC_NEGATIVE + CLI_NEGATIVE.get(cli, []):
