@@ -683,6 +683,27 @@ assert G2_wait_cmd_hint_has_task "grep -q -- '--task ID' \"$ROOT/commands/wait.m
 g3_unsafe="$(grep -rnE 'orca-wait-done\.sh\"? +--' "$ROOT/scripts"/*.sh 2>/dev/null | grep -- '--role' | grep -v -- '--task' || true)"
 assert G3_no_script_emits_bare_role_wait "[[ -z \"\$g3_unsafe\" ]]"
 
+# --- G4: orca-fallback-on-limit.sh used to print its own wait-done command
+# with a hand-edit `--task <placeholder>` — pure duplication of what
+# orca-dispatch-role.sh's trailing summary already streams (the failover
+# dispatch runs WITHOUT --wait, so the dispatcher reaches that summary, and
+# its stdout is not captured), in a strictly worse form: the placeholder had
+# to be edited by hand, and its `--timeout-ms 900000` is already
+# orca-wait-done.sh's own default. It now points at the dispatcher's line
+# instead. That pointer is prose, so it DEPENDS on the dispatcher still
+# emitting a task-pinned wait-done suggestion — pin both halves here, or a
+# future edit to either side silently turns the guidance into a dangling
+# reference. Computed into variables first, then asserted, so the patterns
+# never have to survive a round of eval quoting (same idiom as G3/CT1). ---
+g4_optional_block="$(grep -n 'optional block:' "$ROOT/scripts/orca-dispatch-role.sh" 2>/dev/null || true)"
+assert G4_dispatch_still_prints_optional_block "[[ -n \"\$g4_optional_block\" ]]"
+assert G4_optional_block_names_wait_done "printf '%s' \"\$g4_optional_block\" | grep -q -- 'orca-wait-done.sh'"
+assert G4_optional_block_is_task_pinned "printf '%s' \"\$g4_optional_block\" | grep -q -- '--task'"
+assert G4_fallback_prints_no_own_wait_cmd \
+  "! grep -q -- 'orca-wait-done.sh --role' \"$ROOT/scripts/orca-fallback-on-limit.sh\""
+assert G4_fallback_has_no_placeholder_task \
+  "! grep -q -- 'task_id printed above' \"$ROOT/scripts/orca-fallback-on-limit.sh\""
+
 
 # ============================================================================
 # Task 1 (terminal lifecycle): H-series. All use a stubbed `orca` on PATH
