@@ -258,4 +258,4 @@ fi
 
 echo "Dispatched. task_id=$TASK_ID handle=$HANDLE"
 echo "  status: orca orchestration dispatch-show --task $TASK_ID --json"
-echo "  optional block: .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE"
+echo "  optional block: .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE --task $TASK_ID"

@@ -659,6 +659,30 @@ assert G2_playbook_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty
 assert G2_scripts_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty --task' \"$ROOT/templates/SCRIPTS.md\""
 assert G2_wait_cmd_hint_has_task "grep -q -- '--task ID' \"$ROOT/commands/wait.md\""
 
+# --- G3 (item 6 remainder): the three assertions above pin the DOCS, but the
+# same unsafe form was still being EMITTED AT RUNTIME by two scripts —
+# orca-dispatch-role.sh printed an "optional block:" suggestion with a bare
+# --role immediately after printing the very task_id that makes it safe, and
+# orca-fallback-on-limit.sh printed the same shape for ROLE=fallback. A
+# printed suggestion is strictly more dangerous than a static doc line: it is
+# offered in copy-paste form at the exact moment the user is choosing their
+# next command. templates/SCRIPTS.md:28-29 had already been fixed to say
+# "always pass --task … bare --role can act on a leftover worker_done", so the
+# repo was contradicting itself within one review item.
+#
+# This is a source-grep guard rather than a runtime-output assertion, matching
+# how this suite already pins cross-script invocation shapes (see the dispatch
+# --wait check and the ledger-atomicity greps). It is deliberately
+# INVOCATION-SHAPED — `orca-wait-done.sh` followed immediately by a flag — so
+# that prose mentioning the script and the word --role in the same sentence
+# (orca-dispatch-role.sh's own explanatory comment does exactly that) is not a
+# false positive, while every real invocation and every copy-pasteable
+# suggestion is covered. Any line that passes --role must pin --task on the
+# same line; usage lines that pass neither (--timeout-ms/--no-close/--types)
+# are untouched.
+g3_unsafe="$(grep -rnE 'orca-wait-done\.sh\"? +--' "$ROOT/scripts"/*.sh 2>/dev/null | grep -- '--role' | grep -v -- '--task' || true)"
+assert G3_no_script_emits_bare_role_wait "[[ -z \"\$g3_unsafe\" ]]"
+
 
 # ============================================================================
 # Task 1 (terminal lifecycle): H-series. All use a stubbed `orca` on PATH

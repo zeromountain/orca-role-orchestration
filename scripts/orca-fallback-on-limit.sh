@@ -142,4 +142,12 @@ EOF
 
 "$DISPATCH" fallback --spec "$FULL_SPEC"
 echo "Failover dispatched to ROLE=fallback."
-echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --timeout-ms 900000"
+# --task is a PLACEHOLDER here on purpose: this script does not capture the
+# dispatcher's stdout (item 5 removed exactly that kind of live pipe on the
+# dispatcher, and re-adding one to harvest the id would risk the same class of
+# failure), so the real id is the `task_id=` the dispatch above just printed.
+# Pasted verbatim, this line fails loudly on an unknown task instead of
+# silently acting on a leftover worker_done from another flow — a bare --role
+# would close whatever tab handles.json maps that role to. See
+# orca-wait-done.sh's own header for the full failure mode.
+echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --task <task_id printed above> --timeout-ms 900000"

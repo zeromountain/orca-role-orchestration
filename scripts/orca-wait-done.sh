@@ -37,7 +37,7 @@
 #   .orca/orchestration/scripts/orca-wait-done.sh
 #   .orca/orchestration/scripts/orca-wait-done.sh --timeout-ms 900000
 #   .orca/orchestration/scripts/orca-wait-done.sh --no-close          # wait only
-#   .orca/orchestration/scripts/orca-wait-done.sh --role thrifty      # prefer role handle
+#   .orca/orchestration/scripts/orca-wait-done.sh --role thrifty --task task_abc123   # prefer role handle; always pin --task
 #   .orca/orchestration/scripts/orca-wait-done.sh --types worker_done,escalation
 #   .orca/orchestration/scripts/orca-wait-done.sh --task task_abc123  # only complete on this task
 set -euo pipefail
