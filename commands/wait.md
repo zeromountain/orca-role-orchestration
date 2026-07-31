@@ -1,12 +1,16 @@
 ---
 description: Wait for worker_done / escalation / decision_gate from Orca role workers
-argument-hint: "[--timeout-ms N] [--role ROLE]"
+argument-hint: "[--timeout-ms N] [--role ROLE] [--task ID]"
 allowed-tools: Bash(.orca/orchestration/scripts/orca-wait-done.sh:*)
 ---
 
 ```bash
 .orca/orchestration/scripts/orca-wait-done.sh $ARGUMENTS
 ```
+
+Prefer passing `--task <task_id>` (printed by dispatch) whenever you know it — without it, the
+first matching message wins regardless of whose task it is, which can act on a leftover message
+from an unrelated flow (e.g. a debate, which never drains its own inbox backlog).
 
 Timeout or `count:0` is a checkpoint, not a failure — report it as such.
 Synthesize any `worker_done` bodies into a short summary for the user.

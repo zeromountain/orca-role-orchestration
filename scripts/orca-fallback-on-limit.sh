@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Failover primary role → Antigravity Gemini 3.5 Flash (Medium).
+# Failover primary role → the fallback role's model. Model comes from
+# orca-roles-lib.sh (role_meta / role_launch_cmd) — never hardcode it here.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$ORCH/../.." && pwd)"
+# shellcheck source=orca-roles-lib.sh
+source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 DISPATCH="$HERE/orca-dispatch-role.sh"
+FALLBACK_MODEL="$(role_meta fallback | cut -f2)"
 FROM=""
 SPEC=""
 SPEC_FILE=""
@@ -90,26 +94,26 @@ with open(sys.argv[1]) as stream:
 PY
 )"
   CREATE="$(orca terminal create --worktree "$WT" --title "role-agy-fallback" \
-    --command 'agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions' --json)"
+    --command "$(role_launch_cmd fallback)" --json)"
   FB="$(printf '%s' "$CREATE" | python3 -c '
 import json,sys
 d=json.load(sys.stdin); r=d.get("result") or d
 print(r.get("handle") or (r.get("terminal") or {}).get("handle") or "")
 ')"
   orca terminal rename --terminal "$FB" --title "role-agy-fallback" --json >/dev/null 2>&1 || true
-  python3 - "$HANDLES_FILE" "$FB" <<'PY'
+  python3 - "$HANDLES_FILE" "$FB" "$FALLBACK_MODEL" <<'PY'
 import json,sys,datetime,os
-path, fb = sys.argv[1:3]
+path, fb, model = sys.argv[1:4]
 d=json.load(open(path)) if os.path.exists(path) else {}
 d.setdefault("roles", {})
 d["fallback"]=fb
 d["roles"]["fallback"]={
   "handle": fb, "title": "role-agy-fallback",
-  "model": "Gemini 3.5 Flash (Medium)", "agent": "antigravity", "cli": "agy",
+  "model": model, "agent": "antigravity", "cli": "agy",
 }
 d["limit_failover"]={
   "enabled": True, "target_role": "fallback",
-  "model": "Gemini 3.5 Flash (Medium)",
+  "model": model,
   "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
 }
 d["updatedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -120,7 +124,7 @@ PY
 fi
 
 if preview_limited "$HANDLE"; then
-  echo "Detected limit on $HANDLE — failing over to agy Gemini 3.5 Flash (Medium)"
+  echo "Detected limit on $HANDLE — failing over to agy $FALLBACK_MODEL"
 else
   echo "No explicit limit pattern; failing over as requested"
 fi
@@ -128,7 +132,7 @@ fi
 FULL_SPEC="$(cat <<EOF
 [FAILOVER from $FROM / $HANDLE]
 Primary agent hit rate/session limit or was manually failed over.
-Continue with Gemini 3.5 Flash (Medium). Prefer finishing over redesign.
+Continue with $FALLBACK_MODEL. Prefer finishing over redesign.
 Follow project AGENTS.md / CLAUDE.md constraints if present.
 
 TASK:
@@ -138,4 +142,12 @@ EOF
 
 "$DISPATCH" fallback --spec "$FULL_SPEC"
 echo "Failover dispatched to ROLE=fallback."
-echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --timeout-ms 900000"
+# --task is a PLACEHOLDER here on purpose: this script does not capture the
+# dispatcher's stdout (item 5 removed exactly that kind of live pipe on the
+# dispatcher, and re-adding one to harvest the id would risk the same class of
+# failure), so the real id is the `task_id=` the dispatch above just printed.
+# Pasted verbatim, this line fails loudly on an unknown task instead of
+# silently acting on a leftover worker_done from another flow — a bare --role
+# would close whatever tab handles.json maps that role to. See
+# orca-wait-done.sh's own header for the full failure mode.
+echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --task <task_id printed above> --timeout-ms 900000"

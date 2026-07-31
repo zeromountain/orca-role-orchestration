@@ -1,15 +1,21 @@
 # Orca Role Orchestration
 
-An installable Agent Skill and project scaffold for routing Orca Agent IDE work across four model-specific roles.
+An installable Agent Skill and project scaffold for routing Orca Agent IDE work across six model-specific roles, plus a four-model idea-debate mode.
 
 | Role | Default model | Best for |
 |---|---|---|
-| `architect` | Claude Opus 4.8 | Architecture, planning, high-risk review |
+| `architect` | Claude Opus 5 | Architecture, planning, high-risk review |
 | `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
 | `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
-| `fallback` | Gemini 3.5 Flash (Medium) via `agy` | Continuity after rate or session limits |
+| `ui` | Gemini 3.6 Flash (Medium) via `agy` | User-visible surface drafts, always routed back to architect for approval |
+| `reviewer` | Claude Opus 5 | Final pre-merge gate only — APPROVE/BLOCK, never implements |
+| `fallback` | Gemini 3.6 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
-The defaults are intentionally opinionated. Launch commands live in `scripts/orca-bootstrap-roles.sh` (not `roles.yaml`). Edit that script if you need different model IDs or CLI flags.
+Bootstrap starts the four primaries (`architect`/`executor`/`thrifty`/`fallback`); `ui` and
+`reviewer` tabs are created on their first dispatch. The idea-debate mode below adds four more
+read-only `debater_*` seats, one per provider.
+
+The defaults are intentionally opinionated. Launch commands live in `scripts/orca-roles-lib.sh` (`role_meta` / `role_launch_cmd`), not `roles.yaml` — edit that library if you need different model IDs or CLI flags.
 
 ## Prerequisites
 
@@ -129,11 +135,42 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
 
+## Idea debate
+
+Four models argue an idea into a niche direction — propose, critique each other anonymously,
+then converge:
+
+```bash
+.orca/orchestration/scripts/orca-debate.sh --topic "your idea or open question"
+```
+
+Transcript lands in `.orca/orchestration/debates/<slug>/` (gitignored); the decision document goes
+to `docs/ideas/`. Round output is written under a shuffled label from the start (`round-1/A.md`,
+never a model-named file); the label map and per-round manifest live outside the debate directory
+entirely, in `.orca/orchestration/debate-labels/` and `debate-manifests/` — nothing inside the
+debate directory itself, in a filename or in file contents, ever names a debater. See the
+anonymity guarantee and its limits under Security below. Only one debate runs at a time: starting
+a second one — same slug or a different one — while a debate is still live is refused, since
+terminals are reused per-role globally and two concurrent debates would otherwise collide in the
+same four sessions (a same-slug collision would also reset the live debate's tracked handles,
+leaving its tabs unprotected from the new driver's own cleanup).
+
 ## Security
 
 The default launch commands disable or bypass agent permission checks. Use them only in trusted repositories and review the commands before running `orca-bootstrap-roles.sh`. Remove the bypass flags if you want each provider's normal approval boundaries.
 
 Generated `.orca/orchestration/handles.json` files are local runtime state and must not be committed.
+
+**Idea-debate anonymity is not cryptographic.** The achievable guarantee is: nothing instructs a
+debater to deanonymize, and no single `diff`, `glob`, or file read *inside the debate directory*
+reveals authorship. Debaters run under the same permission-bypass flags as every other role, so
+this is enforced by the dispatch spec and persona (`templates/roles.yaml`'s `read_only` field is
+prompt-enforced, not a sandboxing fact) — a debater that ignored its instructions could still read
+`dispatch-ledger.jsonl`, `handles.json`, `terminal-journal.jsonl`, or `orca terminal list` titles,
+none of which live inside the debate directory but none of which are hidden from that process
+either. The transcript (`transcript.md`, inside the debate directory) is the one deliberate
+exception: it re-attributes each contribution by real short name for the human reader, written
+only after the debate has concluded and never referenced by any round spec.
 
 ## License
 

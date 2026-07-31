@@ -20,6 +20,7 @@ SPEC_FILE=""
 DEPS="[]"
 WAIT_DONE=0
 NO_REAP=0
+PERSIST=0
 TIMEOUT_MS=900000
 REAP_TIMEOUT_MS=3600000
 WORKTREE="active"
@@ -30,15 +31,20 @@ REAPER_DIR="$ORCH/reapers"
 usage() {
   cat <<'EOF'
 Usage:
-  orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "text"
+  orca-dispatch-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}> --spec "text"
   orca-dispatch-role.sh <role> --spec-file file.md [--deps '["task_id"]']
-  orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--timeout-ms N]
+  orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--persist] [--timeout-ms N]
 
 By default a background reaper auto-closes the worker tab when the dispatch
 completes or fails (no coordinator action required).
 
-  --wait      Also block on orca-wait-done.sh (optional; reaper still runs unless --no-reap)
+  --wait      Also block on orca-wait-done.sh, pinned to THIS dispatch's own
+              task id (--task) so it can only complete on this task's own
+              message, never a leftover from an unrelated flow (optional;
+              reaper still runs unless --no-reap)
   --no-reap   Disable automatic background close (tabs will linger unless closed elsewhere)
+  --persist   Keep the worker tab open after worker_done (implies --no-reap).
+              For multi-round flows (debate) where the caller closes tabs itself.
   --timeout-ms  Timeout for --wait only (default 900000). Reaper default lifetime 1h.
 EOF
 }
@@ -53,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --deps) DEPS="${2:?}"; shift 2 ;;
     --wait) WAIT_DONE=1; shift ;;
     --no-reap) NO_REAP=1; shift ;;
+    --persist) PERSIST=1; NO_REAP=1; shift ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
@@ -65,8 +72,9 @@ if [[ ! -f "$HANDLES_FILE" ]]; then
 fi
 
 case "$ROLE" in
-  architect|executor|thrifty|fallback) ;;
-  *) echo "role must be architect|executor|thrifty|fallback" >&2; exit 1 ;;
+  architect|executor|thrifty|ui|reviewer|fallback) ;;
+  debater_claude|debater_codex|debater_grok|debater_gemini) ;;
+  *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}" >&2; exit 1 ;;
 esac
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
@@ -95,6 +103,53 @@ else
 fi
 
 HANDLE="$(ensure_terminal "$ROLE")"
+
+# Dead-man watchdog registration (Task 2): completely generic and
+# debate-agnostic — this script does not know or care what ORCA_ROLE_LOCK_FILE
+# means (today only orca-debate.sh sets it, via its own exported env var,
+# inherited by this process since orca-debate-round.sh calls this script as a
+# child). If a --persist caller has an active lock context, register our
+# resolved handle so that caller's watchdog knows to close it if the caller
+# ever stops proving it is alive. A missing/absent lock context, or a
+# non-persist dispatch, is a normal no-op — most dispatches have neither.
+if [[ "$PERSIST" -eq 1 && -n "${ORCA_ROLE_LOCK_FILE:-}" && -f "$ORCA_ROLE_LOCK_FILE" ]]; then
+  lock_register_handle "$ORCA_ROLE_LOCK_FILE" "$HANDLE" \
+    || echo "(warn) could not register $HANDLE with lock $ORCA_ROLE_LOCK_FILE — the watchdog owning that lock will not know about this handle" >&2
+fi
+
+# Gate (Task 2, fix round 3): confirm the worker's actual screen BEFORE
+# task-create, not after. Round 1 gated only right before --inject, with
+# `orca orchestration task-create` already having run — every failed live
+# debate traced back to exactly that ordering: seed() (called inside
+# ensure_terminal above) sends the seed text and the model starts
+# responding to it (the seed explicitly asks it to acknowledge its role),
+# so the terminal is legitimately BUSY, not ready, for however long that
+# response takes. The old inject-side gate would refuse a busy-but-working
+# seat, and by then task-create had already run — the script's own
+# now-removed error message admitted it: "task_id=... was already created
+# and is now stranded undispatched". A stranded task is never dispatched
+# and never appears in a ledger row, so `dispatch-show` returns null,
+# `dispatch_status` reads that as unknown, and the round polls to a full
+# timeout believing the seat might still respond. Gating here means a
+# refusal costs nothing — no task exists yet to strand — and
+# terminal_wait_ready's own BUSY handling (see orca-roles-lib.sh) now
+# extends its patience specifically for "the model is responding", rather
+# than refusing a seat that is doing exactly what the seed asked it to do.
+# No elapsed-time floor is passed (unlike ensure_terminal's own gate before
+# seeding): this call site does not know a genuine creation timestamp for
+# $HANDLE (it may have just been created moments ago by ensure_terminal
+# above, which already applied that floor once before seeding, or it may
+# be a long-warm terminal from a prior dispatch), and re-flooring from
+# "now" on every ordinary dispatch would add pure, unrequested latency to
+# the six pre-existing roles' hot path for no safety benefit.
+echo "Waiting for worker tui-idle…"
+orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
+AGENT_CLI="$(role_meta "$ROLE" | cut -f3)"
+if ! terminal_wait_ready "$HANDLE" "$AGENT_CLI"; then
+  echo "orca-dispatch-role.sh: $HANDLE for role=$ROLE never showed a ready screen — refusing to dispatch. No task was created; re-run once the terminal is confirmed ready, or clear its screen by hand if it is sitting on a first-run prompt (see the screen dump above)." >&2
+  exit 1
+fi
+
 MODEL="$(role_meta "$ROLE" | cut -f2)"
 PERSONA_FILE="$ORCH/personas/$ROLE.md"
 STANCE=""
@@ -102,24 +157,22 @@ if [[ -f "$PERSONA_FILE" ]]; then
   STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
 fi
 
-# Spec always carries auto-close contract so the worker also self-closes after worker_done.
-AUTO_CLOSE_BLOCK="
-AUTO-CLOSE (required, automatic):
-After you send worker_done exactly once, immediately run this shell command (do not skip):
-  orca terminal close --terminal ${HANDLE} --tab --json
-Your Orca terminal handle for this session is: ${HANDLE}
-Then stop. Do not poll orchestration. A background reaper also closes this tab if needed.
-"
+# Spec always carries a tail contract: auto-close (default) or stay-open (--persist).
+if [[ "$PERSIST" -eq 1 ]]; then
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" persist)"
+else
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" close)"
+fi
 
 if [[ -n "${STANCE// }" ]]; then
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 STANCE: $STANCE
 $SPEC
-$AUTO_CLOSE_BLOCK"
+$TAIL_BLOCK"
 else
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 $SPEC
-$AUTO_CLOSE_BLOCK"
+$TAIL_BLOCK"
 fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE"
@@ -138,9 +191,12 @@ if [[ -z "$TASK_ID" ]]; then
 fi
 echo "task_id=$TASK_ID"
 
-echo "Waiting for worker tui-idle…"
-orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
-
+# No second readiness gate here — fix round 3 moved the one gate to before
+# task-create above specifically so a refusal never strands a task. Adding
+# a redundant check back here would re-run the classifier for no benefit:
+# nothing touches the terminal between the gate above and this point except
+# the task-create call itself (an orchestration-side API call, not a
+# terminal write), so the terminal's readiness cannot regress in between.
 echo "Dispatching (inject)…"
 DISPATCH_JSON="$(orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json)"
 printf '%s\n' "$DISPATCH_JSON"
@@ -189,10 +245,17 @@ else
 fi
 
 if [[ "$WAIT_DONE" -eq 1 ]]; then
+  # --task pins this wait to the dispatch we just created (Task 4): without
+  # it, a leftover worker_done from an unrelated flow (e.g. a multi-round
+  # debate, which deliberately never drains its own worker_done backlog)
+  # would be the first message orca-wait-done.sh sees, and --role would then
+  # resolve the close target from handles.json by role name rather than from
+  # that message — closing this role's real, still-running tab and
+  # reporting THIS task done on the strength of someone else's completion.
   echo "Also blocking on wait-done…"
-  exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE"
+  exec "$HERE/orca-wait-done.sh" --timeout-ms "$TIMEOUT_MS" --role "$ROLE" --task "$TASK_ID"
 fi
 
 echo "Dispatched. task_id=$TASK_ID handle=$HANDLE"
 echo "  status: orca orchestration dispatch-show --task $TASK_ID --json"
-echo "  optional block: .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE"
+echo "  optional block: .orca/orchestration/scripts/orca-wait-done.sh --role $ROLE --task $TASK_ID"

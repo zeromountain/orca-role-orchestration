@@ -203,6 +203,71 @@ roles:
       architect is session-limited, reviewer very likely is too — defer the gate
       rather than downgrade it to a weaker model.
 
+  debater_claude:
+    handle_title: debate-opus
+    agent: claude
+    model: claude-opus-5
+    effort: high
+    persona_file: personas/debater_claude.md
+    persona_summary: >-
+      The Principled Skeptic — debate seat arguing long-horizon coherence,
+      failure modes, and regulatory exposure. Read-only.
+    owns:
+      - the principle-and-risk lens in an idea debate
+    does_not:
+      - any file edit outside its assigned debate output file
+      - implementation of any kind
+
+  debater_codex:
+    handle_title: debate-sol
+    agent: codex
+    model: gpt-5.6-sol
+    effort: high
+    persona_file: personas/debater_codex.md
+    persona_summary: >-
+      The Builder — debate seat arguing build cost, technical risk, and the
+      shortest credible path to a shippable slice. Read-only.
+    owns:
+      - the feasibility lens in an idea debate
+    does_not:
+      - any file edit outside its assigned debate output file
+      - implementation of any kind
+
+  debater_grok:
+    handle_title: debate-grok
+    agent: grok
+    model: grok-4.5
+    effort: default
+    persona_file: personas/debater_grok.md
+    persona_summary: >-
+      The Contrarian — debate seat sweeping prior art and attacking the
+      consensus angle. Read-only.
+    owns:
+      - the contrarian-and-market lens in an idea debate
+    does_not:
+      - any file edit outside its assigned debate output file
+      - implementation of any kind
+
+  debater_gemini:
+    handle_title: debate-agy
+    agent: antigravity
+    cli: agy
+    model: "Gemini 3.6 Flash (Medium)"
+    effort: medium
+    persona_file: personas/debater_gemini.md
+    persona_summary: >-
+      The User's Advocate — debate seat demanding evidence that a specific
+      person wants this. Read-only.
+    owns:
+      - the demand-and-user lens in an idea debate
+    does_not:
+      - any file edit outside its assigned debate output file
+      - implementation of any kind
+    notes: |
+      Shares the agy CLI and Gemini quota with `ui` and `fallback`. On a limit,
+      re-run the debate with --debaters minus gemini rather than substituting
+      another model — swapping a model destroys the lens diversity.
+
   fallback:
     handle_title: role-agy-fallback
     agent: antigravity
@@ -273,6 +338,21 @@ routing_table:
     when: "External research, competitor/platform alternatives"
     primary: thrifty
     secondary: architect
+  - match: idea_debate
+    when: >
+      User wants to research and sharpen an idea by having multiple models
+      argue it out — brainstorming, idea refinement, finding a niche or
+      differentiated direction. Korean triggers: 아이디어 토론, 브레인스토밍,
+      아이디어 구체화, 니치 찾기.
+    primary: coordinator
+    notes: |
+      Do not dispatch debaters one at a time. Run the driver:
+        .orca/orchestration/scripts/orca-debate.sh --topic "<goal>"
+      Three rounds: propose → critique (anonymized) → converge.
+      Round prompt text lives in scripts/orca-debate-lib.sh (single source);
+      it is deliberately not duplicated here.
+      Output: debates/<slug>/transcript.md, then a decision document in
+      docs/ideas/ written by the coordinator (or --judge <role>).
   - match: prototype
     when: "Spike / demo / one-shot mock (code/UI, not raster image generation)"
     primary: thrifty
@@ -449,6 +529,23 @@ dags:
           BLOCK needs blocking findings with file:line evidence, why each blocks,
           a fix path, and who fixes it. Never edit a file.
 
+  idea_debate:
+    description: Multi-model idea debate — propose, critique, converge on a niche
+    driver: .orca/orchestration/scripts/orca-debate.sh
+    steps:
+      - id: propose
+        role: debater_claude, debater_codex, debater_grok, debater_gemini
+        deps: []
+      - id: critique
+        role: same four, reading anonymized proposals
+        deps: [propose]
+      - id: converge
+        role: same four, reading anonymized critiques
+        deps: [critique]
+      - id: decide
+        role: coordinator
+        deps: [converge]
+
 limit_failover:
   enabled: true
   target_role: fallback
@@ -477,6 +574,20 @@ lifecycle:
     - user asks to supervise / monitor / wait / coordinate DAG / decision gate
   worker_done_required: true
   max_concurrent: 2
+  debate:
+    # Debate rounds fan out to 4 read-only participants at once. max_concurrent
+    # exists to stop two roles editing the same files; debaters edit nothing, so
+    # the debate path is exempt.
+    max_concurrent: 4
+    # PROMPT-ENFORCED, NOT A FACT: debaters run under the same permission-bypass
+    # CLI flags as every other role (see role_launch_cmd in orca-roles-lib.sh).
+    # Nothing sandboxes them — "read-only" here means the dispatch spec and
+    # persona instruct them to write only their own output file and never touch
+    # git state; a debater that ignored those instructions could write anywhere
+    # its OS user can. Do not read this field as a security boundary.
+    read_only: true
+    tabs_persist_between_rounds: true   # dispatch --persist; driver closes on exit
+    driver_script: .orca/orchestration/scripts/orca-debate.sh
   wait_timeout_ms: 900000
   circuit_break_after_failures: 3
   edit_ownership: |

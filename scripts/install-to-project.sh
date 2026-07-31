@@ -266,7 +266,7 @@ write_managed "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md" "PLAYBOOK.md"
 write_managed "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md" "SCRIPTS.md"
 write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.example.json"
 
-for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh; do
+for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh; do
   write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
 
@@ -274,7 +274,7 @@ done
 # Never touch the skill package's own scripts/ when installing into the skill repo itself.
 OLD_SCRIPTS_DIR="$ROOT/scripts"
 if [[ "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
-  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh; do
+  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh; do
     if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
       # Skip if this is the skill source file (same path as SCRIPTS_SRC)
       if [[ "$OLD_SCRIPTS_DIR/$s" -ef "$SCRIPTS_SRC/$s" ]]; then
@@ -323,16 +323,21 @@ data = {
 pathlib.Path(manifest_path).write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-# gitignore handles.json
+# gitignore local runtime state
 GI="$ROOT/.gitignore"
-if [[ -f "$GI" ]]; then
-  if ! grep -qF '.orca/orchestration/handles.json' "$GI" 2>/dev/null; then
-    printf '\n# Orca local terminal handles\n.orca/orchestration/handles.json\n' >> "$GI"
-    REPORT_REFRESHED+=(".gitignore")
+touch "$GI"
+gi_added=0
+for entry in '.orca/orchestration/handles.json' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/'; do
+  if ! grep -qF "$entry" "$GI" 2>/dev/null; then
+    if [[ "$gi_added" -eq 0 ]]; then
+      printf '\n# Orca local runtime state\n' >> "$GI"
+      gi_added=1
+    fi
+    printf '%s\n' "$entry" >> "$GI"
   fi
-else
-  printf '# Orca local terminal handles\n.orca/orchestration/handles.json\n' > "$GI"
-  REPORT_INSTALLED+=(".gitignore")
+done
+if [[ "$gi_added" -eq 1 ]]; then
+  REPORT_REFRESHED+=(".gitignore")
 fi
 
 # Optional AGENTS.md snippet
@@ -345,16 +350,20 @@ $MARKER
 
 | Role | Model | CLI |
 |------|-------|-----|
-| architect | Claude Opus 4.8 | \`claude\` |
+| architect | Claude Opus 5 | \`claude\` |
 | executor | GPT-5.6 Sol | \`codex\` |
 | thrifty | Grok 4.5 | \`grok\` |
-| fallback | Gemini 3.5 Flash (Medium) | \`agy\` |
+| ui | Gemini 3.6 Flash (Medium) | \`agy\` |
+| reviewer | Claude Opus 5 | \`claude\` |
+| fallback | Gemini 3.6 Flash (Medium) | \`agy\` |
+| debater_* | one seat per provider | debate only, read-only |
 
 - Managed routing: \`.orca/orchestration/roles.yaml\`
 - Project hints (yours): \`.orca/orchestration/project_hints.yaml\`
 - Playbook: \`.orca/orchestration/PLAYBOOK.md\`
 - Bootstrap: \`.orca/orchestration/scripts/orca-bootstrap-roles.sh\`
 - Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
+- Idea debate: \`.orca/orchestration/scripts/orca-debate.sh --topic "…"\`
 - Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
 EOF
   REPORT_REFRESHED+=("AGENTS.md (section appended)")
