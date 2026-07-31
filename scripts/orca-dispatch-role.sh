@@ -117,6 +117,39 @@ if [[ "$PERSIST" -eq 1 && -n "${ORCA_ROLE_LOCK_FILE:-}" && -f "$ORCA_ROLE_LOCK_F
     || echo "(warn) could not register $HANDLE with lock $ORCA_ROLE_LOCK_FILE — the watchdog owning that lock will not know about this handle" >&2
 fi
 
+# Gate (Task 2, fix round 3): confirm the worker's actual screen BEFORE
+# task-create, not after. Round 1 gated only right before --inject, with
+# `orca orchestration task-create` already having run — every failed live
+# debate traced back to exactly that ordering: seed() (called inside
+# ensure_terminal above) sends the seed text and the model starts
+# responding to it (the seed explicitly asks it to acknowledge its role),
+# so the terminal is legitimately BUSY, not ready, for however long that
+# response takes. The old inject-side gate would refuse a busy-but-working
+# seat, and by then task-create had already run — the script's own
+# now-removed error message admitted it: "task_id=... was already created
+# and is now stranded undispatched". A stranded task is never dispatched
+# and never appears in a ledger row, so `dispatch-show` returns null,
+# `dispatch_status` reads that as unknown, and the round polls to a full
+# timeout believing the seat might still respond. Gating here means a
+# refusal costs nothing — no task exists yet to strand — and
+# terminal_wait_ready's own BUSY handling (see orca-roles-lib.sh) now
+# extends its patience specifically for "the model is responding", rather
+# than refusing a seat that is doing exactly what the seed asked it to do.
+# No elapsed-time floor is passed (unlike ensure_terminal's own gate before
+# seeding): this call site does not know a genuine creation timestamp for
+# $HANDLE (it may have just been created moments ago by ensure_terminal
+# above, which already applied that floor once before seeding, or it may
+# be a long-warm terminal from a prior dispatch), and re-flooring from
+# "now" on every ordinary dispatch would add pure, unrequested latency to
+# the six pre-existing roles' hot path for no safety benefit.
+echo "Waiting for worker tui-idle…"
+orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
+AGENT_CLI="$(role_meta "$ROLE" | cut -f3)"
+if ! terminal_wait_ready "$HANDLE" "$AGENT_CLI"; then
+  echo "orca-dispatch-role.sh: $HANDLE for role=$ROLE never showed a ready screen — refusing to dispatch. No task was created; re-run once the terminal is confirmed ready, or clear its screen by hand if it is sitting on a first-run prompt (see the screen dump above)." >&2
+  exit 1
+fi
+
 MODEL="$(role_meta "$ROLE" | cut -f2)"
 PERSONA_FILE="$ORCH/personas/$ROLE.md"
 STANCE=""
@@ -158,25 +191,12 @@ if [[ -z "$TASK_ID" ]]; then
 fi
 echo "task_id=$TASK_ID"
 
-echo "Waiting for worker tui-idle…"
-orca terminal wait --terminal "$HANDLE" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
-
-# Gate (Task 2): confirm the worker's actual screen, not tui-idle alone,
-# before injecting — tui-idle reports success on a terminal that simply
-# never finished booting (the defect this task fixes). No elapsed-time
-# floor is passed here (unlike ensure_terminal's own gate before seeding
-# above): this call site does not know a genuine creation timestamp for
-# $HANDLE (it may have just been created moments ago by ensure_terminal,
-# which already applied that floor once before seeding, or it may be a
-# long-warm terminal from a prior dispatch), and re-flooring from "now" on
-# every ordinary dispatch would add pure, unrequested latency to the six
-# pre-existing roles' hot path for no safety benefit.
-AGENT_CLI="$(role_meta "$ROLE" | cut -f3)"
-if ! terminal_wait_ready "$HANDLE" "$AGENT_CLI"; then
-  echo "orca-dispatch-role.sh: $HANDLE for role=$ROLE never showed a ready screen — refusing to inject. task_id=$TASK_ID was already created and is now stranded undispatched; re-run once the terminal is confirmed ready, or clear its screen by hand if it is sitting on a first-run prompt (see the screen dump above)." >&2
-  exit 1
-fi
-
+# No second readiness gate here — fix round 3 moved the one gate to before
+# task-create above specifically so a refusal never strands a task. Adding
+# a redundant check back here would re-run the classifier for no benefit:
+# nothing touches the terminal between the gate above and this point except
+# the task-create call itself (an orchestration-side API call, not a
+# terminal write), so the terminal's readiness cannot regress in between.
 echo "Dispatching (inject)…"
 DISPATCH_JSON="$(orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json)"
 printf '%s\n' "$DISPATCH_JSON"

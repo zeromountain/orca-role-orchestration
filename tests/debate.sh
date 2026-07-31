@@ -4298,10 +4298,14 @@ assert TR8a_reports_screen "grep -q 'never became ready' \"$tr8a_dir/err.log\""
 assert TR8a_handle_stays_recorded_for_retry \
   "grep -q term_tr8a \"$tr8a_dir/orch/handles.json\""
 
-# TR8b: orca-dispatch-role.sh's OWN gate before --inject, isolated from
-# ensure_terminal's gate above by using an ALREADY-live handle (case
-# live_rc==0 returns immediately without seeding at all) — so this proves
-# the second, independent gate, not a repeat of TR8a.
+# TR8b: orca-dispatch-role.sh's OWN gate, isolated from ensure_terminal's
+# gate above by using an ALREADY-live handle (case live_rc==0 returns
+# immediately without seeding at all) — so this proves the second,
+# independent gate, not a repeat of TR8a. Fix round 3 moved this gate to
+# BEFORE task-create (was: before --inject, with task-create already run —
+# see orca-dispatch-role.sh's own comment for why that stranded a task on
+# every refusal); TR8b_task_create_never_called is the direct, persistent
+# proof of "after a refusal, no task exists for that attempt."
 tr8b_dir="$tmpdir/tr8b"
 mkdir -p "$tr8b_dir/scripts" "$tr8b_dir/bin"
 cp "$ROOT/scripts/orca-dispatch-role.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tr8b_dir/scripts/"
@@ -4314,7 +4318,7 @@ case "\$1 \$2" in
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_tr8b_existing","connected":true}]}}' ;;
   "terminal wait") echo '{"ok":true}' ;;
   "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr8b_existing","status":"running","tail":[]}}}' ;;
-  "orchestration task-create") echo '{"ok":true,"result":{"task":{"id":"task_tr8b"}}}' ;;
+  "orchestration task-create") touch "$tr8b_dir/task-create-was-called"; echo '{"ok":true,"result":{"task":{"id":"task_tr8b"}}}' ;;
   "orchestration dispatch") touch "$tr8b_dir/inject-was-called"; echo '{"ok":true,"result":{"dispatch":{"id":"disp_tr8b"}}}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -4327,8 +4331,9 @@ tr8b_rc=0
   cd "$tr8b_dir"
   ./scripts/orca-dispatch-role.sh architect --spec "irrelevant" --no-reap
 ) >"$tr8b_dir/out.log" 2>"$tr8b_dir/err.log" || tr8b_rc=$?
-assert TR8b_dispatch_refuses_inject "[[ \"$tr8b_rc\" -ne 0 ]]"
+assert TR8b_dispatch_refuses "[[ \"$tr8b_rc\" -ne 0 ]]"
 assert TR8b_inject_never_called "[[ ! -f \"$tr8b_dir/inject-was-called\" ]]"
+assert TR8b_task_create_never_called "[[ ! -f \"$tr8b_dir/task-create-was-called\" ]]"
 assert TR8b_reports_screen "grep -q 'never showed a ready screen' \"$tr8b_dir/err.log\""
 
 # --- TR9 (fix round 1): seed()'s minimum-elapsed floor is sourced from
@@ -4510,6 +4515,152 @@ chmod +x "$tr14_dir/bin/orca"
 tr14_out="$(export PATH="$tr14_dir/bin:$PATH"; _terminal_ready_check term_tr14 antigravity)"
 assert TR14_antigravity_nonbare_last_line_still_not_ready \
   "printf '%s\n' \"\$tr14_out\" | head -n1 | grep -q NOT_READY"
+
+# ----------------------------------------------------------------------------
+# Fix round 3 (Task 2), from live verification: the root cause of every
+# failed debate. Preflight gates BEFORE seeding (correct, passes). Seeding
+# then makes the model respond -- the seed text explicitly asks it to
+# acknowledge its role. The round dispatches while the seat is still
+# mid-response; the OLD inject-side gate (after task-create) refused it,
+# and the task was already created, so it was stranded: dispatch-show
+# returns null, dispatch_status reads that as unknown, and the round polls
+# to its full timeout. Two fixes, proven below: (1) a THIRD verdict, BUSY,
+# distinct from READY/NOT_READY, that extends the poll deadline instead of
+# counting against it; (2) orca-dispatch-role.sh's gate now runs BEFORE
+# task-create, so a refusal never creates anything to strand.
+# ----------------------------------------------------------------------------
+
+# --- TR15: the exact live grok mid-response screen (verbatim, not
+# paraphrased), byte-faithfulness hashed first, must classify BUSY -- not
+# READY (the response text must not accidentally satisfy the prompt
+# pattern) and not a hard NOT_READY refusal (this is the model doing
+# exactly what the seed asked, not a stuck terminal).
+tr15_dir="$tmpdir/tr15"
+mkdir -p "$tr15_dir/bin"
+cat > "$tr15_dir/screen.txt" <<'TR15SCREEN'
+◆ Thought for 2.1s
+ROLE=debater_grok — ready.
+Lens: contrarian / market (widen option space; prefer niches incumbents structurally cannot follow)
+Standing orders:
+ • Write only to the output file named in the dispatch spec
+ • Exact headings from the round spec; source-tag every factual claim
+ • worker_done once with taskId + dispatchId, then stay open for the next round
+No dispatch preamble yet. Idle and waiting for the next round.
+Worked for 5.5s
+TR15SCREEN
+tr15_expected_sha256="df599e3cbe7b95fff9d57b6665eb4d44f018ca08b5f9792174fae29151d24efc"
+tr15_actual_sha256="$(shasum -a 256 "$tr15_dir/screen.txt" | awk '{print $1}')"
+assert TR15_fixture_byte_faithful "[[ \"$tr15_actual_sha256\" == \"$tr15_expected_sha256\" ]]"
+
+cat > "$tr15_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+python3 - "$TR15_SCREEN_FILE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+lines = text.split("\n")
+if lines and lines[-1] == "":
+    lines = lines[:-1]
+print(json.dumps({"ok": True, "result": {"terminal": {"handle": "term_tr15", "status": "running", "tail": lines}}}))
+PYEOF
+exit 0
+ORCASTUB
+chmod +x "$tr15_dir/bin/orca"
+tr15_out="$(
+  export PATH="$tr15_dir/bin:$PATH"
+  export TR15_SCREEN_FILE="$tr15_dir/screen.txt"
+  _terminal_ready_check term_tr15 grok
+)"
+assert TR15_live_busy_screen_is_busy "printf '%s\n' \"\$tr15_out\" | head -n1 | grep -q '^BUSY:'"
+assert TR15_busy_not_ready "! printf '%s\n' \"\$tr15_out\" | head -n1 | grep -qx READY"
+assert TR15_busy_not_hard_refused "! printf '%s\n' \"\$tr15_out\" | head -n1 | grep -q '^NOT_READY'"
+
+# --- TR16: a seat that is BUSY (responding) and then goes idle at a
+# prompt within the polling window must end up READY -- proving the
+# deadline-extension actually delivers a success, not just a classifier
+# label with no effect on the poll loop. ROLE_READY_TIMEOUT_SECONDS is
+# deliberately shorter than the time this fixture stays busy, so this can
+# only pass if BUSY genuinely extended the deadline past that short budget.
+tr16_dir="$tmpdir/tr16"
+mkdir -p "$tr16_dir/bin"
+tr16_counter="$tr16_dir/counter"
+echo 0 > "$tr16_counter"
+cat > "$tr16_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal read")
+    n=\$(cat "$tr16_counter")
+    n=\$((n + 1))
+    echo "\$n" > "$tr16_counter"
+    if [[ "\$n" -lt 3 ]]; then
+      echo '{"ok":true,"result":{"terminal":{"handle":"term_tr16","status":"running","tail":["Thought for 2.1s","ROLE=debater_grok — ready.","Worked for 1.0s"]}}}'
+    else
+      echo '{"ok":true,"result":{"terminal":{"handle":"term_tr16","status":"running","tail":["❯ "]}}}'
+    fi
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr16_dir/bin/orca"
+tr16_rc=0
+(
+  export PATH="$tr16_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=1
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=10
+  terminal_wait_ready term_tr16 grok
+) >"$tr16_dir/out.log" 2>"$tr16_dir/err.log" || tr16_rc=$?
+assert TR16_busy_then_idle_ends_ready "[[ \"$tr16_rc\" -eq 0 ]]"
+assert TR16_reached_third_poll "[[ \"\$(cat \"$tr16_counter\")\" -ge 3 ]]"
+
+# --- TR17/TR18: BUSY handling must not swallow a genuine failure into a
+# long timeout -- a trust dialog and a blank screen must both still refuse
+# PROMPTLY, on the normal (short) ROLE_READY_TIMEOUT_SECONDS budget, not
+# anywhere near the much longer ROLE_BUSY_TIMEOUT_SECONDS ceiling. Timed
+# directly: with a short normal timeout and a deliberately much longer busy
+# ceiling, total elapsed must stay far under the busy ceiling.
+tr17_dir="$tmpdir/tr17"
+mkdir -p "$tr17_dir/bin"
+cat > "$tr17_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr17","status":"running","tail":["Do you trust the files in this folder?","❯ 1. Yes, proceed"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr17_dir/bin/orca"
+tr17_start=$(date +%s)
+tr17_rc=0
+(
+  export PATH="$tr17_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=1
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=20
+  terminal_wait_ready term_tr17 claude
+) >"$tr17_dir/out.log" 2>"$tr17_dir/err.log" || tr17_rc=$?
+tr17_elapsed=$(( $(date +%s) - tr17_start ))
+assert TR17_trust_dialog_refuses "[[ \"$tr17_rc\" -ne 0 ]]"
+assert TR17_trust_dialog_refuses_promptly "[[ \"$tr17_elapsed\" -lt 10 ]]"
+
+tr18_dir="$tmpdir/tr18"
+mkdir -p "$tr18_dir/bin"
+cat > "$tr18_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr18","status":"running","tail":[]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr18_dir/bin/orca"
+tr18_start=$(date +%s)
+tr18_rc=0
+(
+  export PATH="$tr18_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=1
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=20
+  terminal_wait_ready term_tr18 claude
+) >"$tr18_dir/out.log" 2>"$tr18_dir/err.log" || tr18_rc=$?
+tr18_elapsed=$(( $(date +%s) - tr18_start ))
+assert TR18_blank_screen_refuses "[[ \"$tr18_rc\" -ne 0 ]]"
+assert TR18_blank_screen_refuses_promptly "[[ \"$tr18_elapsed\" -lt 10 ]]"
 
 echo
 echo "Results: $pass passed, $fail failed"

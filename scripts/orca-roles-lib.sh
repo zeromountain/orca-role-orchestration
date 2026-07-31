@@ -278,6 +278,15 @@ wait_idle() {
 : "${ROLE_READY_MIN_ELAPSED_SECONDS:=3}"
 : "${ROLE_SEED_MARKER_RETRIES:=5}"
 : "${ROLE_SEED_MARKER_INTERVAL_SECONDS:=1}"
+# Fix round 3: a BUSY verdict (see _terminal_ready_check) extends the poll
+# deadline instead of counting against it — a model mid-response to the
+# seed's own role-acknowledgment request can legitimately take "tens of
+# seconds", more for a high-effort model — but the extension is bounded by
+# this ceiling (measured from the very first poll, never renewed past it),
+# so a screen that shows busy-shaped text forever still eventually times
+# out rather than blocking indefinitely. An estimate, not a measurement —
+# no live timing data exists yet for how long a real seed ack can run.
+: "${ROLE_BUSY_TIMEOUT_SECONDS:=300}"
 
 _terminal_ready_check() {
   # $1=handle $2=cli (claude|codex|grok|antigravity|"" for unknown) → stdout
@@ -299,7 +308,7 @@ _terminal_ready_check() {
   # source rather than being readable as separate input). Same argv-not-
   # stdin data-passing convention create_role uses for its own `$raw`.
   python3 - "$handle" "$cli" "$read_json" >"$scratch" <<'PY'
-import json, sys
+import json, re, sys
 
 handle, cli, raw = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -382,6 +391,50 @@ def _strip_leading_decoration(line):
 
 def has_prompt_line(needle):
     return any(_strip_leading_decoration(ln).startswith(needle) for ln in lines)
+
+
+# Fix round 3 (live verification): every failed debate traced to this. The
+# gate ran BEFORE seeding (correct) and again before --inject, and in
+# between, seeding itself makes the model respond -- the seed text
+# explicitly asks it to acknowledge its role. A live grok seat was caught
+# doing exactly that ("Thought for 2.1s" / "ROLE=debater_grok -- ready." /
+# ... / "Worked for 5.5s") and the inject-side gate refused it: the
+# response text interleaves with the prompt frame, so neither the positive
+# nor the negative patterns above are a meaningful signal on this screen,
+# and treating "no positive match yet" the same as a genuinely stuck
+# terminal is wrong -- a model mid-response is not stuck, it is doing what
+# was asked. A THIRD verdict, BUSY, is checked BEFORE positive/negative so
+# response text is never allowed to accidentally satisfy (a stray "❯"-like
+# character in generated prose) or accidentally veto (quoted example text
+# happening to contain a trust-dialog phrase) either pattern set --
+# `terminal_wait_ready` below treats BUSY as "keep waiting" and extends its
+# patience for it, distinctly from both READY and a genuine NOT_READY.
+#
+# Markers are the exact live-observed grok text ("Thought for <n>s" /
+# "Worked for <n>s"), tightened to require the numeral so ordinary prose
+# beginning a sentence with "Thought for..." cannot coincidentally match,
+# and treated as GENERIC (checked for every CLI) rather than grok-only: no
+# other CLI's busy screen has been captured yet (the same evidentiary gap
+# as codex's missing positive pattern), but the cost of a false match here
+# is bounded and cheap -- waiting somewhat longer before the normal
+# not-ready path still applies -- while the cost of NOT recognizing a real
+# one is the exact defect this fix exists to close, and claude at high
+# effort is explicitly expected to take longer than grok's own example.
+_BUSY_RE = re.compile(r"\b(?:Thought|Worked) for \d")
+
+
+def busy_reason():
+    for ln in lines:
+        m = _BUSY_RE.search(ln)
+        if m:
+            return f"BUSY: model is actively responding to the seed ({m.group(0)!r} seen) -- waiting, not refusing"
+    return None
+
+
+_busy = busy_reason()
+if _busy:
+    emit(_busy, lines)
+    raise SystemExit(0)
 
 
 # Positive per-CLI ready pattern, checked BEFORE negative markers below. See
@@ -548,21 +601,36 @@ terminal_wait_ready() {
   # indication of what the screen showed is the exact failure this task
   # exists to eliminate.
   #
+  # Fix round 3: a BUSY verdict (the model actively responding to the
+  # seed's own role-acknowledgment request — see _terminal_ready_check) is
+  # neither READY nor a genuine NOT_READY. It extends deadline_epoch out to
+  # now + ROLE_READY_TIMEOUT_SECONDS again on every poll that observes it —
+  # never past busy_ceiling_epoch, fixed once at the start from
+  # ROLE_BUSY_TIMEOUT_SECONDS, so a screen that shows busy-shaped text
+  # forever still eventually times out through the normal refusal path
+  # below, it just gets a much longer overall allowance than a genuinely
+  # stuck screen (booting/trust-dialog/blank/menu) ever does. A poll that
+  # observes neither READY nor BUSY does not touch either deadline — the
+  # original, tighter ROLE_READY_TIMEOUT_SECONDS budget still governs that
+  # case exactly as it did before this round.
+  #
   # $3 is a caller-supplied ABSOLUTE epoch, not "elapsed since this call
   # started": ensure_terminal knows a genuine creation timestamp for a
   # terminal it just created and passes created_epoch +
-  # ROLE_READY_MIN_ELAPSED_SECONDS. orca-dispatch-role.sh's own gate (before
-  # --inject) does NOT know a creation time for a handle it merely resolved
-  # (it may have just been created moments ago by ensure_terminal above,
-  # which already applied this floor once before seeding, or it may be a
+  # ROLE_READY_MIN_ELAPSED_SECONDS. orca-dispatch-role.sh's own gate (now
+  # called before task-create, not before --inject — see its own comment)
+  # does NOT know a creation time for a handle it merely resolved (it may
+  # have just been created moments ago by ensure_terminal above, which
+  # already applied this floor once before seeding, or it may be a
   # long-warm terminal from a prior dispatch) and passes no floor at all —
   # restarting a multi-second floor on every ordinary dispatch to an
   # already-ready, already-warm terminal would add pure, unrequested latency
   # to the six pre-existing roles' hot path for no safety benefit.
   local handle="$1" cli="${2:-}" not_before="${3:-0}"
-  local deadline_epoch now_epoch verdict reason screen
+  local deadline_epoch busy_ceiling_epoch busy_deadline now_epoch verdict reason screen
   now_epoch="$(date +%s)"
   deadline_epoch=$((now_epoch + ROLE_READY_TIMEOUT_SECONDS))
+  busy_ceiling_epoch=$((now_epoch + ROLE_BUSY_TIMEOUT_SECONDS))
   reason="(no check performed)"
   screen="(none)"
 
@@ -574,6 +642,12 @@ terminal_wait_ready() {
 
     if [[ "$reason" == "READY" ]] && { [[ "$not_before" -eq 0 ]] || [[ "$now_epoch" -ge "$not_before" ]]; }; then
       return 0
+    fi
+
+    if [[ "$reason" == BUSY:* ]]; then
+      busy_deadline=$((now_epoch + ROLE_READY_TIMEOUT_SECONDS))
+      [[ "$busy_deadline" -gt "$busy_ceiling_epoch" ]] && busy_deadline="$busy_ceiling_epoch"
+      [[ "$busy_deadline" -gt "$deadline_epoch" ]] && deadline_epoch="$busy_deadline"
     fi
 
     [[ "$now_epoch" -ge "$deadline_epoch" ]] && break
