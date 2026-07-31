@@ -135,6 +135,98 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
 
+## Using the skill
+
+Once the skill is loaded, ordinary requests route themselves — the scripts below are what the
+coordinator runs on your behalf, not something you normally type.
+
+| You ask for | Routed to | Shape |
+|---|---|---|
+| "Plan this refactor before anyone touches code" | `architect` | plan only, no edits |
+| "Implement the approved plan and get the build green" | `executor` | implement + verify |
+| "Map where auth lives" / "prototype this quickly" | `thrifty` | read-only survey, cheap changes |
+| "Draft the settings screen" | `ui` → `architect` | draft, then approval before implementing |
+| "Final check before merge" | `reviewer` | APPROVE / BLOCK, never implements |
+| "Make a hero image" | clarity gate → `executor` | Codex `$imagegen` only |
+| "Opus hit its limit — keep going" | `fallback` | continuity on Gemini Flash |
+| "Let's sharpen this idea" | four `debater_*` seats | [idea debate](#idea-debate) |
+
+Korean triggers work the same way (`역할 오케스트레이션`, `모델별 역할 분리`, `이미지 생성`,
+`아이디어 토론`, `니치 찾기`).
+
+Slash commands are the explicit form of the same routes — `/orca-role-orchestration:install`,
+`:bootstrap`, `:dispatch`, `:wait`, `:fallback`, `:debate`, `:close` in Claude Code, and
+`/orca-install`, `/orca-bootstrap`, `/orca-dispatch`, … in Codex.
+
+### Plan → implement → review
+
+The standard DAG, dispatched by hand. Each tab auto-closes when its task completes — there is no
+close step:
+
+```bash
+D=.orca/orchestration/scripts/orca-dispatch-role.sh
+
+# 1. Opus plans. No file edits in this pass.
+"$D" architect --spec "Plan only: add refresh-token rotation to the auth service.
+Constraints: follow AGENTS.md; no schema migration in this pass.
+Scope: src/auth/**. Done: numbered plan + risk list, zero file edits."
+
+# 2. Sol implements the approved plan and blocks until it reports back.
+"$D" executor --wait --spec "Implement the approved plan (rotation + revoke-on-reuse).
+Scope: src/auth/**, tests/auth/**. Done: pnpm typecheck && pnpm test:auth both green."
+
+# 3. Opus gates the diff. Review only.
+"$D" reviewer --spec "Pre-merge gate on the auth diff. APPROVE or BLOCK with reasons.
+Do not implement or rewrite."
+```
+
+Cheap work skips the ladder entirely — `"$D" thrifty --spec "Read-only: list every call site of
+issueToken(). No edits."`
+
+### Waiting on a result
+
+`--wait` on dispatch already pins the wait to that dispatch's own task. Waiting separately means
+passing the task id dispatch printed, otherwise the first matching message wins — including a
+leftover one from an unrelated flow:
+
+```bash
+.orca/orchestration/scripts/orca-wait-done.sh --task task_abc123 --timeout-ms 900000
+```
+
+A timeout or `count:0` is a checkpoint, not a failure.
+
+### Image generation
+
+Raster images route to `executor` through Codex `$imagegen`. If subject, intended use, or
+destination is missing, the coordinator asks before dispatching rather than inventing them:
+
+```bash
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --spec "
+Use Codex \$imagegen skill only
+(read \${CODEX_HOME:-\$HOME/.codex}/skills/.system/imagegen/SKILL.md).
+Goal: dark-mode hero image for the landing page.
+Subject: a single orca breaching over a calm night sea.
+Use: web hero, 16:9.
+Destination: public/img/hero.png
+Avoid: text, logos, brand marks.
+Done: final path + mode (built-in|CLI).
+"
+```
+
+Vector icon sets, repo-native logos, and shapes better done in CSS/SVG are not `$imagegen` work.
+
+### After a rate or session limit
+
+Hand the remaining work to the fallback seat instead of retrying the limited primary:
+
+```bash
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect \
+  --spec "Continue: finish the rotation plan.
+Done so far: threat model + token schema. Remaining: revoke-on-reuse and rollout steps."
+```
+
+Fallback is continuity, not a default quality lane.
+
 ## Idea debate
 
 Four models argue an idea into a niche direction — propose, critique each other anonymously,
