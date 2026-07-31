@@ -4662,6 +4662,226 @@ tr18_elapsed=$(( $(date +%s) - tr18_start ))
 assert TR18_blank_screen_refuses "[[ \"$tr18_rc\" -ne 0 ]]"
 assert TR18_blank_screen_refuses_promptly "[[ \"$tr18_elapsed\" -lt 10 ]]"
 
+# ----------------------------------------------------------------------------
+# Fix round 4 (Task 2), from live verification: with rounds 1-3 in place,
+# preflight passed all three seats live for the first time, and claude and
+# gemini both reached completed end to end -- the feature's first real
+# automated output. Only grok still failed. The gate DID recognise BUSY and
+# extended for the full ~300s ceiling, then refused -- so this was never
+# "BUSY was missed"; grok never presented a clean READY frame within it.
+# Its screen at refusal (reproduced verbatim below) shows grok had, per the
+# coordinator's own direct diagnosis, ALREADY finished ("No dispatch
+# received yet. Standing by for the first round preamble." is its own seed
+# acknowledgment) -- but overlapping redraws left a mangled composite frame
+# (spinner, stale elapsed-time footer, box-drawing fragments, all
+# interleaved mid-line) that no positive pattern, however decoration-
+# tolerant, could parse, and that still contains a busy-shaped fragment
+# ("Waiting for respons") despite not being busy at all. A STABILITY path
+# — the tail stops changing across consecutive polls, with tui-idle also
+# holding — is added as a route to READY for exactly this shape of screen,
+# subordinate to the negative markers (a stable trust dialog or menu must
+# still refuse), proven below.
+# ----------------------------------------------------------------------------
+
+# --- TR19: the exact live grok garbled-frame screen (verbatim, not
+# paraphrased), byte-faithfulness hashed first. Held STATIC across polls
+# (a stub returning the identical content every call), it must reach READY
+# via the stability path — even though its own per-poll classifier verdict
+# is BUSY the entire time (the "Waiting for respons" fragment), never a
+# clean positive-pattern match.
+tr19_dir="$tmpdir/tr19"
+mkdir -p "$tr19_dir/bin"
+cat > "$tr19_dir/screen.txt" <<'TR19SCREEN'
+aggedDone signal: worker_done once per dispatch (taskId + dispatchId), then idl
+next round──────────────────────────────────────────────────────────────────────
+──Sh No dispatch received yet. Standing by for the first round preamble.
+    #1 You are ROLE=debater_grok on model grok-4.5 in an Orca multi-agent setup
+for ⠧ Waiting for respons … 0.0s
+    ⠼Worked for 7.1s             │t Ctrl+x:shortcuts                           s
+top  [hooks: 2]g… 1.6s                                                         1
+8.2
+                     Ctrl+x:shortcuts
+TR19SCREEN
+tr19_expected_sha256="750f3a2a8f00ba647f307fa8520b59e0cb317b83e4f4477bd6f046380d57bc3c"
+tr19_actual_sha256="$(shasum -a 256 "$tr19_dir/screen.txt" | awk '{print $1}')"
+assert TR19_fixture_byte_faithful "[[ \"$tr19_actual_sha256\" == \"$tr19_expected_sha256\" ]]"
+
+cat > "$tr19_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal read")
+    python3 - "$TR19_SCREEN_FILE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+lines = text.split("\n")
+if lines and lines[-1] == "":
+    lines = lines[:-1]
+print(json.dumps({"ok": True, "result": {"terminal": {"handle": "term_tr19", "status": "running", "tail": lines}}}))
+PYEOF
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr19_dir/bin/orca"
+tr19_rc=0
+(
+  export PATH="$tr19_dir/bin:$PATH"
+  export TR19_SCREEN_FILE="$tr19_dir/screen.txt"
+  export ROLE_READY_TIMEOUT_SECONDS=2
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=30
+  export ROLE_READY_STABLE_POLLS=3
+  terminal_wait_ready term_tr19 grok
+) >"$tr19_dir/out.log" 2>"$tr19_dir/err.log" || tr19_rc=$?
+assert TR19_garbled_static_frame_reaches_ready "[[ \"$tr19_rc\" -eq 0 ]]"
+
+# --- TR20: the same shape of screen (busy-marker present, no clean prompt)
+# but GENUINELY CHANGING between polls (new content each time, the way a
+# model actually streaming a response would look) must NOT reach ready —
+# stability must never fire on content that keeps actually changing.
+tr20_dir="$tmpdir/tr20"
+mkdir -p "$tr20_dir/bin"
+tr20_counter="$tr20_dir/counter"
+echo 0 > "$tr20_counter"
+cat > "$tr20_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "terminal read")
+    n=\$(cat "$tr20_counter")
+    n=\$((n + 1))
+    echo "\$n" > "$tr20_counter"
+    echo '{"ok":true,"result":{"terminal":{"handle":"term_tr20","status":"running","tail":["for ⠧ Waiting for respons … '"\$n"'.0s","streaming response chunk number '"\$n"'"]}}}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr20_dir/bin/orca"
+tr20_rc=0
+(
+  export PATH="$tr20_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=2
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=3
+  export ROLE_READY_STABLE_POLLS=3
+  terminal_wait_ready term_tr20 grok
+) >"$tr20_dir/out.log" 2>"$tr20_dir/err.log" || tr20_rc=$?
+assert TR20_genuinely_changing_frame_not_ready "[[ \"$tr20_rc\" -ne 0 ]]"
+
+# --- TR21: a first-run menu (grok, no prompt at all), held perfectly
+# STATIC across many more polls than the stability threshold requires,
+# must still refuse — "(vetoed)" is never stability-eligible, so no amount
+# of unchanging repetition promotes it. This is the regression that would
+# matter most: stable-but-blocked is exactly what a real first-run menu
+# looks like.
+tr21_dir="$tmpdir/tr21"
+mkdir -p "$tr21_dir/bin"
+cat > "$tr21_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr21","status":"running","tail":["splash art placeholder","New worktree","Resume session","Changelog","Quit"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr21_dir/bin/orca"
+tr21_rc=0
+(
+  export PATH="$tr21_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=5
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=5
+  export ROLE_READY_STABLE_POLLS=3
+  terminal_wait_ready term_tr21 grok
+) >"$tr21_dir/out.log" 2>"$tr21_dir/err.log" || tr21_rc=$?
+assert TR21_stable_menu_still_refuses "[[ \"$tr21_rc\" -ne 0 ]]"
+assert TR21_stable_menu_reports_vetoed "grep -q 'NOT_READY(vetoed)' \"$tr21_dir/err.log\""
+
+# --- TR22/TR23: claude's and antigravity's EXISTING ready detection,
+# exercised through the full terminal_wait_ready loop (not just the
+# single-shot classifier), must be unaffected by any of this round's
+# additions — both must still resolve immediately (elapsed ~0s), the same
+# as before this round, since the positive-pattern path returns before the
+# stability machinery is ever consulted.
+tr22_dir="$tmpdir/tr22"
+mkdir -p "$tr22_dir/bin"
+cat > "$tr22_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr22","status":"running","tail":["❯ ","bypass permissions on"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr22_dir/bin/orca"
+tr22_start=$(date +%s)
+tr22_rc=0
+(
+  export PATH="$tr22_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=60
+  export ROLE_READY_POLL_INTERVAL_SECONDS=2
+  terminal_wait_ready term_tr22 claude
+) >"$tr22_dir/out.log" 2>"$tr22_dir/err.log" || tr22_rc=$?
+tr22_elapsed=$(( $(date +%s) - tr22_start ))
+assert TR22_claude_ready_still_immediate "[[ \"$tr22_rc\" -eq 0 && \"$tr22_elapsed\" -lt 2 ]]"
+
+tr23_dir="$tmpdir/tr23"
+mkdir -p "$tr23_dir/bin"
+cat > "$tr23_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr23","status":"running","tail":["Antigravity CLI","> "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr23_dir/bin/orca"
+tr23_start=$(date +%s)
+tr23_rc=0
+(
+  export PATH="$tr23_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=60
+  export ROLE_READY_POLL_INTERVAL_SECONDS=2
+  terminal_wait_ready term_tr23 antigravity
+) >"$tr23_dir/out.log" 2>"$tr23_dir/err.log" || tr23_rc=$?
+tr23_elapsed=$(( $(date +%s) - tr23_start ))
+assert TR23_antigravity_ready_still_immediate "[[ \"$tr23_rc\" -eq 0 && \"$tr23_elapsed\" -lt 2 ]]"
+
+# --- TR24: stability requires tui-idle to ALSO hold, not just unchanging
+# content — a stub whose screen never changes but whose "terminal wait"
+# call always fails (simulating tui-idle never actually settling) must
+# never be promoted via stability.
+tr24_dir="$tmpdir/tr24"
+mkdir -p "$tr24_dir/bin"
+cat > "$tr24_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "terminal wait") exit 7 ;;
+  "terminal read") echo '{"ok":true,"result":{"terminal":{"handle":"term_tr24","status":"running","tail":["for ⠧ Waiting for respons … 0.0s"]}}}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$tr24_dir/bin/orca"
+tr24_rc=0
+(
+  export PATH="$tr24_dir/bin:$PATH"
+  export ROLE_READY_TIMEOUT_SECONDS=2
+  export ROLE_READY_POLL_INTERVAL_SECONDS=1
+  export ROLE_BUSY_TIMEOUT_SECONDS=30
+  export ROLE_READY_STABLE_POLLS=3
+  terminal_wait_ready term_tr24 grok
+) >"$tr24_dir/out.log" 2>"$tr24_dir/err.log" || tr24_rc=$?
+assert TR24_stable_but_tui_idle_never_holds_not_promoted "[[ \"$tr24_rc\" -ne 0 ]]"
+
+# --- TR25: "Worked for <n>s" alone (no "Thought for", no "Waiting for
+# respons") must NOT classify as BUSY — round 4 removed it from the busy
+# marker set specifically because the coordinator's own live evidence
+# showed it as a completion notice, not an ongoing-activity signal.
+tr25_dir="$tmpdir/tr25"
+mkdir -p "$tr25_dir/bin"
+cat > "$tr25_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr25","status":"running","tail":["some idle-looking content","Worked for 7.1s"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr25_dir/bin/orca"
+tr25_out="$(export PATH="$tr25_dir/bin:$PATH"; _terminal_ready_check term_tr25 grok)"
+assert TR25_worked_for_alone_not_busy "! printf '%s\n' \"\$tr25_out\" | head -n1 | grep -q '^BUSY:'"
+
 echo
 echo "Results: $pass passed, $fail failed"
 [[ "$fail" -gt 0 ]] && exit 1

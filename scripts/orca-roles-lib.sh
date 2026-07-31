@@ -287,6 +287,14 @@ wait_idle() {
 # out rather than blocking indefinitely. An estimate, not a measurement —
 # no live timing data exists yet for how long a real seed ack can run.
 : "${ROLE_BUSY_TIMEOUT_SECONDS:=300}"
+# Fix round 4: how many CONSECUTIVE polls must see the same (normalized)
+# screen, with tui-idle also holding on the most recent check, before
+# terminal_wait_ready's stability path (see its own comment) promotes an
+# otherwise-unmatched screen to READY. 3 requires roughly 3 x
+# ROLE_READY_POLL_INTERVAL_SECONDS of confirmed staticness — long enough
+# that a single lucky coincidence can't trigger it, short enough not to
+# add much latency once a seat genuinely has gone idle.
+: "${ROLE_READY_STABLE_POLLS:=3}"
 
 _terminal_ready_check() {
   # $1=handle $2=cli (claude|codex|grok|antigravity|"" for unknown) → stdout
@@ -324,10 +332,20 @@ try:
 except Exception:
     d = None
 
+# Fix round 4: every NOT_READY reason below now carries a parenthetical
+# sub-tag right after "NOT_READY" -- (unreadable)/(status)/(blank)/
+# (vetoed)/(no-match) -- so terminal_wait_ready's bash loop can tell these
+# apart with a plain prefix match instead of pattern-matching English
+# phrasing. Only ONE sub-case, (no-match), is ever eligible for the new
+# stability-based promotion to READY below; the tag is what lets the loop
+# apply that promotion to exactly that case and nothing else, most
+# importantly never to (vetoed) -- a stable trust dialog or first-run menu
+# must keep refusing no matter how long it sits unchanged.
 if not isinstance(d, dict) or not d.get("ok"):
     emit(
-        "NOT_READY: could not read terminal (orca terminal read failed or "
-        "returned no output) -- transient, not a verdict on the screen itself",
+        "NOT_READY(unreadable): could not read terminal (orca terminal read "
+        "failed or returned no output) -- transient, not a verdict on the "
+        "screen itself",
         ["(unreadable)"],
     )
     raise SystemExit(0)
@@ -335,15 +353,15 @@ if not isinstance(d, dict) or not d.get("ok"):
 term = (d.get("result") or {}).get("terminal")
 if not isinstance(term, dict) or term.get("handle") != handle:
     emit(
-        "NOT_READY: terminal read did not return this handle's own terminal "
-        "(structural mismatch) -- transient",
+        "NOT_READY(unreadable): terminal read did not return this handle's "
+        "own terminal (structural mismatch) -- transient",
         ["(unreadable)"],
     )
     raise SystemExit(0)
 
 tail = term.get("tail")
 if not isinstance(tail, list):
-    emit("NOT_READY: terminal read returned no tail array -- transient", ["(unreadable)"])
+    emit("NOT_READY(unreadable): terminal read returned no tail array -- transient", ["(unreadable)"])
     raise SystemExit(0)
 
 lines = [str(x) for x in tail]
@@ -357,11 +375,11 @@ status = term.get("status")
 # genuinely-running terminal as gone.
 BAD_STATUSES = {"exited", "dead", "stopped", "crashed", "terminated", "closed"}
 if isinstance(status, str) and status.strip().lower() in BAD_STATUSES:
-    emit(f"NOT_READY: terminal status={status!r} -- the CLI process is not running", lines or ["(no output)"])
+    emit(f"NOT_READY(status): terminal status={status!r} -- the CLI process is not running", lines or ["(no output)"])
     raise SystemExit(0)
 
 if not joined.strip():
-    emit("NOT_READY: blank screen (no output yet -- CLI still booting)", ["(blank)"])
+    emit("NOT_READY(blank): blank screen (no output yet -- CLI still booting)", ["(blank)"])
     raise SystemExit(0)
 
 
@@ -410,17 +428,30 @@ def has_prompt_line(needle):
 # `terminal_wait_ready` below treats BUSY as "keep waiting" and extends its
 # patience for it, distinctly from both READY and a genuine NOT_READY.
 #
-# Markers are the exact live-observed grok text ("Thought for <n>s" /
-# "Worked for <n>s"), tightened to require the numeral so ordinary prose
-# beginning a sentence with "Thought for..." cannot coincidentally match,
-# and treated as GENERIC (checked for every CLI) rather than grok-only: no
-# other CLI's busy screen has been captured yet (the same evidentiary gap
-# as codex's missing positive pattern), but the cost of a false match here
-# is bounded and cheap -- waiting somewhat longer before the normal
-# not-ready path still applies -- while the cost of NOT recognizing a real
-# one is the exact defect this fix exists to close, and claude at high
-# effort is explicitly expected to take longer than grok's own example.
-_BUSY_RE = re.compile(r"\b(?:Thought|Worked) for \d")
+# Fix round 4: dropped "Worked for <n>s" from this set. A second live
+# grok seat proved it unreliable -- the coordinator's own read of the
+# timeline: "Worked for 7.1s" is a COMPLETION notice ("I worked for this
+# long [and am now done]"), not evidence of ongoing activity, and it can
+# sit statically on screen long after the model has actually finished,
+# consuming the entire busy ceiling before the gate finally gave up on a
+# seat that had been idle for most of that window. "Thought for <n>s" is
+# kept -- round 2's own live evidence showed it as part of an ACTIVELY
+# UPDATING status ticker while the model was still visibly writing more
+# output afterward, unlike "Worked for", which appeared once, at the end,
+# and never changed again. Added "Waiting for respons" (not the full word
+# "response" -- the second live capture that motivated this round showed
+# it truncated mid-word by the same rendering corruption this round's
+# stability fix exists for, "Waiting for respons … 0.0s", so matching the
+# stable prefix tolerates that specific corruption instead of silently
+# missing it) as a new, unambiguous marker: unlike an elapsed-time report,
+# a CLI only shows "waiting for a response" while a response has not yet
+# arrived. Both are treated as GENERIC (checked for every CLI) rather than
+# grok-only: no other CLI's busy screen has been captured yet (the same
+# evidentiary gap as codex's missing positive pattern), but the cost of a
+# false match here is bounded and cheap -- waiting somewhat longer before
+# the normal not-ready path still applies -- while the cost of NOT
+# recognizing a real one is the exact defect this fix exists to close.
+_BUSY_RE = re.compile(r"\bThought for \d|\bWaiting for respons")
 
 
 def busy_reason():
@@ -569,11 +600,18 @@ CLI_NEGATIVE = {
 }
 for marker in GENERIC_NEGATIVE + CLI_NEGATIVE.get(cli, []):
     if marker in joined:
-        emit(f"NOT_READY: matched not-ready marker {marker!r} (cli={cli or 'unknown'})", lines)
+        emit(f"NOT_READY(vetoed): matched not-ready marker {marker!r} (cli={cli or 'unknown'})", lines)
         raise SystemExit(0)
 
 if positive_known:
-    emit(f"NOT_READY: no {cli} ready prompt matched yet (looking for {positive_desc})", lines)
+    # Fix round 4: this specific sub-case -- a CLI WITH a known positive
+    # pattern, whose screen is non-blank, not a bad status, and not vetoed
+    # by any negative marker, but still doesn't match -- is the ONLY one
+    # terminal_wait_ready's stability path (see its own comment) is allowed
+    # to promote to READY, and it recognizes this case by the "(no-match)"
+    # tag alone, via a plain prefix match, not by re-deriving "was this
+    # actually vetoed" from English phrasing. Keep this exact tag stable.
+    emit(f"NOT_READY(no-match): no {cli} ready prompt matched yet (looking for {positive_desc})", lines)
     raise SystemExit(0)
 
 # No known positive pattern for this CLI (codex; also an unrecognized/empty
@@ -586,6 +624,50 @@ emit("READY", lines)
 PY
   cat "$scratch"
   rm -f "$scratch"
+}
+
+_terminal_stability_key() {
+  # $1=screen text (the tail dump already captured by the caller — this
+  # does NOT re-read the terminal) -> a normalized digest on stdout.
+  #
+  # Fix round 4: a second live grok seat sat idle at its own acknowledgment
+  # ("No dispatch received yet. Standing by for the first round preamble.")
+  # for the entire BUSY ceiling before being refused — not because it was
+  # actually busy, but because overlapping redraws left a mangled composite
+  # frame (a spinner, a stale elapsed-time footer, and box-drawing
+  # fragments all interleaved mid-line) that never matched any positive
+  # pattern and never presented a clean prompt glyph. No decoration-
+  # stripping or pattern refinement can reliably parse a frame that
+  # corrupted. What DOES generalize: a genuinely working CLI keeps
+  # producing new, different output (spinners tick, counters advance,
+  # response text streams); a genuinely idle one, however garbled its
+  # frame looks, stops changing. This produces the KEY terminal_wait_ready
+  # compares across consecutive polls for that stability signal.
+  #
+  # Normalizes away exactly what the coordinator named as noise that
+  # churns without meaning: braille-pattern spinner glyphs (U+2800-U+28FF,
+  # the block used for both animated spinners AND grok's own splash-art
+  # ASCII image — irrelevant here, since this key is compared only for
+  # equality, never pattern-matched against) and elapsed-time counters
+  # shaped like "0.0s" / "7.1s" (digits, optional decimal, a REQUIRED
+  # trailing "s" — deliberately not bare digits, to avoid stripping
+  # unrelated numeric content and reducing this to a coincidence machine).
+  # Whitespace runs are also collapsed, since partial/overlapping redraws
+  # can shift horizontal spacing without changing the meaningful content.
+  # Hashed (not compared as raw text) purely to keep the bash-side
+  # comparison a simple, robust string equality check regardless of what
+  # bytes the normalized text happens to contain.
+  local text="$1"
+  python3 -c '
+import hashlib, re, sys
+
+text = sys.argv[1]
+text = re.sub(r"[⠀-⣿]", "", text)
+text = re.sub(r"\d+(?:\.\d+)?s\b", "", text)
+lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n")]
+normalized = "\n".join(lines)
+print(hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest())
+' "$text"
 }
 
 terminal_wait_ready() {
@@ -626,8 +708,36 @@ terminal_wait_ready() {
   # restarting a multi-second floor on every ordinary dispatch to an
   # already-ready, already-warm terminal would add pure, unrequested latency
   # to the six pre-existing roles' hot path for no safety benefit.
+  #
+  # Fix round 4: a STABILITY path to READY, alongside the existing
+  # per-CLI positive patterns. A second live grok seat sat idle at its own
+  # seed acknowledgment for the entire BUSY window, refused at the ceiling,
+  # because overlapping redraws left a mangled composite frame that never
+  # cleanly matched any positive pattern (see _terminal_stability_key's own
+  # comment). No amount of pattern refinement reliably parses a corrupted
+  # frame; what generalizes is that a genuinely working CLI keeps producing
+  # DIFFERENT output, while a genuinely idle one — however garbled its
+  # frame — stops changing. Eligible for exactly two verdict shapes, both
+  # applied inside the loop body below: the "(no-match)" sub-case (a CLI
+  # WITH a known positive pattern, non-blank, not a bad status, NOT vetoed
+  # by any negative marker, but not matching), AND BUSY — the coordinator's
+  # own second capture showed a busy-shaped marker ("Waiting for respons")
+  # sitting in a screen that had, per direct diagnosis, already gone idle;
+  # text alone cannot reliably tell a stale busy marker from a live one, so
+  # stability is the tie-breaker for both, not just one. Never applied to
+  # blank, bad-status, unreadable, or, most importantly, a VETOED screen (a
+  # stable trust dialog or first-run menu must keep refusing no matter how
+  # long it sits unchanged; stability means "not busy", not "ready to
+  # work", and the negative checks upstream in _terminal_ready_check remain
+  # the sole veto for those). ROLE_READY_STABLE_POLLS consecutive polls
+  # with an unchanged normalized screen, AND tui-idle holding on the most
+  # recent check (checked directly now instead of discarded via `|| true`),
+  # promotes that poll to READY. A reason change to anything ineligible
+  # resets the streak — this is about the CURRENT screen being settled, not
+  # merely "was ever settled".
   local handle="$1" cli="${2:-}" not_before="${3:-0}"
   local deadline_epoch busy_ceiling_epoch busy_deadline now_epoch verdict reason screen
+  local stability_key prev_stability_key="" stable_count=0 tui_idle_confirmed=0 tui_idle_rc
   now_epoch="$(date +%s)"
   deadline_epoch=$((now_epoch + ROLE_READY_TIMEOUT_SECONDS))
   busy_ceiling_epoch=$((now_epoch + ROLE_BUSY_TIMEOUT_SECONDS))
@@ -650,9 +760,47 @@ terminal_wait_ready() {
       [[ "$busy_deadline" -gt "$deadline_epoch" ]] && deadline_epoch="$busy_deadline"
     fi
 
+    # Stability tracking covers BOTH "(no-match)" and BUSY verdicts, not
+    # "(no-match)" alone. The coordinator's own second live grok capture is
+    # why: its garbled composite frame contains "Waiting for respons",
+    # which correctly classifies as BUSY by text — but the coordinator's
+    # own diagnosis of that exact screen was that grok had ALREADY
+    # finished; the text was stale noise from overlapping redraws, not
+    # evidence of ongoing work, and nothing in the text alone can tell the
+    # two apart ("pattern matching alone cannot settle this... if you
+    # cannot do that reliably, prefer stability over the text"). So a BUSY
+    # verdict still extends the deadline above (protecting a genuinely
+    # still-generating response, which DOES keep producing different
+    # content and therefore never accumulates stability), but if the exact
+    # same normalized screen keeps recurring across polls regardless of
+    # which of these two verdicts it produced, that repetition is itself
+    # the stronger signal — text can lie about stale-vs-live, unchanging
+    # content cannot. Never applied to "(vetoed)", "(blank)", "(status)",
+    # or "(unreadable)" — those are either a definitive refusal reason
+    # (vetoed) or not meaningfully comparable as "settled" at all.
+    if [[ "$reason" == "NOT_READY(no-match):"* || "$reason" == BUSY:* ]]; then
+      stability_key="$(_terminal_stability_key "$screen")"
+      if [[ -n "$prev_stability_key" && "$stability_key" == "$prev_stability_key" ]]; then
+        stable_count=$((stable_count + 1))
+      else
+        stable_count=1
+      fi
+      prev_stability_key="$stability_key"
+      if [[ "$stable_count" -ge "$ROLE_READY_STABLE_POLLS" && "$tui_idle_confirmed" -eq 1 ]] \
+        && { [[ "$not_before" -eq 0 ]] || [[ "$now_epoch" -ge "$not_before" ]]; }; then
+        return 0
+      fi
+    else
+      stable_count=0
+      prev_stability_key=""
+    fi
+
     [[ "$now_epoch" -ge "$deadline_epoch" ]] && break
+    tui_idle_rc=0
     orca terminal wait --terminal "$handle" --for tui-idle \
-      --timeout-ms "$((ROLE_READY_POLL_INTERVAL_SECONDS * 1000))" --json >/dev/null 2>&1 || true
+      --timeout-ms "$((ROLE_READY_POLL_INTERVAL_SECONDS * 1000))" --json >/dev/null 2>&1 || tui_idle_rc=$?
+    tui_idle_confirmed=0
+    [[ "$tui_idle_rc" -eq 0 ]] && tui_idle_confirmed=1
     sleep "$ROLE_READY_POLL_INTERVAL_SECONDS"
   done
 
