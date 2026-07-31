@@ -284,9 +284,10 @@ Debaters are **read-only by prompt, not by sandbox** — their dispatch spec and
 them to write only their own round output file, but nothing in the CLI enforces that. Quorum is 3 —
 if two or more fail, the round stops. Round prompt text lives in `scripts/orca-debate-lib.sh`.
 
-Only one debate may run at a time: starting a second one while another slug's debate is still
-live is refused (`ensure_terminal` reuses each role's terminal globally, so two concurrent debates
-would otherwise dispatch into the SAME four agent sessions).
+Only one debate may run at a time: starting a second one — same slug or a different one — while a
+debate is still live is refused (`ensure_terminal` reuses each role's terminal globally, so two
+concurrent debates would otherwise dispatch into the SAME four agent sessions; a same-slug
+collision would also reset the live debate's tracked handles out from under it).
 
 ## Routing cheat sheet
 

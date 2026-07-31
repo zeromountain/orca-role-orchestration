@@ -451,6 +451,86 @@ def has_prompt_line(needle):
 # false match here is bounded and cheap -- waiting somewhat longer before
 # the normal not-ready path still applies -- while the cost of NOT
 # recognizing a real one is the exact defect this fix exists to close.
+# Fix round 5 (whole-branch review, items 3+4): negative-marker matching
+# used to substring-match the marker ANYWHERE in the whole ~200-line joined
+# tail -- including text the AGENT ITSELF generated (e.g. grok writing "I
+# updated the Changelog for v2." in its own response matched the grok-only
+# marker 'Changelog'; a claude response merely mentioning "Select a theme"
+# in passing matched the generic marker of the same name). Reproduced
+# directly against this function pre-fix. Since (vetoed) is excluded from
+# the stability-promotion path below by design, this was a hard, permanent
+# refusal for that poll cycle -- and it hits the SIX PRE-EXISTING
+# PRODUCTION ROLES too, not just debaters (thrifty runs grok in THIS repo,
+# whose own vocabulary literally contains "worktree" and "Changelog").
+# Fixed the same way the file already reasons about "Quit" below (precision
+# over recall for a marker that could plausibly appear in ordinary text):
+# anchor each marker to a LINE, not the whole blob, reusing the same
+# decoration-stripping already used for positive-prompt matching. A line
+# only counts as a veto if its decoration-stripped text STARTS WITH the
+# marker -- true for every real dialog/menu line captured live (a menu
+# item is a bare whole line, e.g. "New worktree"; a dialog line like "Do
+# you trust the files in this folder?" starts with the marker text before
+# its own trailing punctuation), false for the marker merely appearing
+# mid-sentence in generated prose.
+GENERIC_NEGATIVE = [
+    # Trust/permission dialogs. Originally documented as "claude-specific";
+    # round 2's live verification proved that framing wrong -- a REAL codex
+    # seat sat on a directory-trust dialog worded entirely differently
+    # ("Do you trust the contents of this directory? Working with
+    # untrusted...") from claude's own ("Do you trust the files in this
+    # folder"). Genuinely cross-CLI, not a claude quirk, and the stakes are
+    # higher for codex specifically than a worse diagnostic: codex has NO
+    # positive pattern (see below), so before this marker existed, this
+    # exact screen matched no negative marker either and fell through to
+    # this function's own "nothing vetoed it -- READY" default for
+    # codex -- a genuine false-READY, caught downstream only because that
+    # particular seat happened to be a debater_* role whose separate,
+    # stricter seed-marker hard gate (see seed()) retried and eventually
+    # failed. A pre-existing role on the same CLI (executor launches codex)
+    # has no such downstream net -- its marker check is soft/informational
+    # by design (Task 2 requirement 4) and would have logged an info line
+    # and reported success. Both phrasings are distinctive, multi-word, and
+    # not the kind of text a normal ready prompt would ever incidentally
+    # contain, so adding the second does not raise false-veto risk.
+    "Do you trust the files in this folder",
+    "Do you trust the contents of this directory",
+    "Select a theme",
+]
+CLI_NEGATIVE = {
+    # Verbatim from the observed-data table. Deliberately EXCLUDES the
+    # table's own "Quit" entry: it is a single common word plausibly present
+    # in an ordinary ready screen's own footer/hint text (e.g. "ctrl+c to
+    # quit"), and the self-review directive here is to bias against
+    # misjudging a genuinely ready terminal as not-ready -- precision over
+    # recall for this one marker. Round 2's live verification confirmed this
+    # directly rather than hypothetically: the real grok seat that exposed
+    # the decoration bug above had "Quit" on screen (a leftover first-run
+    # menu remnant) at the exact same time as a genuinely working prompt --
+    # this marker is also moot regardless, since the positive-before-
+    # negative ordering below means it would never be reached once the
+    # prompt matches anyway. The other three are multi-word, specific, and
+    # were not observed on any ready screen.
+    "grok": ["New worktree", "Resume session", "Changelog"],
+}
+
+
+def _line_matches_marker(ln, marker):
+    return _strip_leading_decoration(ln).startswith(marker)
+
+
+def vetoed_reason():
+    for marker in GENERIC_NEGATIVE + CLI_NEGATIVE.get(cli, []):
+        for ln in lines:
+            if _line_matches_marker(ln, marker):
+                return marker
+    return None
+
+
+# Computed unconditionally, before the busy check below -- see the item-4
+# comment there for why this must be independent of (and, when it matches,
+# override) a BUSY verdict.
+_vetoed_marker = vetoed_reason()
+
 _BUSY_RE = re.compile(r"\bThought for \d|\bWaiting for respons")
 
 
@@ -462,8 +542,25 @@ def busy_reason():
     return None
 
 
+# Fix round 5 (item 4): busy_reason() used to run BEFORE the negative-marker
+# check and win outright -- BUSY is stability-promotable (see
+# terminal_wait_ready's stability path below), so a STATIC trust dialog or
+# first-run menu that also happens to contain busy-shaped leftover text
+# (e.g. a stale "Thought for 3s" line) got misclassified as BUSY, sat
+# unchanging for 3 polls, and was promoted to READY -- directly violating
+# the invariant this file states twice: a stable trust dialog or first-run
+# menu must keep refusing no matter how long it sits unchanged. Reproduced
+# directly pre-fix. _vetoed_marker is now computed independently, above,
+# and wins here whenever both match -- BUSY is only ever emitted for a
+# screen this function is NOT also vetoing. This does not change ordering
+# relative to the positive per-CLI check just below: a genuine positive
+# match still wins over a vetoed marker regardless (see the grok
+# menu-vs-prompt design decision there), so a real prompt match coexisting
+# with both a busy marker and a vetoed marker still reads as READY, not
+# BUSY and not vetoed -- stronger evidence (an actual prompt match) outranks
+# both (see TR26 in tests/debate.sh, which cements this three-way case).
 _busy = busy_reason()
-if _busy:
+if _busy and not _vetoed_marker:
     emit(_busy, lines)
     raise SystemExit(0)
 
@@ -558,50 +655,12 @@ if positive_known and ready:
     emit("READY", lines)
     raise SystemExit(0)
 
-GENERIC_NEGATIVE = [
-    # Trust/permission dialogs. Originally documented as "claude-specific";
-    # round 2's live verification proved that framing wrong -- a REAL codex
-    # seat sat on a directory-trust dialog worded entirely differently
-    # ("Do you trust the contents of this directory? Working with
-    # untrusted...") from claude's own ("Do you trust the files in this
-    # folder"). Genuinely cross-CLI, not a claude quirk, and the stakes are
-    # higher for codex specifically than a worse diagnostic: codex has NO
-    # positive pattern (see above), so before this marker existed, this
-    # exact screen matched no negative marker either and fell through to
-    # this function's own "nothing vetoed it -- READY" default for
-    # codex -- a genuine false-READY, caught downstream only because that
-    # particular seat happened to be a debater_* role whose separate,
-    # stricter seed-marker hard gate (see seed()) retried and eventually
-    # failed. A pre-existing role on the same CLI (executor launches codex)
-    # has no such downstream net -- its marker check is soft/informational
-    # by design (Task 2 requirement 4) and would have logged an info line
-    # and reported success. Both phrasings are distinctive, multi-word, and
-    # not the kind of text a normal ready prompt would ever incidentally
-    # contain, so adding the second does not raise false-veto risk.
-    "Do you trust the files in this folder",
-    "Do you trust the contents of this directory",
-    "Select a theme",
-]
-CLI_NEGATIVE = {
-    # Verbatim from the observed-data table. Deliberately EXCLUDES the
-    # table's own "Quit" entry: it is a single common word plausibly present
-    # in an ordinary ready screen's own footer/hint text (e.g. "ctrl+c to
-    # quit"), and the self-review directive here is to bias against
-    # misjudging a genuinely ready terminal as not-ready -- precision over
-    # recall for this one marker. Round 2's live verification confirmed this
-    # directly rather than hypothetically: the real grok seat that exposed
-    # the decoration bug above had "Quit" on screen (a leftover first-run
-    # menu remnant) at the exact same time as a genuinely working prompt --
-    # this marker is also moot regardless, since the positive-before-
-    # negative ordering above means it would never be reached once the
-    # prompt matches anyway. The other three are multi-word, specific, and
-    # were not observed on any ready screen.
-    "grok": ["New worktree", "Resume session", "Changelog"],
-}
-for marker in GENERIC_NEGATIVE + CLI_NEGATIVE.get(cli, []):
-    if marker in joined:
-        emit(f"NOT_READY(vetoed): matched not-ready marker {marker!r} (cli={cli or 'unknown'})", lines)
-        raise SystemExit(0)
+# _vetoed_marker was computed above, before the busy check -- see its own
+# comment and the item-4 comment above busy_reason() for why. A positive
+# match (just above) still wins over it regardless.
+if _vetoed_marker:
+    emit(f"NOT_READY(vetoed): matched not-ready marker {_vetoed_marker!r} (cli={cli or 'unknown'})", lines)
+    raise SystemExit(0)
 
 if positive_known:
     # Fix round 4: this specific sub-case -- a CLI WITH a known positive

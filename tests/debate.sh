@@ -456,6 +456,44 @@ assert E4_survives_fail   "[[ $E4_RC -eq 0 ]]"
 assert E4_others_present  "[[ -f \"$DEB4/round-1/$e4_claude_label.md\" && -f \"$DEB4/round-1/$e4_gemini_label.md\" && -f \"$DEB4/round-1/$e4_grok_label.md\" ]]"
 assert E4_forfeit_missing "[[ ! -s \"$DEB4/round-1/$e4_codex_label.md\" ]]"
 
+# --- E5 (whole-branch review, item 5): the old
+# `tid=$(dispatcher | awk '{...; exit}' || true)` piped the dispatcher
+# directly into awk — awk's own `exit` on the FIRST match closes its end of
+# the pipe, and the real orca-dispatch-role.sh prints "task_id=..." well
+# BEFORE its slower --inject call, so the dispatcher's next stdout write
+# after that point got SIGPIPE, silently, under the trailing `|| true`.
+# Reproduced directly against the unedited script: a dispatcher stub that
+# prints task_id= then a large amount of additional output (well past any
+# pipe buffer) was killed by SIGPIPE before reaching its own sentinel write
+# — recorded verbatim in final-fix-report.md. This stub writes 500KB after
+# task_id= (comfortably larger than any real pipe buffer) and then touches
+# its own sentinel file — proof the dispatcher process ran to completion,
+# was never attached to a pipe that could SIGPIPE it, regardless of how
+# much it writes after task_id=. ---
+E5_SENTINEL="$tmpdir/e5-dispatcher-finished.marker"
+rm -f "$E5_SENTINEL"
+cat > "$STUB/orca-dispatch-role-bigoutput.sh" <<SH
+#!/usr/bin/env bash
+echo "task_id=task_bigoutput"
+head -c 500000 /dev/zero | tr '\\0' 'x'
+echo
+touch "$E5_SENTINEL"
+SH
+chmod +x "$STUB/orca-dispatch-role-bigoutput.sh"
+
+DEB5="$tmpdir/debate5"
+mkdir -p "$DEB5"
+printf 'TOPIC_E5\n' > "$DEB5/topic.md"
+E5_LABEL_MAP="$tmpdir/labels-e5.json"
+debate_label_map_ensure "$E5_LABEL_MAP" e5slug "claude" >/dev/null
+E5_RC=0
+ORCA_TEST_DISPATCH="$STUB/orca-dispatch-role-bigoutput.sh" \
+ORCA_TEST_STATUS_STUB=completed \
+"$ROUND" --dir "$DEB5" --round 1 --phase propose --debaters claude --timeout-ms 5000 \
+  --label-map "$E5_LABEL_MAP" >"$tmpdir/e5.out" 2>"$tmpdir/e5.err" || E5_RC=$?
+assert E5_dispatcher_never_sigpiped "[[ -f \"$E5_SENTINEL\" ]]"
+assert E5_tid_still_captured "grep -q 'debater_claude → task_bigoutput' \"$tmpdir/e5.err\""
+
 # --- F1 driver argument handling and preflight ---
 DRIVER="$ROOT/scripts/orca-debate.sh"
 assert F1_exec "[[ -x \"$DRIVER\" ]]"
@@ -610,6 +648,16 @@ assert G1_readme "grep -q 'orca-debate.sh' \"$ROOT/README.md\""
 # own pattern run directly against this file.
 assert G1_playbook_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/templates/PLAYBOOK.md\""
 assert G1_skill_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/SKILL.md\""
+
+# --- G2 (whole-branch review, item 6): both templates' "optional block"
+# example, and commands/wait.md's argument-hint, must teach the SAFE
+# orca-wait-done.sh invocation (--task pinned) rather than the bare --role
+# form — orca-wait-done.sh's own header explains at length why the bare form
+# closes the wrong tab once a debate has left worker_done messages queued
+# (the debate path deliberately never drains its inbox). ---
+assert G2_playbook_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty --task' \"$ROOT/templates/PLAYBOOK.md\""
+assert G2_scripts_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty --task' \"$ROOT/templates/SCRIPTS.md\""
+assert G2_wait_cmd_hint_has_task "grep -q -- '--task ID' \"$ROOT/commands/wait.md\""
 
 
 # ============================================================================
@@ -3096,6 +3144,219 @@ assert ZC3_never_both_dispatch_across_trials "[[ \"$zc3_any_double_dispatch\" -e
 assert ZC3_exactly_one_dispatches_every_trial "[[ \"$zc3_any_neither_dispatch\" -eq 0 ]]"
 
 # ============================================================================
+# CT-series (whole-branch review, item 1): a --dry-run invocation of the SAME
+# slug as a live, real debate must not disturb ANY of that live debate's
+# state — not its mutex hold, not its lock file, not its watchdog process.
+# Pre-fix, cleanup() released the startup mutex and (via debate_watchdog_stop
+# resolving the SAME $LOCK_DIR/$SLUG.watchdog.pid path, since LOCK_DIR/
+# LOCK_FILE/WATCHDOG_PID_FILE are computed unconditionally regardless of
+# DRY_RUN) SIGTERM'd the LIVE driver's own watchdog and removed its lock —
+# unconditionally, even though the --dry-run process itself never acquired
+# the mutex and never wrote that lock. Reproduced directly against the
+# unedited script (real two-process run, not simulated): a live driver's
+# lock+watchdog vanished the instant a concurrent same-slug --dry-run
+# invocation exited; recorded verbatim in final-fix-report.md. Reuses the
+# Q-series' real sandboxed orca-debate.sh + q_bin (never the real project's
+# .orca/ state). The live driver below is started WITHOUT
+# ORCA_TEST_STATUS_STUB set, so its one dispatch's status stays "unknown"
+# forever (q_bin's "orchestration dispatch-show" case falls through to its
+# own `{"ok":true}` catch-all, which dispatch_status parses as "unknown")
+# and the round polls (every 5s, orca-debate-round.sh's own fixed POLL_S)
+# without ever resolving — a deterministic window in which the live driver
+# is genuinely registered (real lock, real running watchdog process) but not
+# yet exited, to run the concurrent --dry-run against.
+# ============================================================================
+ct_root="$tmpdir/ct-debates"
+ct_slug="ct-shared-slug"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+"$Q_DRIVER" --topic "the live half of a same-slug collision" --slug "$ct_slug" --rounds 1 \
+  --timeout-ms 100 --dir-root "$ct_root" --lock-ttl-seconds 1800 \
+  >"$tmpdir/ct-live.out" 2>"$tmpdir/ct-live.err" &
+ct_live_pid=$!
+unset ORCA_TEST_DISPATCH
+export PATH="$Q_OLD_PATH"
+CLEANUP_PIDS+=("$ct_live_pid")
+
+ct_lock_file="$Q_LOCKS_DIR/$ct_slug.json"
+ct_watchdog_pidfile="$Q_LOCKS_DIR/$ct_slug.watchdog.pid"
+wait_for 5000 "[[ -f \"$ct_watchdog_pidfile\" ]]" || true
+ct_watchdog_pid="$(cat "$ct_watchdog_pidfile" 2>/dev/null || true)"
+[[ -n "$ct_watchdog_pid" ]] && CLEANUP_PIDS+=("$ct_watchdog_pid")
+
+assert CT0_live_watchdog_pid_captured "[[ -n \"$ct_watchdog_pid\" ]]"
+assert CT0_live_lock_is_fresh "[[ -f \"$ct_lock_file\" ]] && lock_is_fresh \"$ct_lock_file\""
+assert CT0_live_watchdog_process_alive "kill -0 \"$ct_watchdog_pid\" 2>/dev/null"
+
+ct_live_lock_pid_before="$(lock_pid "$ct_lock_file")"
+
+# The concurrent --dry-run: SAME slug, run to completion synchronously
+# (--dry-run never blocks on a round — no terminals, so it exits almost
+# immediately regardless of the live driver's own state).
+ct_dry_rc=0
+export PATH="$q_bin:$PATH"
+"$Q_DRIVER" --topic "a dry-run preview of the same slug while it is live" --slug "$ct_slug" \
+  --dry-run --dir-root "$ct_root" \
+  >"$tmpdir/ct-dry.out" 2>"$tmpdir/ct-dry.err" || ct_dry_rc=$?
+export PATH="$Q_OLD_PATH"
+
+assert CT1_dry_run_itself_ok "[[ \"$ct_dry_rc\" -eq 0 ]]"
+assert CT1_live_lock_still_present "[[ -f \"$ct_lock_file\" ]]"
+assert CT1_live_lock_still_fresh "lock_is_fresh \"$ct_lock_file\""
+# Captured to a plain variable FIRST, then compared — never an inline
+# `$(lock_pid ...)` inside the assert string itself. lock_pid's own header
+# explains why it must be captured via `$(...)` by a caller rather than
+# read directly (bash 3.2's heredoc-in-$(...) issue); an assert-condition
+# STRING built with an inline `$(lock_pid ...)` inside it is a second layer
+# of the same hazard and was observed flaky here (empty on the FIRST call in
+# this exact context, correct on every direct call before/after) — same
+# capture-then-compare idiom the RL-series above already uses throughout.
+ct_lock_pid_now="$(lock_pid "$ct_lock_file")"
+assert CT1_live_lock_pid_unchanged "[[ \"$ct_lock_pid_now\" == \"$ct_live_lock_pid_before\" ]]"
+assert CT1_live_watchdog_still_alive "kill -0 \"$ct_watchdog_pid\" 2>/dev/null"
+
+# Let the live driver actually finish (its own poll cycle's timeout fires
+# ~5s in — see the comment above) and confirm ITS OWN cleanup still behaves
+# normally afterward: the concurrent dry-run must not have left it in some
+# half-cleaned state.
+ct_live_rc=0
+wait "$ct_live_pid" || ct_live_rc=$?
+assert CT2_live_driver_still_exits_ok "[[ \"$ct_live_rc\" -eq 0 ]]"
+assert CT2_live_lock_removed_by_its_own_cleanup "[[ ! -f \"$ct_lock_file\" ]]"
+ct_watchdog_gone=0
+wait_for 3000 "! kill -0 $ct_watchdog_pid 2>/dev/null" && ct_watchdog_gone=1
+assert CT2_live_watchdog_exits_after_its_own_run "[[ \"$ct_watchdog_gone\" -eq 1 ]]"
+
+# --- CT3 (item 1, related): --keep-tabs must leave the lock as a forced-
+# stale BREADCRUMB, not remove it outright — a debater's handle stays in
+# handles.json forever (orca-close-role.sh never clears it), so once this
+# driver exits, orca-sweep-orphans.sh's stale-lock path is the ONLY detector
+# left for the tabs --keep-tabs deliberately left open; removing the lock
+# (the pre-fix behavior) made them permanently undetectable. ---
+ct3_root="$tmpdir/ct3-debates"
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+ct3_out="$("$Q_DRIVER" --topic "keep-tabs must breadcrumb, not remove" --slug ct3slug --rounds 1 \
+  --keep-tabs --dir-root "$ct3_root" --lock-ttl-seconds 1800 2>&1)"
+ct3_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Q_OLD_PATH"
+
+ct3_lock_file="$Q_LOCKS_DIR/ct3slug.json"
+assert CT3_driver_exits_ok "[[ \"$ct3_rc\" -eq 0 ]]"
+assert CT3_lock_left_in_place "[[ -f \"$ct3_lock_file\" ]]"
+assert CT3_lock_forced_stale "[[ -f \"$ct3_lock_file\" ]] && ! lock_is_fresh \"$ct3_lock_file\""
+assert CT3_reports_breadcrumb "printf '%s' \"\$ct3_out\" | grep -qi 'breadcrumb'"
+
+# Step 3's own acceptance criterion (mirrors BC1's own sweep check above,
+# same handle-capture technique): the sweeper subsequently reports one of
+# ct3slug's still-open (--keep-tabs never closes anything) debater handles
+# as a WOULD-CLOSE candidate. close_handle_if_live's own echo lines
+# (orca-sweep-orphans.sh) print the handle and title, never the slug string
+# itself — grepping for "ct3slug" directly (this assertion's first draft)
+# can never match; the slug is only reachable via the handle it owns.
+ct3_claude_handle="$(grep '^debate-opus ' "$Q_STATE_DIR/handle-by-title.log" 2>/dev/null | tail -1 | awk '{print $2}')" || true
+assert CT3_claude_handle_captured "[[ -n \"$ct3_claude_handle\" ]]"
+
+# Must run with q_bin (the STUBBED orca) on PATH — orca-sweep-orphans.sh
+# calls `orca terminal list` itself, and without the stub this would reach a
+# real `orca` binary, breaking this suite's runtime-free property. Captured
+# to a variable first (never piped directly inside the assert string — same
+# reasoning as CT1 above).
+ct3_sweep_out="$(
+  export PATH="$q_bin:$PATH"
+  "$SWEEP" --locks-dir "$Q_LOCKS_DIR" --orch-dir "$q_root" \
+    --journal "$q_root/no-such-journal-for-ct3.jsonl" --handles-file "$q_root/handles.json" 2>&1
+)"
+assert CT3_sweeper_finds_it "printf '%s' \"\$ct3_sweep_out\" | grep -q \"\$ct3_claude_handle.*WOULD CLOSE\""
+
+# ============================================================================
+# SL-series (whole-branch review, item 2): a FRESH same-slug lock used to be
+# a warning-and-overwrite, unlike a fresh OTHER-slug lock (a hard refusal,
+# see ZC1 above). Driver B's lock_write reset "handles" to [] on disk;
+# driver A's own cleanup() calls lock_handle_claimed_elsewhere with A's OWN
+# lock excluded (by design), so once B overwrote the file, A could no longer
+# see B's claim on the same handles and would close tabs B was mid-round on,
+# then remove what was now B's lock — killing B's watchdog too. Reproduced
+# directly against the unedited script: a hand-written fresh same-slug lock
+# (with one registered handle, simulating a live driver A) was silently
+# overwritten by a real driver B for the same slug, which then dispatched
+# normally; recorded verbatim in final-fix-report.md. Fixed by refusing
+# outright, matching the cross-slug refusal's own message shape.
+# ============================================================================
+sl_root="$tmpdir/sl-debates"
+sl_lock_file="$Q_LOCKS_DIR/sl-slug.json"
+lock_write "$sl_lock_file" "$$" sl-slug 1800
+lock_register_handle "$sl_lock_file" "term_protected_debater"
+lock_merge_and_refresh "$sl_lock_file" >/dev/null
+sl_pid_before="$(lock_pid "$sl_lock_file")"
+sl_handles_before="$(lock_handles "$sl_lock_file")"
+sl_sidecar="${sl_lock_file%.json}.handles.jsonl"
+[[ -f "$sl_sidecar" ]] && sl_sidecar_before="$(cat "$sl_sidecar")" || sl_sidecar_before=""
+
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+sl_rc=0
+sl_out="$("$Q_DRIVER" --topic "driver B, colliding slug" --slug sl-slug --rounds 1 \
+  --dir-root "$sl_root" --lock-ttl-seconds 1800 2>&1)" || sl_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Q_OLD_PATH"
+
+assert SL1_refuses_fresh_same_slug_lock "[[ \"$sl_rc\" -ne 0 ]]"
+assert SL1_message_is_actionable "printf '%s' \"\$sl_out\" | grep -q 'Refusing to start'"
+assert SL1_message_names_the_slug "printf '%s' \"\$sl_out\" | grep -q 'sl-slug'"
+assert SL1_never_dispatched_anything "[[ ! -d \"$sl_root/sl-slug/round-1\" ]]"
+# Captured to plain variables FIRST, then compared — never an inline
+# `$(lock_pid ...)`/`$(lock_handles ...)` inside the assert string itself
+# (same bash-3.2-flakiness reasoning as CT1 above; observed directly here
+# too before this fix).
+sl_lock_pid_now="$(lock_pid "$sl_lock_file")"
+sl_lock_handles_now="$(lock_handles "$sl_lock_file")"
+assert SL1_original_lock_pid_untouched "[[ \"$sl_lock_pid_now\" == \"$sl_pid_before\" ]]"
+assert SL1_original_lock_handles_untouched "[[ \"$sl_lock_handles_now\" == \"$sl_handles_before\" ]]"
+assert SL1_original_sidecar_untouched \
+  "[[ \"$( [[ -f \"$sl_sidecar\" ]] && cat \"$sl_sidecar\" || echo '' )\" == \"$sl_sidecar_before\" ]]"
+
+# SL1's own fixture lock (slug "sl-slug", fresh, pid=$$ — genuinely alive,
+# since $$ is this very suite process) MUST be cleared before SL2 runs:
+# left in place, it would make SL2's own driver invocation (a DIFFERENT
+# slug, "sl2-slug") hit the pre-existing, unrelated CROSS-slug refusal
+# (ZC-series above) instead of exercising what SL2 actually tests — same-
+# slug staleness. That cross-contamination was reproduced directly: SL2
+# failed outright with SL1's own fixture still present.
+lock_remove "$sl_lock_file"
+
+# Positive control: an identical same-slug lock that is STALE (heartbeat
+# past its own tiny ttlSeconds) must NOT block — same reasoning as ZC2 above,
+# applied to the same-slug case this fix newly covers.
+sl2_lock_file="$Q_LOCKS_DIR/sl2-slug.json"
+lock_write "$sl2_lock_file" "$$" sl2-slug 1800
+python3 - "$sl2_lock_file" <<'PY'
+import json, datetime, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["heartbeatAt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=999)).isoformat()
+d["ttlSeconds"] = 5
+with open(path, "w") as f:
+    json.dump(d, f)
+PY
+assert SL2_stale_same_slug_lock_confirmed_stale "! lock_is_fresh \"$sl2_lock_file\""
+
+export PATH="$q_bin:$PATH"
+export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
+export ORCA_TEST_STATUS_STUB=completed
+sl2_rc=0
+"$Q_DRIVER" --topic "stale same-slug lock must not block a legitimate restart" --slug sl2-slug --rounds 1 \
+  --dir-root "$sl_root" --lock-ttl-seconds 1800 \
+  >"$tmpdir/sl2.out" 2>"$tmpdir/sl2.err" || sl2_rc=$?
+unset ORCA_TEST_DISPATCH ORCA_TEST_STATUS_STUB
+export PATH="$Q_OLD_PATH"
+assert SL2_stale_same_slug_lock_does_not_block "[[ \"$sl2_rc\" -eq 0 ]]"
+assert SL2_own_lock_cleaned_up_after_normal_exit "[[ ! -f \"$sl2_lock_file\" ]]"
+
+# ============================================================================
 # WD-series (Task 4): orca-wait-done.sh's new --task filter. The defect: bare
 # `orca orchestration check` has no per-task selector, so a leftover message
 # from an unrelated flow (a multi-round debate deliberately never drains its
@@ -3758,6 +4019,171 @@ assert RL3_reap_exits_ok "[[ \"$rl3_rc\" -eq 0 ]]"
 rl3_status="$(rl_ledger_status task_rl3)"
 assert RL3_ledger_says_undetermined "[[ \"$rl3_status\" == 'close_undetermined' ]]"
 assert RL3_ledger_not_closed "[[ \"$rl3_status\" != 'closed' ]]"
+
+# ----------------------------------------------------------------------------
+# WCV-series (whole-branch review, item 7 + item 8): orca-wait-done.sh's own
+# close path had the IDENTICAL unverified-close-plus-unconditional-"closed"
+# lie RL1-3 above already fixed for orca-reap-task.sh — it fired
+# `orca terminal close`, logged "may already be gone" on any failure, and
+# wrote dispatch-ledger.jsonl status="closed" unconditionally on BOTH
+# branches. Reproduced directly against the unedited script (a "terminal
+# list" stub that always reports the handle connected, however many times
+# close is called): status="closed" landed in the ledger anyway; recorded
+# verbatim in final-fix-report.md. Mirrors RL-series' own sandboxing
+# convention (own copy of the script + orca-roles-lib.sh, own ORCH-relative
+# ledger/handles.json) since orca-wait-done.sh's ORCH is likewise always
+# recomputed from its own on-disk location, never overridable.
+# ----------------------------------------------------------------------------
+wcv_dir="$tmpdir/wait-close-verify"
+mkdir -p "$wcv_dir/orch/scripts"
+cp "$ROOT/scripts/orca-wait-done.sh" "$ROOT/scripts/orca-roles-lib.sh" "$wcv_dir/orch/scripts/"
+chmod +x "$wcv_dir/orch/scripts/orca-wait-done.sh"
+WCV_WAIT="$wcv_dir/orch/scripts/orca-wait-done.sh"
+WCV_LEDGER="$wcv_dir/orch/dispatch-ledger.jsonl"
+
+seed_wcv_ledger() {
+  # $1=task_id $2=handle
+  cat > "$WCV_LEDGER" <<JSON
+{"taskId": "$1", "dispatchId": "dispatch_$1", "role": "debater_claude", "handle": "$2", "status": "dispatched", "dispatchedAt": "2020-01-01T00:00:00+00:00"}
+JSON
+}
+
+wcv_ledger_status() {
+  python3 -c '
+import json, sys
+path, tid = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get("taskId") == tid:
+                print(row.get("status") or "")
+except Exception:
+    print("")
+' "$WCV_LEDGER" "$1"
+}
+
+# --- WCV1 (item 7's core proof): a close that is fired but NEVER actually
+# takes ("terminal list" reports the handle connected forever, no matter how
+# many times "terminal close" is called) must NOT leave dispatch-ledger.jsonl
+# saying "closed". ---
+wcv1_dir="$tmpdir/wcv1"
+mkdir -p "$wcv1_dir/bin"
+cat > "$wcv1_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_wcv1_stuck","subject":"done","payload":{"taskId":"task_wcv1"}}]}}'
+    ;;
+  "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_wcv1_stuck","connected":true}]}}' ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wcv1_dir/bin/orca"
+seed_wcv_ledger task_wcv1 term_wcv1_stuck
+wcv1_rc=0
+wcv1_out="$(
+  export PATH="$wcv1_dir/bin:$PATH"
+  "$WCV_WAIT" --task task_wcv1 --timeout-ms 3000 2>&1
+)" || wcv1_rc=$?
+assert WCV1_wait_exits_ok "[[ \"$wcv1_rc\" -eq 0 ]]"
+# grep -qi -E, not the bare `\|` GNU-alternation extension: this file's
+# suite also runs against BSD grep (macOS default), whose basic-regex mode
+# does not treat `\|` as alternation the way GNU grep does.
+assert WCV1_reports_close_failed_loudly "printf '%s' \"\$wcv1_out\" | grep -qiE 'STILL LIVE|Close FAILED'"
+wcv1_status="$(wcv_ledger_status task_wcv1)"
+assert WCV1_ledger_not_closed "[[ \"$wcv1_status\" != 'closed' ]]"
+assert WCV1_ledger_says_close_failed "[[ \"$wcv1_status\" == 'close_failed' ]]"
+
+# --- WCV2 (happy path unaffected): a close that genuinely succeeds (stateful
+# stub — the handle is omitted from "terminal list" once actually closed)
+# must still leave the ledger saying "closed", proving this fix does not
+# turn a real success into a false alarm. ---
+wcv2_dir="$tmpdir/wcv2"
+mkdir -p "$wcv2_dir/bin"
+cat > "$wcv2_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_wcv2_ok","subject":"done","payload":{"taskId":"task_wcv2"}}]}}'
+    ;;
+  "terminal list")
+    if grep -qx "term_wcv2_ok" "$WCV2_CLOSED_MARKER" 2>/dev/null; then
+      echo '{"ok":true,"result":{"terminals":[]}}'
+    else
+      echo '{"ok":true,"result":{"terminals":[{"handle":"term_wcv2_ok","connected":true}]}}'
+    fi
+    ;;
+  "terminal close")
+    echo "term_wcv2_ok" >> "$WCV2_CLOSED_MARKER"
+    echo '{"ok":true}'
+    ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wcv2_dir/bin/orca"
+: > "$wcv_dir/wcv2-closed.log"
+seed_wcv_ledger task_wcv2 term_wcv2_ok
+wcv2_rc=0
+wcv2_out="$(
+  export PATH="$wcv2_dir/bin:$PATH"
+  export WCV2_CLOSED_MARKER="$wcv_dir/wcv2-closed.log"
+  "$WCV_WAIT" --task task_wcv2 --timeout-ms 3000 2>&1
+)" || wcv2_rc=$?
+assert WCV2_wait_exits_ok "[[ \"$wcv2_rc\" -eq 0 ]]"
+assert WCV2_reports_confirmed_gone "printf '%s' \"\$wcv2_out\" | grep -q 'confirmed gone'"
+wcv2_status="$(wcv_ledger_status task_wcv2)"
+assert WCV2_ledger_says_closed "[[ \"$wcv2_status\" == 'closed' ]]"
+
+# --- WCV3 (undetermined path, the third of terminal_close_and_verify's three
+# outcomes): `orca terminal list` itself failing outright must leave a
+# distinct, unambiguous "close_undetermined" status — never "closed". ---
+wcv3_dir="$tmpdir/wcv3"
+mkdir -p "$wcv3_dir/bin"
+cat > "$wcv3_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "orchestration check")
+    echo '{"ok":true,"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_wcv3_unknown","subject":"done","payload":{"taskId":"task_wcv3"}}]}}'
+    ;;
+  "terminal list") echo "simulated outage" >&2; exit 7 ;;
+  "terminal close") echo '{"ok":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+exit 0
+ORCASTUB
+chmod +x "$wcv3_dir/bin/orca"
+seed_wcv_ledger task_wcv3 term_wcv3_unknown
+wcv3_rc=0
+wcv3_out="$(
+  export PATH="$wcv3_dir/bin:$PATH"
+  "$WCV_WAIT" --task task_wcv3 --timeout-ms 3000 2>&1
+)" || wcv3_rc=$?
+assert WCV3_wait_exits_ok "[[ \"$wcv3_rc\" -eq 0 ]]"
+wcv3_status="$(wcv_ledger_status task_wcv3)"
+assert WCV3_ledger_says_undetermined "[[ \"$wcv3_status\" == 'close_undetermined' ]]"
+assert WCV3_ledger_not_closed "[[ \"$wcv3_status\" != 'closed' ]]"
+
+# --- WCV4 (item 8): both mark_ledger bodies (orca-reap-task.sh and
+# orca-wait-done.sh) must write via temp-file + os.replace, never a bare
+# in-place `open(path, "w")` — the latter truncates the ledger before
+# rewriting it, so a kill of either script (both are backgroundable /
+# interruptible processes) in that window would zero dispatch-ledger.jsonl.
+# A real kill -9-mid-write demonstration (the pre-fix pattern zeroing a
+# multi-row ledger, and the post-fix pattern surviving an identical kill
+# byte-for-byte) is recorded in final-fix-report.md — asserted here as a
+# static check against the actual shipped source (not a re-implemented
+# mirror) so this can never silently drift from what actually ships. ---
+assert WCV4_reap_ledger_write_is_atomic \
+  "grep -q 'os.replace(tmp_path, path)' \"$ROOT/scripts/orca-reap-task.sh\""
+assert WCV4_wait_ledger_write_is_atomic \
+  "grep -q 'os.replace(tmp_path, path)' \"$ROOT/scripts/orca-wait-done.sh\""
 
 # --- TG4/TG5/TG6: orca-bootstrap-roles.sh failure isolation. A dedicated
 # stub understands `terminal create` (echoes a handle derived from --title),
@@ -4881,6 +5307,71 @@ ORCASTUB
 chmod +x "$tr25_dir/bin/orca"
 tr25_out="$(export PATH="$tr25_dir/bin:$PATH"; _terminal_ready_check term_tr25 grok)"
 assert TR25_worked_for_alone_not_busy "! printf '%s\n' \"\$tr25_out\" | head -n1 | grep -q '^BUSY:'"
+
+# --- TR26/TR27 (whole-branch review, items 3+4): negative-marker matching
+# used to substring-match the marker ANYWHERE in the whole joined tail,
+# including text the AGENT ITSELF generated in ordinary prose. Fixed by
+# anchoring to a LINE (decoration-stripped, must START WITH the marker) —
+# these two prove the false-positive is gone without weakening the real
+# dialog/menu cases the existing TR2/TR3/TR6/TR11/TR17/TR21 fixtures above
+# already cover (re-run unmodified by this fix round, still green). ---
+tr26_dir="$tmpdir/tr26"
+mkdir -p "$tr26_dir/bin"
+cat > "$tr26_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr26","status":"running","tail":["garbled ⠧ frame","I updated the Changelog for v2."]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr26_dir/bin/orca"
+tr26_out="$(export PATH="$tr26_dir/bin:$PATH"; _terminal_ready_check term_tr26 grok)"
+assert TR26_prose_mentioning_marker_not_vetoed "! printf '%s\n' \"\$tr26_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+assert TR26_falls_to_no_match_instead "printf '%s\n' \"\$tr26_out\" | head -n1 | grep -q '^NOT_READY(no-match)'"
+
+tr27_dir="$tmpdir/tr27"
+mkdir -p "$tr27_dir/bin"
+cat > "$tr27_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr27","status":"running","tail":["❯ ","You can Select a theme from settings later if you like."]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr27_dir/bin/orca"
+tr27_out="$(export PATH="$tr27_dir/bin:$PATH"; _terminal_ready_check term_tr27 claude)"
+assert TR27_prose_mentioning_marker_not_vetoed "! printf '%s\n' \"\$tr27_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+
+# --- TR28 (item 4): a genuine trust dialog that ALSO happens to contain
+# busy-shaped leftover text must still veto — BUSY must never bypass a real
+# vetoed marker. Pre-fix, busy_reason() ran first and won outright, which
+# would let a STATIC trust dialog get promoted to READY via the stability
+# path (3 unchanged polls) — directly violating the invariant this file
+# states twice. ---
+tr28_dir="$tmpdir/tr28"
+mkdir -p "$tr28_dir/bin"
+cat > "$tr28_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr28","status":"running","tail":["You are in /repo.","Do you trust the contents of this directory?","Thought for 3s"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr28_dir/bin/orca"
+tr28_out="$(export PATH="$tr28_dir/bin:$PATH"; _terminal_ready_check term_tr28 codex)"
+assert TR28_vetoed_beats_busy "printf '%s\n' \"\$tr28_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+assert TR28_never_reads_busy "! printf '%s\n' \"\$tr28_out\" | head -n1 | grep -q '^BUSY:'"
+
+# --- TR29 (item 4, documented three-way interaction): a genuine POSITIVE
+# prompt match still wins over both a busy marker and a vetoed marker
+# present at the same time — stronger evidence (an actual prompt match)
+# outranks both, and this ordering is unchanged by this fix round (only
+# busy-vs-vetoed priority changed). Cements the behavior so a future
+# reorder cannot silently flip it. ---
+tr29_dir="$tmpdir/tr29"
+mkdir -p "$tr29_dir/bin"
+cat > "$tr29_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr29","status":"running","tail":["New worktree","Resume session","Changelog","Quit","Thought for 2s","❯ "]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr29_dir/bin/orca"
+tr29_out="$(export PATH="$tr29_dir/bin:$PATH"; _terminal_ready_check term_tr29 grok)"
+assert TR29_positive_beats_both "printf '%s\n' \"\$tr29_out\" | head -n1 | grep -qx 'READY'"
 
 echo
 echo "Results: $pass passed, $fail failed"

@@ -110,10 +110,21 @@ mark_ledger() {
   # the "status" string carries that distinction (see the close_handle
   # call site below for the three values this can now be: "closed",
   # "close_failed", "close_undetermined").
+  #
+  # Fix round (whole-branch review, item 8): this reaper is a `nohup`
+  # background process that can be killed at any moment, and the old body
+  # did `with open(path, "w") as f: <rewrite all rows>` — a plain in-place
+  # open TRUNCATES the file the instant it is opened, before any row is
+  # written back. A kill in that window zeroes dispatch-ledger.jsonl.
+  # orca-roles-lib.sh's lock_write already documents and uses the fix at
+  # length for the exact same reason: write to a temp file in the SAME
+  # directory, then os.replace (atomic on a local filesystem) — a killed
+  # writer leaves, at worst, a stray .tmp.<pid> file next to an untouched,
+  # still-valid ledger.
   local status="$1"
   [[ -f "$LEDGER_FILE" ]] || return 0
   python3 - "$LEDGER_FILE" "$TASK_ID" "$status" <<'PY' 2>/dev/null || true
-import json, sys, datetime
+import json, os, sys, datetime
 path, tid, status = sys.argv[1:4]
 rows = []
 try:
@@ -131,9 +142,11 @@ try:
                 row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 row["reaped"] = True
             rows.append(row)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp." + str(os.getpid())
+    with open(tmp_path, "w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+    os.replace(tmp_path, path)
 except Exception:
     pass
 PY

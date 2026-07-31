@@ -25,8 +25,11 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 .orca/orchestration/scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
 .orca/orchestration/scripts/orca-debate.sh --topic "…"   # 3-round idea debate
-# close is automatic after dispatch; optional block:
-.orca/orchestration/scripts/orca-wait-done.sh --role thrifty
+# close is automatic after dispatch; optional block — always pass --task (the
+# task_id printed by dispatch): bare --role can act on a leftover worker_done
+# message from an unrelated flow (e.g. a debate, which never drains its own
+# inbox backlog) and close the wrong tab.
+.orca/orchestration/scripts/orca-wait-done.sh --role thrifty --task task_xxx
 .orca/orchestration/scripts/orca-close-role.sh thrifty   # manual emergency only
 ```
 

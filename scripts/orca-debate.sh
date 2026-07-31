@@ -240,6 +240,20 @@ WATCHDOG_PID_FILE="$LOCK_DIR/$SLUG.watchdog.pid"
 mkdir -p "$LABELS_DIR"
 LABEL_MAP_FILE="$LABELS_DIR/$SLUG.json"
 
+# Fix round (whole-branch review, item 1): cleanup() below used to call
+# debate_startup_mutex_release and lock_remove UNCONDITIONALLY — but a
+# --dry-run invocation never reaches the DRY_RUN=0 branch below, so it never
+# acquires the mutex and never writes LOCK_FILE. Reproduced directly:
+# a sandbox with a live driver's ".starting.lock" (mid-critical-section) and
+# a fresh "<slug>.json" lock present, one concurrent --dry-run invocation of
+# the SAME slug, both destroyed by the dry-run's own cleanup() — killing the
+# live driver's dead-man watchdog detection, handle protection, and
+# cross-slug refusal for the rest of its run. These two flags record what
+# THIS process actually did, so cleanup() (and the temporary EXIT trap right
+# after the mutex acquire below) can act only on state it actually owns.
+MUTEX_HELD=0
+OWN_LOCK_WRITTEN=0
+
 if [[ "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$LOCK_DIR"
 
@@ -264,13 +278,19 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "Could not acquire the debate-start coordination lock ($LOCK_DIR/.starting.lock) within ${DEBATE_STARTUP_MUTEX_MAX_WAIT_SECONDS_DEFAULT}s (another driver appears to be starting right now). Refusing to start rather than risk two drivers racing into the same terminals — retry in a moment, or if that directory is left over from a crash and you are certain nothing is actively starting, remove it yourself." >&2
     exit 1
   fi
+  MUTEX_HELD=1
   # Safety net: if anything between here and the explicit release a few
   # lines down dies unexpectedly (an error under set -e, a signal), this
   # temporary EXIT trap still releases the mutex instead of leaking it
   # forever. Superseded (silently, harmlessly) once `trap cleanup EXIT` is
   # registered further down — cleanup() itself also releases the mutex
-  # (idempotent) as a second line of defense.
-  trap 'debate_startup_mutex_release "$LOCK_DIR"' EXIT
+  # (idempotent) as a second line of defense. Guarded on MUTEX_HELD (cleared
+  # at every release site below) so that if this process's explicit release
+  # already ran and a DIFFERENT driver's mkdir has since won the mutex, a
+  # crash in the narrow window between that release and `trap cleanup EXIT`
+  # being registered does not fire this trap again and rm-rf the OTHER
+  # driver's now-legitimately-held mutex out from under it.
+  trap '[[ "$MUTEX_HELD" -eq 1 ]] && debate_startup_mutex_release "$LOCK_DIR"' EXIT
 
   # Test seam only: widens the critical section on demand so a test can
   # DETERMINISTICALLY force two concurrent driver invocations to overlap,
@@ -306,13 +326,38 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
         fi
       fi
       echo "Refusing to start: debate '$other_slug' has a live lock ($lf, $alive_note). Starting a second debate now would make ensure_terminal dispatch into the SAME four agent sessions '$other_slug' is using, corrupting both. Wait for '$other_slug' to finish, or — only if you are certain it is actually dead — remove $lf yourself and retry." >&2
+      MUTEX_HELD=0
       debate_startup_mutex_release "$LOCK_DIR"
       exit 1
     fi
   done
 
+  # Fix round (whole-branch review, item 2): a FRESH same-slug lock used to
+  # be a warning-and-overwrite, unlike the cross-slug case above (a hard
+  # refusal). Driver B's lock_write resets "handles" to [] on disk; driver
+  # A's own cleanup() calls lock_handle_claimed_elsewhere with A's OWN lock
+  # file excluded (by design — it must not defer to itself), so once B has
+  # overwritten the file, A can no longer see B's claim on those same
+  # handles, and A's cleanup closes the tabs B is mid-round on, then removes
+  # what is now B's lock — killing B's dead-man watchdog detection too.
+  # README.md/SKILL.md both flatly state "Only one debate runs at a time",
+  # which was false for exactly this case. Refusing outright (matching the
+  # cross-slug refusal's own message shape/actionability) is the safer
+  # reading given the failure mode, and is what makes that doc claim true.
   if [[ -f "$LOCK_FILE" ]] && lock_is_fresh "$LOCK_FILE"; then
-    echo "(warn) a fresh debate lock already exists for slug '$SLUG' (pid=$(lock_pid "$LOCK_FILE")) — overwriting it. If that debate is still actually running, its watchdog will notice the pid no longer matches this run and stand down without closing anything (see orca-sweep-orphans.sh), but two drivers now believe they own the same tabs. Consider --slug to pick a different slug if that was not intended." >&2
+    same_slug_pid="$(lock_pid "$LOCK_FILE")"
+    same_slug_alive_note="cannot confirm a pid"
+    if [[ -n "$same_slug_pid" ]]; then
+      if kill -0 "$same_slug_pid" 2>/dev/null; then
+        same_slug_alive_note="pid $same_slug_pid is alive"
+      else
+        same_slug_alive_note="pid $same_slug_pid is NOT running — its watchdog likely has not noticed yet"
+      fi
+    fi
+    echo "Refusing to start: a fresh debate lock already exists for slug '$SLUG' ($LOCK_FILE, $same_slug_alive_note). Overwriting it would reset its handle tracking to empty, so this new driver's cleanup could not tell that debate's tabs are still in active use and would close them out from under it, then remove ITS lock too. Wait for the running '$SLUG' debate to finish, pick a different --slug, or — only if you are certain it is actually dead — remove $LOCK_FILE yourself and retry." >&2
+    MUTEX_HELD=0
+    debate_startup_mutex_release "$LOCK_DIR"
+    exit 1
   fi
 
   # Deferred finding I1: every real run of a slug is treated as fresh. There
@@ -337,6 +382,14 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 
   WATCHDOG_PID="$(debate_watchdog_start "$HERE" "$LOCK_FILE" "$SLUG" "$$" "$LOCK_DIR" "$LOCK_TTL_SECONDS")"
   printf '%s\n' "$WATCHDOG_PID" > "$WATCHDOG_PID_FILE"
+  # This process's own lock (and watchdog pid file) are now genuinely on
+  # disk (lock_write ran inside debate_watchdog_start just above, in THIS
+  # shell, not a subshell) — from here on, cleanup() may safely act on
+  # LOCK_FILE/WATCHDOG_PID_FILE as its own. Set in the caller, not inside
+  # debate_watchdog_start itself, since that function's own body runs in a
+  # $(...) command substitution subshell — a flag set there would never be
+  # visible out here.
+  OWN_LOCK_WRITTEN=1
   export ORCA_ROLE_LOCK_FILE="$LOCK_FILE"
   echo "  watchdog: pid=$WATCHDOG_PID ttl=${LOCK_TTL_SECONDS}s lock=$LOCK_FILE"
 
@@ -344,6 +397,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   # and therefore visible to any OTHER driver's scan — release the mutex
   # immediately so it is held only for this brief registration window, never
   # for this debate's entire lifetime.
+  MUTEX_HELD=0
   debate_startup_mutex_release "$LOCK_DIR"
 else
   # --dry-run must NEVER write the real label map: a partial-roster preview
@@ -378,15 +432,30 @@ cleanup() {
   # orphan produced sweep's "candidates=0". The lock's fate is now decided
   # at the BOTTOM of this function, once every close has actually been
   # attempted and its real outcome is known.
-  debate_watchdog_stop "$WATCHDOG_PID_FILE"
+  #
+  # Fix round (whole-branch review, item 1): guarded on OWN_LOCK_WRITTEN —
+  # WATCHDOG_PID_FILE is computed unconditionally (cheap, just a path
+  # string) at the top of this script regardless of DRY_RUN, so a --dry-run
+  # invocation of the SAME slug as a live, real debate would otherwise
+  # resolve to that OTHER driver's own watchdog pid file here and SIGTERM
+  # its watchdog process out from under it — reproduced directly. Only the
+  # process that actually started (and durably recorded) its own watchdog
+  # may stop it.
+  if [[ "$OWN_LOCK_WRITTEN" -eq 1 ]]; then
+    debate_watchdog_stop "$WATCHDOG_PID_FILE"
+  fi
 
   # Defensive, idempotent second release of the startup mutex (see the
   # explicit release right after debate_watchdog_start, and the temporary
   # EXIT trap registered right after acquiring it) — a harmless no-op in the
   # normal case where it was already released; a real backstop if some path
   # through the DRY_RUN=0 block above ever reaches here without having done
-  # so itself.
-  debate_startup_mutex_release "$LOCK_DIR"
+  # so itself. Guarded on MUTEX_HELD (same reasoning as the temporary EXIT
+  # trap above) so this can never release a mutex a DIFFERENT driver has
+  # since legitimately acquired.
+  if [[ "$MUTEX_HELD" -eq 1 ]]; then
+    debate_startup_mutex_release "$LOCK_DIR"
+  fi
 
   # Throwaway --dry-run label map (never the real $LABELS_DIR/<slug>.json —
   # see the DRY_RUN branch above): tidy it up regardless of KEEP_TABS/DRY_RUN,
@@ -397,11 +466,29 @@ cleanup() {
 
   if [[ "$KEEP_TABS" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
     # Neither path ever attempts a close (tabs are deliberately left open,
-    # or nothing was ever created), so there is nothing "unconfirmed" —
-    # remove the lock unconditionally here, exactly as debate_watchdog_stop
-    # itself used to, so these two paths' behavior is byte-identical to
-    # before this task.
-    lock_remove "$LOCK_FILE"
+    # or nothing was ever created). Only touch LOCK_FILE if THIS process is
+    # the one that actually wrote it (OWN_LOCK_WRITTEN) — a --dry-run run
+    # never does, so this guard is what stops a concurrent --dry-run preview
+    # from destroying a different, live debate's lock that merely happens to
+    # share this slug's path (item 1's core fix).
+    if [[ "$OWN_LOCK_WRITTEN" -eq 1 ]]; then
+      if [[ "$KEEP_TABS" -eq 1 ]]; then
+        # --keep-tabs deliberately leaves debater tabs live for debugging —
+        # but a debater's handle stays in handles.json FOREVER (see
+        # orca-close-role.sh's own header comment), so once this driver
+        # exits, orca-sweep-orphans.sh's stale-lock path is the ONLY
+        # detector left for those tabs; the "untracked in handles.json" path
+        # never fires for a debater handle by design. Removing the lock here
+        # (the old behavior) made those tabs permanently undetectable —
+        # breadcrumb instead, exactly like an unconfirmed close does below:
+        # forced immediately stale (lock_leave_as_breadcrumb) so the sweeper
+        # finds them right away rather than after a full ttlSeconds.
+        lock_leave_as_breadcrumb "$LOCK_FILE"
+        echo "cleanup: --keep-tabs — leaving $LOCK_FILE in place (forced stale) as a breadcrumb so orca-sweep-orphans.sh can find these deliberately-left-open tabs later" >&2
+      else
+        lock_remove "$LOCK_FILE"
+      fi
+    fi
     return 0
   fi
   local old="$IFS" short

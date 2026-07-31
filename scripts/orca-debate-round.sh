@@ -159,13 +159,26 @@ for i in "${!NAMES[@]}"; do
     continue
   fi
 
-  # `|| true` keeps a non-zero dispatcher exit from aborting the whole round
-  # under `set -euo pipefail`: without it, pipefail would make this bare
-  # assignment's own exit status non-zero (the same bare-assignment-vs-`local`
-  # distinction documented in debate_lint), and `set -e` would kill the script
-  # mid-fanout — orphaning already-dispatched debaters and losing the manifest
-  # entirely instead of forfeiting just this one debater below.
-  tid="$("$DISPATCH_BIN" "$role" --persist --spec "$spec" | awk -F= '/^task_id=/{print $2; exit}' || true)"
+  # Fix round (whole-branch review, item 5): the old code piped the
+  # dispatcher directly into `awk '{...; exit}'` — awk's own `exit` on the
+  # FIRST match closes its end of the pipe, and orca-dispatch-role.sh prints
+  # "task_id=..." (line ~192) well BEFORE its slower --inject call (line
+  # ~201), so the dispatcher's next stdout write after that point gets
+  # SIGPIPE, silently, under the trailing `|| true` below — a script dying
+  # on a signal, exactly the class of bug this branch spent two prior plans
+  # eliminating elsewhere. Worse than a cosmetic loss: the dispatcher can be
+  # killed BEFORE it ever injects the seat's prompt, leaving that seat's
+  # task created but never dispatched. Fixed by capturing the dispatcher's
+  # FULL stdout into a variable first — no process is ever attached to the
+  # other end of a live pipe from the dispatcher once this runs, so it can
+  # never be SIGPIPE'd — then parsing task_id out of the captured string via
+  # a here-string (no new pipe either). `|| true` on the capture (not
+  # `|| dispatch_out=""`) preserves whatever the dispatcher DID print even
+  # on a non-zero exit — bash still assigns the captured output before the
+  # `||` is evaluated, and a dispatcher that created the task before failing
+  # later must not have that output silently discarded.
+  dispatch_out="$("$DISPATCH_BIN" "$role" --persist --spec "$spec")" || true
+  tid="$(awk -F= '/^task_id=/{print $2; exit}' <<<"$dispatch_out")" || tid=""
   if [[ -z "$tid" ]]; then
     echo "  (warn) $role produced no task id" >&2
     tid="none"

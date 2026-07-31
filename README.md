@@ -150,8 +150,10 @@ never a model-named file); the label map and per-round manifest live outside the
 entirely, in `.orca/orchestration/debate-labels/` and `debate-manifests/` — nothing inside the
 debate directory itself, in a filename or in file contents, ever names a debater. See the
 anonymity guarantee and its limits under Security below. Only one debate runs at a time: starting
-a second one while another slug's debate is still live is refused, since terminals are reused
-per-role globally and two concurrent debates would otherwise collide in the same four sessions.
+a second one — same slug or a different one — while a debate is still live is refused, since
+terminals are reused per-role globally and two concurrent debates would otherwise collide in the
+same four sessions (a same-slug collision would also reset the live debate's tracked handles,
+leaving its tabs unprotected from the new driver's own cleanup).
 
 ## Security
 

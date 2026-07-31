@@ -61,7 +61,9 @@ Only when user asks to supervise / coordinate / wait / DAG:
 
 # Optional: block until result (close is already automatic via reaper)
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json
-# or: .orca/orchestration/scripts/orca-wait-done.sh --role thrifty
+# or (always pass --task, the task_id printed by dispatch — bare --role can
+# act on a leftover message from an unrelated flow, e.g. a debate, and close
+# the wrong tab): .orca/orchestration/scripts/orca-wait-done.sh --role thrifty --task task_xxx
 ```
 
 Role tabs are **ephemeral and auto-closed**: every dispatch starts a background reaper (`orca-reap-task.sh`) and injects an AUTO-CLOSE command into the worker. No manual close step. Next dispatch recreates a dead handle automatically.

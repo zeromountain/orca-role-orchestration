@@ -312,19 +312,51 @@ if [[ -z "$CLOSE_HANDLE" || "$CLOSE_HANDLE" != term_* ]]; then
 fi
 
 echo "Auto-closing completed worker tab: $CLOSE_HANDLE" >&2
-# Prefer whole-tab close so the sub-session disappears from the sidebar
-if orca terminal close --terminal "$CLOSE_HANDLE" --tab --json >/dev/null 2>&1 \
-  || orca terminal close --terminal "$CLOSE_HANDLE" --json >/dev/null 2>&1; then
-  echo "Closed $CLOSE_HANDLE" >&2
-else
-  echo "Close returned non-zero for $CLOSE_HANDLE (may already be gone)" >&2
-fi
+# Fix round (whole-branch review, item 7): this used to fire
+# `orca terminal close` fire-and-forget, log "may already be gone" on
+# failure, and continue regardless — then mark_ledger below wrote
+# status="closed" UNCONDITIONALLY on both branches, the identical silent-
+# success lie an earlier task on this branch already removed from
+# orca-reap-task.sh and orca-sweep-orphans.sh (which now both use
+# terminal_close_and_verify + a 0/1/2 -> closed/close_failed/
+# close_undetermined mapping — see orca-reap-task.sh's close_handle).
+# terminal_close_and_verify (orca-roles-lib.sh, already sourced) already
+# does the same "prefer --tab, fall back to a plain close" attempt this
+# used to do manually, then RE-CHECKS instead of trusting the close call's
+# own reported success.
+CLOSE_STATUS="closed"
+close_rc=0
+terminal_close_and_verify "$CLOSE_HANDLE" || close_rc=$?
+case "$close_rc" in
+  0)
+    echo "Closed $CLOSE_HANDLE (confirmed gone)" >&2
+    CLOSE_STATUS="closed"
+    ;;
+  1)
+    echo "Close FAILED for $CLOSE_HANDLE — still live after a close attempt" >&2
+    CLOSE_STATUS="close_failed"
+    ;;
+  2)
+    echo "Close for $CLOSE_HANDLE could not be confirmed (liveness undetermined)" >&2
+    CLOSE_STATUS="close_undetermined"
+    ;;
+esac
 
-# Mark ledger row closed (best-effort)
+# Mark ledger row (best-effort), with the HONEST status from above rather
+# than a hardcoded "closed". Fix round (item 8): the old body did
+# `with open(path, "w") as f: <rewrite all rows>` — a plain in-place open
+# truncates the file the instant it is opened, before any row is written
+# back, so a kill of this process in that window would zero
+# dispatch-ledger.jsonl. Same temp-file + os.replace pattern
+# orca-roles-lib.sh's lock_write documents and uses at length, and
+# orca-reap-task.sh's own mark_ledger now also uses (byte-identical write
+# mechanism; this script's row does not set "reaped" — that field records
+# the background reap CYCLE having acted, which is not what this script
+# is).
 if [[ -n "$TASK_ID" && -f "$LEDGER_FILE" ]]; then
-  python3 - "$LEDGER_FILE" "$TASK_ID" <<'PY' 2>/dev/null || true
-import json, sys, datetime
-path, tid = sys.argv[1:3]
+  python3 - "$LEDGER_FILE" "$TASK_ID" "$CLOSE_STATUS" <<'PY' 2>/dev/null || true
+import json, os, sys, datetime
+path, tid, status = sys.argv[1:4]
 rows = []
 try:
     with open(path) as f:
@@ -338,11 +370,13 @@ try:
                 continue
             if row.get("taskId") == tid:
                 row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                row["status"] = "closed"
+                row["status"] = status
             rows.append(row)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp." + str(os.getpid())
+    with open(tmp_path, "w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+    os.replace(tmp_path, path)
 except Exception:
     pass
 PY
