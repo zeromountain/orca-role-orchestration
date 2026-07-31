@@ -142,12 +142,16 @@ EOF
 
 "$DISPATCH" fallback --spec "$FULL_SPEC"
 echo "Failover dispatched to ROLE=fallback."
-# --task is a PLACEHOLDER here on purpose: this script does not capture the
-# dispatcher's stdout (item 5 removed exactly that kind of live pipe on the
-# dispatcher, and re-adding one to harvest the id would risk the same class of
-# failure), so the real id is the `task_id=` the dispatch above just printed.
-# Pasted verbatim, this line fails loudly on an unknown task instead of
-# silently acting on a leftover worker_done from another flow — a bare --role
-# would close whatever tab handles.json maps that role to. See
-# orca-wait-done.sh's own header for the full failure mode.
-echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --task <task_id printed above> --timeout-ms 900000"
+# This script deliberately does NOT print (or parse out) its own wait-done
+# command. The dispatch above runs WITHOUT --wait, so orca-dispatch-role.sh
+# reaches its own trailing summary and has already streamed a complete,
+# copy-pasteable "optional block:" line pinned to this exact task id — its
+# stdout is not captured here, so the user saw it live. Re-printing it would
+# be pure duplication, and the earlier attempt at that duplicated it in a
+# STRICTLY WORSE form: a `--task <placeholder>` the user had to hand-edit,
+# plus `--timeout-ms 900000`, which is already orca-wait-done.sh's own
+# default. Harvesting the real id here would mean capturing the dispatcher's
+# stdout, which costs the live streaming this interactive failover tool wants
+# (terminal create + the readiness gate can block for tens of seconds) and
+# buys nothing the dispatcher has not already printed.
+echo "  (to block on completion: run the 'optional block' command printed above — it is already pinned to this task id, and its default timeout is 900000ms)"
