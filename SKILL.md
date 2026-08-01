@@ -67,6 +67,13 @@ produced**. The scripts resolve the id automatically (`$ORCA_RUN_ID`, else
 `run-current`) and pass `--run`; they never create a Run for you, because
 `run-create` rebinds the calling terminal and Runs have no close step.
 
+This reaches the **worker** too. Orca's injected preamble shows a
+`orca orchestration send` example with no `--run`, so a worker that copies it
+has its `worker_done` refused — the task stays `dispatched` forever even though
+the work finished. Every dispatch spec therefore carries a RUN SCOPE block
+telling the worker to add `--run` to its own calls. Measured: same role, same
+model, same task — `dispatched` without the block, `completed` with it.
+
 Left unbound, the failure is invisible at the point of cause: bootstrap and the
 debate preflight both pass, seats seed normally, and the work dies much later as
 worker timeouts that look like a model problem. `orca-debate.sh` therefore

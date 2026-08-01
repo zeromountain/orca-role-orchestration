@@ -81,11 +81,41 @@ is_debater() {
 }
 
 dispatch_tail_block() {
-  # $1=handle  $2=close|persist
-  local handle="$1" mode="${2:-close}"
+  # $1=handle  $2=close|persist  $3=run_id (optional)
+  local handle="$1" mode="${2:-close}" run_id="${3:-}"
+
+  # Run scope for the WORKER's own outbound calls.
+  #
+  # Orca generates the dispatch preamble, and its `orca orchestration send`
+  # example carries no --run. A worker that copies it verbatim — exactly what
+  # the preamble instructs — has worker_done refused with legacy_read_only,
+  # because the worker's terminal is not bound to a Run either.
+  #
+  # Measured live: a probe worker completed its task and reported
+  # "outcome=succeeded ... Note: orchestration send worker_done blocked by
+  # legacy_read_only process identity from this terminal."
+  #
+  # The coordinator-side fix (resolve_run_id + --run on task-create/dispatch)
+  # does NOT cover this — the send originates in the worker's terminal, so the
+  # flag has to reach it as an instruction. Without this block every --wait
+  # dispatch times out, and every debate round forfeits workers that did the
+  # work and had no way to say so.
+  local run_scope=""
+  if [[ -n "$run_id" ]]; then
+    run_scope="
+RUN SCOPE (required — the command block above is incomplete without it):
+Add --run ${run_id} to EVERY 'orca orchestration' command you run, including
+worker_done and heartbeats. The preamble's examples omit it; sent without it,
+your messages are refused (legacy_read_only) and the coordinator never sees
+them, no matter how well the task itself went. For example:
+  orca orchestration send --run ${run_id} --from ${handle} \\
+    --type worker_done --subject \"…\" --body \"…\" --outcome succeeded
+"
+  fi
+
   if [[ "$mode" == "persist" ]]; then
     cat <<EOF
-
+${run_scope}
 STAY-OPEN (required):
 After you send worker_done exactly once, do NOT close this terminal and do NOT
 run any close command. Stay idle and wait for the next dispatch in this debate.
@@ -95,7 +125,7 @@ The debate driver closes this tab when the debate ends.
 EOF
   else
     cat <<EOF
-
+${run_scope}
 AUTO-CLOSE (required, automatic):
 After you send worker_done exactly once, immediately run this shell command (do not skip):
   orca terminal close --terminal ${handle} --tab --json
