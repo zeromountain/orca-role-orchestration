@@ -4752,9 +4752,13 @@ assert TR5_floor_enforced "[[ \"$tr5_elapsed\" -ge 2 ]]"
 # UNRECOGNIZED future status string (must NOT veto — never fail on a signal
 # we don't understand) are each classified correctly. ---
 tr6_trust_dir="$tmpdir/tr6-trust"; mkdir -p "$tr6_trust_dir/bin"
-cat > "$tr6_trust_dir/bin/orca" <<'ORCASTUB'
+# Marker and choice affordance deliberately kept on separate source lines —
+# see TR33. Emitted JSON is unchanged; only this file's own layout is.
+tr6_marker='Do you trust the files in this folder?'
+tr6_choice='❯ 1. Yes, proceed'
+cat > "$tr6_trust_dir/bin/orca" <<ORCASTUB
 #!/usr/bin/env bash
-echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"running","tail":["Do you trust the files in this folder?","❯ 1. Yes, proceed"]}}}'
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr6","status":"running","tail":["$tr6_marker","$tr6_choice"]}}}'
 exit 0
 ORCASTUB
 chmod +x "$tr6_trust_dir/bin/orca"
@@ -5207,9 +5211,12 @@ assert TR16_reached_third_poll "[[ \"\$(cat \"$tr16_counter\")\" -ge 3 ]]"
 # ceiling, total elapsed must stay far under the busy ceiling.
 tr17_dir="$tmpdir/tr17"
 mkdir -p "$tr17_dir/bin"
-cat > "$tr17_dir/bin/orca" <<'ORCASTUB'
+# Split for the same reason as TR6 above — see TR33.
+tr17_marker='Do you trust the files in this folder?'
+tr17_choice='❯ 1. Yes, proceed'
+cat > "$tr17_dir/bin/orca" <<ORCASTUB
 #!/usr/bin/env bash
-echo '{"ok":true,"result":{"terminal":{"handle":"term_tr17","status":"running","tail":["Do you trust the files in this folder?","❯ 1. Yes, proceed"]}}}'
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr17","status":"running","tail":["$tr17_marker","$tr17_choice"]}}}'
 exit 0
 ORCASTUB
 chmod +x "$tr17_dir/bin/orca"
@@ -5531,6 +5538,98 @@ ORCASTUB
 chmod +x "$tr29_dir/bin/orca"
 tr29_out="$(export PATH="$tr29_dir/bin:$PATH"; _terminal_ready_check term_tr29 grok)"
 assert TR29_positive_beats_both "printf '%s\n' \"\$tr29_out\" | head -n1 | grep -qx 'READY'"
+
+# ============================================================================
+# TR30-TR33: the codex directory-trust dialog AS IT ACTUALLY ARRIVES. TR28
+# above uses a hand-written, well-formed version of this screen; the real one
+# read off a live seat does not look like that, and the gate reported READY
+# for it — the seat then received its seed into the modal and produced
+# nothing, which is why the codex seat was the only one that never returned.
+#
+# TR30's tail line is the captured one, verbatim apart from the path: the
+# spaces inside the dialog are GONE (that is how `orca terminal read` hands
+# it back), and what survives is a single line whose head is the path banner,
+# so the marker is neither present verbatim nor at the start of a line. Both
+# of the anchored matcher's assumptions fail at once.
+#
+# The line is ASSEMBLED FROM PIECES here on purpose. This suite is read by
+# seats working on this repo; a source line carrying the marker and a choice
+# affordance together would render on such a seat's screen and veto it —
+# the same self-inflicted false veto the corroboration rule exists to avoid.
+# Keep the two halves on separate lines in any future edit.
+# ============================================================================
+tr30_dir="$tmpdir/tr30"
+mkdir -p "$tr30_dir/bin"
+tr30_head='>You are in /repo/projDoyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents'
+tr30_mid='comeswithhigherriskofpromptinjection.Trustingthedirectoryallowsproject-localconfig,hooks,andexecpoliciestoload.'
+tr30_choices='› 1. Yes, continue2.No,quitPress enter to continue'
+tr30_line="$tr30_head$tr30_mid$tr30_choices"
+cat > "$tr30_dir/bin/orca" <<ORCASTUB
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr30","status":"running","tail":["codex --model gpt-5.6-sol","","$tr30_line"]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr30_dir/bin/orca"
+tr30_out="$(export PATH="$tr30_dir/bin:$PATH"; _terminal_ready_check term_tr30 codex)"
+assert TR30_real_trust_dialog_vetoed "printf '%s\n' \"\$tr30_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+# codex has no positive pattern, so before this fix the same screen fell
+# through to this function's "nothing vetoed it -- READY" default. Pinning
+# the exact verdict, not merely "not READY": (no-match) is the ONE tag
+# terminal_wait_ready's stability path is allowed to promote to READY after
+# a few unchanged polls, and a trust dialog is perfectly static — so landing
+# on (no-match) here would readmit the same false READY through that door.
+assert TR30_not_reported_ready "! printf '%s\n' \"\$tr30_out\" | head -n1 | grep -qx 'READY'"
+assert TR30_not_stability_promotable "! printf '%s\n' \"\$tr30_out\" | head -n1 | grep -q 'no-match'"
+
+# --- TR31: corroboration is load-bearing. The same squashed marker WITHOUT a
+# choice affordance — an agent's own prose, which is what forced the marker
+# to be line-anchored in the first place (TR26/TR27) — must not veto. ---
+tr31_dir="$tmpdir/tr31"
+mkdir -p "$tr31_dir/bin"
+cat > "$tr31_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr31","status":"running","tail":["I hit a prompt readingDoyoutrustthecontentsofthisdirectory?and answered it."]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr31_dir/bin/orca"
+tr31_out="$(export PATH="$tr31_dir/bin:$PATH"; _terminal_ready_check term_tr31 codex)"
+assert TR31_squashed_marker_alone_not_vetoed "! printf '%s\n' \"\$tr31_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+
+# --- TR32: the mirror. A choice affordance with no marker (an ordinary
+# numbered list in generated output) must not veto either. ---
+tr32_dir="$tmpdir/tr32"
+mkdir -p "$tr32_dir/bin"
+cat > "$tr32_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr32","status":"running","tail":["Options: 1. Yes, continue2.No,quit — pick one for the migration."]}}}'
+exit 0
+ORCASTUB
+chmod +x "$tr32_dir/bin/orca"
+tr32_out="$(export PATH="$tr32_dir/bin:$PATH"; _terminal_ready_check term_tr32 codex)"
+assert TR32_affordance_alone_not_vetoed "! printf '%s\n' \"\$tr32_out\" | head -n1 | grep -q '^NOT_READY(vetoed)'"
+
+# --- TR33: this repo's own source must not veto a seat that is reading it.
+# The gate library and this suite both contain the marker text and the
+# affordance fragments; if any single line of either carried both, a seat
+# doing ordinary work here would refuse itself permanently (a veto is not
+# stability-promotable). Checked mechanically rather than by eye. ---
+tr33_bad=""
+for tr33_f in "$ROOT/scripts/orca-roles-lib.sh" "$ROOT/tests/debate.sh"; do
+  tr33_hit="$(python3 - "$tr33_f" <<'PY'
+import sys
+markers = ["Do you trust the files in this folder", "Do you trust the contents of this directory"]
+affordances = ["1.Yes", "2.No", "Pressentertocontinue"]
+squash = lambda s: "".join(s.split())
+sq_markers = [squash(m) for m in markers]
+for i, line in enumerate(open(sys.argv[1], encoding="utf-8"), 1):
+    s = squash(line)
+    if any(m in s for m in sq_markers) and any(a in s for a in affordances):
+        print(f"{sys.argv[1]}:{i}")
+PY
+)" || true
+  [[ -n "$tr33_hit" ]] && tr33_bad="$tr33_bad$tr33_hit"
+done
+assert TR33_repo_source_cannot_self_veto "[[ -z \"\$tr33_bad\" ]]"
 
 echo
 echo "Results: $pass passed, $fail failed"
