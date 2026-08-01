@@ -107,13 +107,26 @@ FROM_HANDLE=""
 TASK_ID=""
 SUBJECT=""
 
+# Resolved once and shared by both branches below — `check` is Run-scoped like
+# task-create/dispatch (see resolve_run_id in orca-roles-lib.sh). Empty keeps
+# the pre-2026-07-31 call shape exactly.
+RUN_ID="$(resolve_run_id)"
+RUN_ARGS=()
+if [[ -n "$RUN_ID" ]]; then
+  RUN_ARGS=(--run "$RUN_ID")
+fi
+
 if [[ -z "$TASK_FILTER" ]]; then
   # ---------------------------------------------------------------------
-  # No filter: byte-for-byte the original single-shot behavior, untouched
-  # on purpose (Step 3 acceptance: existing callers must be unaffected).
+  # No filter: the original single-shot behavior, with one addition — the
+  # Run scope below. When RUN_ARGS is empty the emitted command is
+  # byte-for-byte the original (Step 3 acceptance: existing callers must be
+  # unaffected); when it is set, the call reaches the same Run that
+  # orca-dispatch-role.sh created the task in, instead of the read-only
+  # legacy coordinator.
   # ---------------------------------------------------------------------
   echo "Waiting (types=$TYPES timeout-ms=$TIMEOUT_MS)…" >&2
-  CHECK_JSON="$(orca orchestration check --wait --types "$TYPES" --timeout-ms "$TIMEOUT_MS" --json)"
+  CHECK_JSON="$(orca orchestration check ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --wait --types "$TYPES" --timeout-ms "$TIMEOUT_MS" --json)"
   printf '%s\n' "$CHECK_JSON"
 
   # Parse first message
@@ -173,7 +186,7 @@ else
     fi
 
     echo "Waiting (types=$TYPES timeout-ms=$REMAINING_MS task=$TASK_FILTER)…" >&2
-    CHECK_JSON="$(orca orchestration check --wait --types "$TYPES" --timeout-ms "$REMAINING_MS" --json)"
+    CHECK_JSON="$(orca orchestration check ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --wait --types "$TYPES" --timeout-ms "$REMAINING_MS" --json)"
     printf '%s\n' "$CHECK_JSON"
 
     eval "$(printf '%s' "$CHECK_JSON" | python3 -c '

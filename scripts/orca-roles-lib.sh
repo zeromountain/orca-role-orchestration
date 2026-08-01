@@ -1704,3 +1704,76 @@ lock_handle_claimed_elsewhere() {
   done
   return 1
 }
+
+# ---------------------------------------------------------------------------
+# Run scope (Orca contract update, 2026-07-31)
+#
+# Orchestration moved to a Run-scoped model. `task-create`, `dispatch` and
+# `check` now need an explicit `--run <run_id>`. Without it they fall back to
+# the RETAINED LEGACY COORDINATOR, which is read-only and refuses every
+# mutation with:
+#
+#   {"ok":false,"error":{"code":"legacy_read_only","message":
+#    "This retained legacy coordinator could not prove its original process
+#     identity. No effects were applied."}}
+#
+# The failure is quiet in the worst way: no task id is ever produced, so a
+# debate round dispatches nothing and every debater forfeits on a timeout that
+# looks like a worker problem. Preflight passes first, which hides the cause.
+#
+# Binding a Run to the terminal is NOT sufficient on its own — verified live:
+# `run-current` returned the bound Run while a `--run`-less `task-create` was
+# still refused. The flag has to be passed.
+#
+# Resolution order:
+#   1. $ORCA_RUN_ID   — explicit override, wins outright
+#   2. `run-current`  — the Run bound to this coordinator terminal
+#   3. empty          — pre-update behaviour, unchanged (see the hint below)
+#
+# Soft-fails to empty on older Orca builds with no `run-current` subcommand,
+# so this never turns a working setup into a hard error.
+#
+# Callers must resolve ONCE and reuse the value: resolving separately per call
+# would let a rebinding between task-create and dispatch split one dispatch
+# across two Runs.
+resolve_run_id() {
+  if [[ -n "${ORCA_RUN_ID:-}" ]]; then
+    printf '%s' "$ORCA_RUN_ID"
+    return 0
+  fi
+  local raw=""
+  raw="$(orca orchestration run-current --json 2>/dev/null)" || return 0
+  [[ -n "$raw" ]] || return 0
+  printf '%s' "$raw" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+result = payload.get("result") or {}
+run = result.get("run") or {}
+sys.stdout.write(run.get("id") or "")
+' 2>/dev/null || true
+}
+
+# Emit a remediation hint when an orchestration mutation was refused for lack
+# of a Run scope. Callers pass the raw JSON they got back; a no-op for any
+# other failure, so it is safe to call on every error path.
+warn_if_legacy_read_only() {
+  local raw="${1:-}" what="${2:-The orchestration call}"
+  printf '%s' "$raw" | grep -q 'legacy_read_only' || return 0
+  {
+    echo "$what was refused: orchestration is in legacy READ-ONLY mode."
+    echo "No effects were applied and no task id was produced."
+    echo
+    echo "Orca's Run-scoped orchestration needs an explicit run id. Bind one:"
+    echo
+    echo "  orca orchestration run-create --objective \"<what this run is for>\" --json"
+    echo
+    echo "then re-run this command. To reuse an existing Run instead:"
+    echo
+    echo "  orca orchestration run-list --json      # find the id"
+    echo "  orca orchestration run-use --run <id>   # bind this terminal"
+    echo "  # or bypass binding entirely: export ORCA_RUN_ID=run_xxxxxxxxxxxx"
+  } >&2
+}

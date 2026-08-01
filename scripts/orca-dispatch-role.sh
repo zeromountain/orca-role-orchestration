@@ -175,8 +175,19 @@ $SPEC
 $TAIL_BLOCK"
 fi
 
-echo "Creating task for ROLE=$ROLE → $HANDLE"
-CREATE_JSON="$(orca orchestration task-create --deps "$DEPS" --spec "$FULL_SPEC" --json)"
+# Resolve the Run scope ONCE (see resolve_run_id in orca-roles-lib.sh): the
+# same value must reach both task-create and dispatch, or a rebinding between
+# the two calls would split one dispatch across two Runs. Empty is a legal
+# result and keeps the pre-2026-07-31 behaviour; the refusal path below is
+# what tells the caller when that fallback is the reason nothing happened.
+RUN_ID="$(resolve_run_id)"
+RUN_ARGS=()
+if [[ -n "$RUN_ID" ]]; then
+  RUN_ARGS=(--run "$RUN_ID")
+fi
+
+echo "Creating task for ROLE=$ROLE → $HANDLE${RUN_ID:+ (run=$RUN_ID)}"
+CREATE_JSON="$(orca orchestration task-create ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --deps "$DEPS" --spec "$FULL_SPEC" --json)"
 TASK_ID="$(printf '%s' "$CREATE_JSON" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
@@ -187,6 +198,10 @@ print(t.get("id") or t.get("task_id") or r.get("id") or "")
 if [[ -z "$TASK_ID" ]]; then
   echo "Failed to parse task id:" >&2
   echo "$CREATE_JSON" >&2
+  # The single most likely cause when RUN_ID resolved empty: the call fell
+  # through to the read-only legacy coordinator. Say so instead of leaving
+  # the caller with raw JSON.
+  warn_if_legacy_read_only "$CREATE_JSON" "task-create for ROLE=$ROLE"
   exit 1
 fi
 echo "task_id=$TASK_ID"
@@ -198,8 +213,9 @@ echo "task_id=$TASK_ID"
 # the task-create call itself (an orchestration-side API call, not a
 # terminal write), so the terminal's readiness cannot regress in between.
 echo "Dispatching (inject)…"
-DISPATCH_JSON="$(orca orchestration dispatch --task "$TASK_ID" --to "$HANDLE" --inject --json)"
+DISPATCH_JSON="$(orca orchestration dispatch ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --task "$TASK_ID" --to "$HANDLE" --inject --json)"
 printf '%s\n' "$DISPATCH_JSON"
+warn_if_legacy_read_only "$DISPATCH_JSON" "dispatch for ROLE=$ROLE"
 DISPATCH_ID="$(printf '%s' "$DISPATCH_JSON" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)

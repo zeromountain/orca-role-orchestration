@@ -626,6 +626,28 @@ trap 'exit 143' TERM
 # orca-dispatch-role.sh's own terminal_wait_ready gate before --inject,
 # which still runs on every dispatch regardless of this preflight.
 if [[ "$DRY_RUN" -eq 0 ]]; then
+  # Run scope gate — cheapest possible failure, and it must come BEFORE any
+  # seat is created. Without a Run, every task-create in every round falls
+  # through to the read-only legacy coordinator: no task ids, all debaters
+  # forfeit, quorum fails. That failure is invisible at the point of cause —
+  # preflight passes, seats seed fine, and the debate dies ~30 minutes later
+  # looking like a worker timeout. Checking here turns 30 wasted minutes and
+  # N spawned agent sessions into one line of output.
+  #
+  # Deliberately NOT auto-creating a Run: run-create binds the Run to the
+  # calling terminal, and a script that silently rebinds the user's
+  # coordinator (or leaks an orphan Run per debate, with no lifecycle to
+  # close it) is worse than a clear refusal.
+  if [[ -z "$(resolve_run_id)" ]]; then
+    echo "Refusing to start: no orchestration Run is bound to this terminal." >&2
+    echo "Every round would dispatch into the read-only legacy coordinator and forfeit." >&2
+    echo >&2
+    echo "  orca orchestration run-create --objective \"debate: $SLUG\" --json" >&2
+    echo >&2
+    echo "then re-run this command (or export ORCA_RUN_ID=run_xxxxxxxxxxxx)." >&2
+    exit 1
+  fi
+
   echo
   echo "=== preflight: confirming all $COUNT debater seat(s) are created, seeded, and ready ==="
   OLD_IFS="$IFS"
