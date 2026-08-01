@@ -640,10 +640,63 @@ def vetoed_reason():
     return None
 
 
+# A codex seat sitting on the directory-trust dialog was still reported
+# READY, and the seat then received its seed INTO the modal and produced
+# nothing. The anchored matcher above cannot see that screen, for two
+# independent reasons, both read straight off a live terminal:
+#
+#   - `orca terminal read` hands the dialog back with the spaces inside it
+#     GONE, so the marker text is not present verbatim to match at all.
+#   - What is left arrives as ONE line whose head is the path banner, so the
+#     marker is not at the start of it either, and the anchoring the prose
+#     false-veto fix introduced (correctly -- see its own comment above)
+#     refuses it a second time.
+#
+# So this second path compares whitespace-removed copies of both sides,
+# which drops the anchor. Dropping the anchor alone would resurrect exactly
+# the defect that anchoring fixed -- an agent writing the phrase in its own
+# prose would veto its seat permanently, since a veto is deliberately not
+# stability-promotable. What keeps that from happening is CORROBORATION: a
+# line only vetoes here if it ALSO carries a modal's choice affordance.
+# Prose can quote the question; it does not come with "1. Yes" attached.
+#
+# Applies to GENERIC_NEGATIVE (dialogs) only, never CLI_NEGATIVE: menu
+# entries like "New worktree" are bare whole lines that the anchored path
+# already catches, and they are short enough that a corroborated substring
+# match would be a real false-veto risk.
+#
+# LIMITATION: same line only. A dialog wrapped across two lines by a narrow
+# terminal defeats both this and the anchored path. Joining adjacent lines
+# before matching was considered and rejected: it widens the false-veto
+# surface (any marker line that merely happens to sit next to an affordance
+# line would fire), and every capture of this dialog so far collapses onto
+# one line rather than wrapping.
+def _squash(s):
+    return "".join(s.split())
+
+
+# Fragments, never a whole dialog line. This file is itself read by seats
+# working on this repo -- a source line carrying a marker AND an affordance
+# together would render on such a seat's screen and veto it. Nothing here,
+# or in the fixtures that exercise it, may put both on one physical line.
+_DIALOG_AFFORDANCES = ("1.Yes", "2.No", "Pressentertocontinue")
+
+
+def corroborated_dialog_marker():
+    for ln in lines:
+        squashed = _squash(_strip_leading_decoration(ln))
+        if not any(a in squashed for a in _DIALOG_AFFORDANCES):
+            continue
+        for marker in GENERIC_NEGATIVE:
+            if _squash(marker) in squashed:
+                return marker
+    return None
+
+
 # Computed unconditionally, before the busy check below -- see the item-4
 # comment there for why this must be independent of (and, when it matches,
 # override) a BUSY verdict.
-_vetoed_marker = vetoed_reason()
+_vetoed_marker = vetoed_reason() or corroborated_dialog_marker()
 
 _BUSY_RE = re.compile(r"\bThought for \d|\bWaiting for respons")
 
