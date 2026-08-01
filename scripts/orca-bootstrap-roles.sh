@@ -169,3 +169,12 @@ echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
 echo "After dispatch: worker tabs auto-close (background reaper + worker AUTO-CLOSE)."
 echo "  Optional block for results: orca orchestration check --wait --types worker_done,escalation,decision_gate"
 echo "Limit failover: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec \"...\""
+
+# Run scope check — bootstrap itself needs no Run (it only creates terminals),
+# but the very next thing the user does (dispatch) does. Warning here turns a
+# silent legacy_read_only refusal later into a one-line heads-up now.
+if [[ -z "$(resolve_run_id)" ]]; then
+  echo
+  echo "WARNING: no orchestration Run is bound — dispatch will be refused (legacy_read_only)." >&2
+  echo "  orca orchestration run-create --objective \"$PROJECT_NAME roles\" --json" >&2
+fi

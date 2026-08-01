@@ -52,9 +52,25 @@ per-task reminder. Missing file → bootstrap uses a built-in one-liner and disp
 orca status --json   # runtime.reachable true
 # Settings → Experimental → Agent orchestration ON
 which orca claude codex grok agy
+
+# Run scope (Orca contract update, 2026-07-31) — REQUIRED for any dispatch
+orca orchestration run-current --json          # {"run": null} means not bound
+orca orchestration run-create --objective "…"  # bind one if null
 ```
 
 If the project is not in Orca: `orca repo add --path <abs-project-root>`.
+
+**Why the Run matters.** `task-create`, `dispatch`, and `check` are Run-scoped.
+With no Run bound they fall through to the retained legacy coordinator, which is
+read-only and refuses every mutation with `legacy_read_only` — **no task id is
+produced**. The scripts resolve the id automatically (`$ORCA_RUN_ID`, else
+`run-current`) and pass `--run`; they never create a Run for you, because
+`run-create` rebinds the calling terminal and Runs have no close step.
+
+Left unbound, the failure is invisible at the point of cause: bootstrap and the
+debate preflight both pass, seats seed normally, and the work dies much later as
+worker timeouts that look like a model problem. `orca-debate.sh` therefore
+refuses up front instead of burning a round.
 
 ## Skill layout
 

@@ -32,6 +32,17 @@ trap 'for _p in "${CLEANUP_PIDS[@]:-}"; do kill -9 "$_p" 2>/dev/null || true; do
 
 echo "=== tests/debate.sh (tmp=$tmpdir) ==="
 
+# Run scope (Orca contract update, 2026-07-31): orchestration mutations are
+# Run-scoped, and orca-debate.sh refuses to start without one rather than
+# letting every round forfeit against the read-only legacy coordinator.
+# The stubbed `orca` in this file answers `orchestration run-current` from its
+# catch-all (`{"ok":true}` — no result.run), so resolve_run_id would come back
+# empty and every real-driver test would trip that gate. Export the documented
+# override instead of teaching ~20 separate stubs a new subcommand; this also
+# means the suite exercises the --run-carrying call shape, which is the one
+# that now runs in production.
+export ORCA_RUN_ID="run_testsuite"
+
 # Task 2 (terminal readiness gate): every test in this file that reaches
 # terminal_wait_ready/seed's debater marker gate goes through a STUBBED
 # orca, never a real CLI actually booting — so there is no reason for this
