@@ -120,6 +120,77 @@ print(disp.get("status") or "unknown")
 ' 2>/dev/null || echo "unknown"
 }
 
+codex_trust_ensure() {
+  # $1 = absolute project path. Idempotently records it as a trusted project
+  # in ${CODEX_HOME:-$HOME/.codex}/config.toml. Silent no-op if already there.
+  #
+  # THE DEFECT THIS FIXES: a codex seat launched in a directory codex has not
+  # been told to trust boots into a modal "Do you trust the contents of this
+  # directory?" prompt and stops on it. The seat then receives its seed INTO
+  # that dialog and produces nothing — observed live as "the codex seat is the
+  # only one that never returns", across every debate run. Confirmed by
+  # reading the seat's own screen both ways: with this entry present codex
+  # boots through to its real prompt (model/directory/permissions banner);
+  # without it the dialog is still on screen for the whole readiness window.
+  #
+  # WHY THE CONFIG FILE AND NOT A FLAG: `-c projects."<path>".trust_level=
+  # "trusted"` was tried first and does NOT suppress the dialog, even though
+  # the override parses cleanly and reaches codex as a correctly quoted single
+  # argv entry (verified). codex evidently honours trust only from persisted
+  # config — a defensible design, since a flag that could grant trust to its
+  # own invocation would defeat the prompt entirely. So writing the file is
+  # the only lever, and this is byte-identical to what codex itself writes
+  # when a human answers "Yes, continue" once.
+  #
+  # LIMITATION: the path recorded is the project root this scaffold is
+  # installed into. A seat created against a --worktree selector that Orca
+  # resolves OUTSIDE that root would still see the dialog; the seat's own
+  # resolved cwd is not known here without a runtime call, and this library
+  # is deliberately runtime-free apart from the explicit `orca` calls.
+  local root="${1:-}"
+  [[ -n "$root" ]] || return 0
+  python3 - "${CODEX_HOME:-$HOME/.codex}/config.toml" "$root" <<'PY' || true
+import os, shutil, sys, tempfile
+
+cfg, root = sys.argv[1], sys.argv[2]
+header = '[projects."%s"]' % root.replace("\\", "\\\\").replace('"', '\\"')
+
+existing = ""
+if os.path.exists(cfg):
+    with open(cfg, encoding="utf-8") as fh:
+        existing = fh.read()
+
+# Textual header match, deliberately not a TOML parse: this has to run on
+# whatever python3 the machine ships (tomllib is 3.11+), and it must never
+# rewrite a config it does not fully understand. Append-only, never edits or
+# reorders anything already in the file.
+if any(line.strip() == header for line in existing.splitlines()):
+    raise SystemExit(0)
+
+sep = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+merged = existing + sep + header + '\ntrust_level = "trusted"\n'
+
+d = os.path.dirname(cfg) or "."
+os.makedirs(d, exist_ok=True)
+# Temp-then-replace, the same discipline the ledger writers use: a kill part
+# way through must never leave the user with a truncated codex config.
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".config.toml.")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(merged)
+    if existing:
+        shutil.copymode(cfg, tmp)
+    os.replace(tmp, cfg)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print("codex trust: registered %s in %s" % (root, cfg), file=sys.stderr)
+PY
+}
+
 create_role() {
   # $1=title $2=command $3=role (optional; recorded in the journal only — may
   #   be empty/unknown, e.g. orca-bootstrap-roles.sh's direct 2-arg calls)
@@ -148,6 +219,19 @@ create_role() {
   # created (raw response exists) but its handle was never recorded anywhere.
   local title="$1" command="$2" role="${3:-}" journal_file raw handle handle_scratch
   echo "→ Creating $title" >&2
+  # Must happen BEFORE the terminal exists: the trust dialog is drawn at codex
+  # boot, so registering afterwards would not help this seat. Gated on the
+  # command's first token so it only ever fires for codex seats — and this is
+  # the single choke point every seat goes through (orca-bootstrap-roles.sh's
+  # own loop and ensure_terminal both call create_role), which is why it lives
+  # here rather than in either caller.
+  case "$command" in
+    codex|codex\ *)
+      if [[ -n "${ORCH:-}" && -d "$ORCH/../.." ]]; then
+        codex_trust_ensure "$(cd "$ORCH/../.." && pwd)"
+      fi
+      ;;
+  esac
   raw="$(orca terminal create --worktree "$WORKTREE" --title "$title" --command "$command" --json)" || raw=""
   journal_file="${ORCH:-.}/terminal-journal.jsonl"
   mkdir -p "$(dirname "$journal_file")" 2>/dev/null || true
