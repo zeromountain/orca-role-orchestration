@@ -715,6 +715,109 @@ assert G4_fallback_prints_no_own_wait_cmd \
 assert G4_fallback_has_no_placeholder_task \
   "! grep -q -- 'task_id printed above' \"$ROOT/scripts/orca-fallback-on-limit.sh\""
 
+# ============================================================================
+# CX-series: codex_trust_ensure. A codex seat launched in a directory codex
+# has not been told to trust boots into a modal trust dialog and stops there,
+# swallowing its own seed — the reason the codex seat was the only one that
+# never returned. This registers the project the way codex itself does when a
+# human answers the dialog once. Pure filesystem (CODEX_HOME redirected into
+# $tmpdir), so this file's "no Orca runtime required" property still holds.
+# ============================================================================
+cx_home="$tmpdir/cx-home"
+cx_cfg="$cx_home/config.toml"
+cx_path="/tmp/cx-project"
+
+# --- CX1: creates the file (and its directory) when nothing exists yet ---
+CODEX_HOME="$cx_home" codex_trust_ensure "$cx_path" 2>/dev/null
+assert CX1_config_created "[[ -f \"$cx_cfg\" ]]"
+assert CX1_header_written "grep -qF '[projects.\"$cx_path\"]' \"$cx_cfg\""
+assert CX1_trust_level_written "grep -qF 'trust_level = \"trusted\"' \"$cx_cfg\""
+
+# --- CX2: idempotent. Re-running must not append a second block — seats are
+# created on every bootstrap and every debate round, so a non-idempotent
+# writer would grow the user's config without bound. ---
+CODEX_HOME="$cx_home" codex_trust_ensure "$cx_path" 2>/dev/null
+cx2_count="$(grep -cF "[projects.\"$cx_path\"]" "$cx_cfg")"
+assert CX2_no_duplicate_block "[[ \"$cx2_count\" -eq 1 ]]"
+
+# --- CX3: append-only. An existing config must survive byte-for-byte; this
+# writes to a file the user owns and may have hand-edited, so clobbering any
+# part of it is the worst failure this function could have. ---
+cx3_home="$tmpdir/cx-home3"; mkdir -p "$cx3_home"
+printf '[model]\nname = "keep-me"\n\n[mcp_servers.thing]\ncommand = "x"\n' > "$cx3_home/config.toml"
+cx3_before="$(cat "$cx3_home/config.toml")"
+CODEX_HOME="$cx3_home" codex_trust_ensure "$cx_path" 2>/dev/null
+assert CX3_preserves_prior_content \
+  "[[ \"\$(head -c \${#cx3_before} \"$cx3_home/config.toml\")\" == \"\$cx3_before\" ]]"
+assert CX3_appends_the_block "grep -qF '[projects.\"$cx_path\"]' \"$cx3_home/config.toml\""
+
+# --- CX4: a config whose last line has no trailing newline must not end up
+# with the new table header glued onto it (which would corrupt both). ---
+cx4_home="$tmpdir/cx-home4"; mkdir -p "$cx4_home"
+printf '[model]\nname = "no-trailing-newline"' > "$cx4_home/config.toml"
+CODEX_HOME="$cx4_home" codex_trust_ensure "$cx_path" 2>/dev/null
+assert CX4_header_on_its_own_line \
+  "grep -qx '\\[projects\\.\"$cx_path\"\\]' \"$cx4_home/config.toml\""
+assert CX4_prior_key_intact "grep -qx 'name = \"no-trailing-newline\"' \"$cx4_home/config.toml\""
+
+# --- CX5: a path containing a double quote must be escaped, or it would end
+# the TOML key early and corrupt the file. ---
+cx5_home="$tmpdir/cx-home5"
+cx5_path='/tmp/we"ird'
+CODEX_HOME="$cx5_home" codex_trust_ensure "$cx5_path" 2>/dev/null
+# Expected text and actual file both captured into plain variables first, then
+# compared with grep -F — never spelled inline inside the assert string, which
+# would have to survive a round of eval quoting on top of the backslash the
+# escaping itself produces (the first draft did, and failed on that alone
+# while the written file was correct).
+cx5_expected='[projects."/tmp/we\"ird"]'
+cx5_got="$(cat "$cx5_home/config.toml" 2>/dev/null || true)"
+assert CX5_quote_escaped "printf '%s' \"\$cx5_got\" | grep -qF \"\$cx5_expected\""
+assert CX5_trust_level_present "printf '%s' \"\$cx5_got\" | grep -qF 'trust_level = \"trusted\"'"
+
+# --- CX6: create_role only reaches for this on codex seats. Source grep
+# rather than a stubbed create_role run: the point being pinned is the gate's
+# existence and its codex-only shape, and this suite already pins cross-script
+# invocation shapes this way (G3/G4 above). ---
+cx6_gate="$(grep -n -A6 'case "\$command" in' "$ROOT/scripts/orca-roles-lib.sh" | head -20 || true)"
+assert CX6_gate_is_codex_only "printf '%s' \"\$cx6_gate\" | grep -q 'codex|codex'"
+assert CX6_gate_calls_ensure "printf '%s' \"\$cx6_gate\" | grep -q 'codex_trust_ensure'"
+
+# --- CX7: the gate's actual BEHAVIOR through create_role, not just its
+# source shape. CX6's grep cannot tell a working gate from a broken one — a
+# throwaway harness that appeared to show the gate firing for every CLI was
+# what prompted this test; the gate was fine and the harness was wrong, but
+# only running the real function could establish which. Stubbed orca on PATH
+# (never the real runtime), CODEX_HOME redirected into $tmpdir, one subshell
+# per arm so an export can never leak between them. ---
+cx7_dir="$tmpdir/cx7"
+mkdir -p "$cx7_dir/bin" "$cx7_dir/proj/.orca/orchestration"
+cat > "$cx7_dir/bin/orca" <<'ORCASTUB'
+#!/usr/bin/env bash
+echo '{"ok":true,"result":{"terminal":{"handle":"term_cx7"}}}'
+ORCASTUB
+chmod +x "$cx7_dir/bin/orca"
+
+cx7_run() {
+  # $1=arm name (also its own CODEX_HOME) $2=launch command
+  (
+    export PATH="$cx7_dir/bin:$PATH"
+    export CODEX_HOME="$cx7_dir/home-$1"
+    export ORCH="$cx7_dir/proj/.orca/orchestration"
+    export WORKTREE=active
+    create_role "cx7-$1" "$2" "$1" >/dev/null 2>&1
+  )
+}
+cx7_run codex 'codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+cx7_run claude 'claude --model claude-opus-5 --dangerously-skip-permissions'
+cx7_run grok 'grok --model grok-4.5 --permission-mode bypassPermissions'
+
+assert CX7_codex_seat_registers_trust "[[ -f \"$cx7_dir/home-codex/config.toml\" ]]"
+assert CX7_codex_trust_names_project_root \
+  "grep -qF '$cx7_dir/proj' \"$cx7_dir/home-codex/config.toml\""
+assert CX7_claude_seat_writes_nothing "[[ ! -e \"$cx7_dir/home-claude/config.toml\" ]]"
+assert CX7_grok_seat_writes_nothing "[[ ! -e \"$cx7_dir/home-grok/config.toml\" ]]"
+
 
 # ============================================================================
 # Task 1 (terminal lifecycle): H-series. All use a stubbed `orca` on PATH
