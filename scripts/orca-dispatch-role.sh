@@ -157,11 +157,27 @@ if [[ -f "$PERSONA_FILE" ]]; then
   STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
 fi
 
-# Spec always carries a tail contract: auto-close (default) or stay-open (--persist).
+# Resolve the Run scope ONCE (see resolve_run_id in orca-roles-lib.sh): the
+# same value must reach the tail block, task-create AND dispatch, or a
+# rebinding mid-script would split one dispatch across two Runs — or worse,
+# tell the worker to report into a different Run than the task lives in.
+# Empty is a legal result and keeps the pre-2026-07-31 behaviour; the refusal
+# path below is what tells the caller when that fallback is why nothing
+# happened.
+RUN_ID="$(resolve_run_id)"
+RUN_ARGS=()
+if [[ -n "$RUN_ID" ]]; then
+  RUN_ARGS=(--run "$RUN_ID")
+fi
+
+# Spec always carries a tail contract: auto-close (default) or stay-open
+# (--persist). It also carries the Run scope the worker needs for its OWN
+# worker_done — Orca's injected preamble omits --run, so without this the
+# worker's report is refused even when the task itself succeeded.
 if [[ "$PERSIST" -eq 1 ]]; then
-  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" persist)"
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" persist "$RUN_ID")"
 else
-  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" close)"
+  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" close "$RUN_ID")"
 fi
 
 if [[ -n "${STANCE// }" ]]; then
@@ -173,17 +189,6 @@ else
   FULL_SPEC="[ROLE=$ROLE | $MODEL]
 $SPEC
 $TAIL_BLOCK"
-fi
-
-# Resolve the Run scope ONCE (see resolve_run_id in orca-roles-lib.sh): the
-# same value must reach both task-create and dispatch, or a rebinding between
-# the two calls would split one dispatch across two Runs. Empty is a legal
-# result and keeps the pre-2026-07-31 behaviour; the refusal path below is
-# what tells the caller when that fallback is the reason nothing happened.
-RUN_ID="$(resolve_run_id)"
-RUN_ARGS=()
-if [[ -n "$RUN_ID" ]]; then
-  RUN_ARGS=(--run "$RUN_ID")
 fi
 
 echo "Creating task for ROLE=$ROLE → $HANDLE${RUN_ID:+ (run=$RUN_ID)}"
