@@ -45,17 +45,14 @@ if [[ -z "${HANDLE// }" ]]; then
   exit 0
 fi
 
-if ! terminal_is_live "$HANDLE"; then
-  echo "Handle $HANDLE already gone (ok)"
-  exit 0
-fi
-
 echo "Closing $TARGET → $HANDLE (tab)"
-# Prefer --tab so the whole sub-session leaves the sidebar (not just the pane).
-if orca terminal close --terminal "$HANDLE" --tab --json >/dev/null 2>&1 \
-  || orca terminal close --terminal "$HANDLE" --json >/dev/null 2>&1; then
-  echo "Closed $HANDLE"
-else
-  echo "Close returned non-zero for $HANDLE (treating as ok — may already be gone)"
-fi
-exit 0
+close_terminal "$HANDLE"
+case "$?" in
+  0) echo "Closed $HANDLE"; exit 0 ;;
+  1) echo "Handle $HANDLE already gone (ok)"; exit 0 ;;
+  *)
+    echo "Close FAILED for $HANDLE — Orca may be unreachable." >&2
+    echo "  Check: orca status --json" >&2
+    exit 1
+    ;;
+esac

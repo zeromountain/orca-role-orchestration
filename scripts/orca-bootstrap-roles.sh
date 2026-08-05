@@ -24,24 +24,52 @@ PY
 )"
 fi
 
+ROLES="architect executor thrifty fallback"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --worktree) WORKTREE="${2:?}"; shift 2 ;;
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --roles) ROLES="$(printf '%s' "${2:?}" | tr ',' ' ')"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--worktree <selector>] [--project-name NAME]"
+      echo "Usage: $0 [--worktree <selector>] [--project-name NAME] [--roles a,b]"
+      echo "  --roles  subset to bootstrap (default: all four)"
       exit 0
       ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
   esac
 done
 
+for r in $ROLES; do
+  if ! role_meta "$r" >/dev/null 2>&1; then
+    echo "Unknown role in --roles: $r" >&2
+    exit 1
+  fi
+done
+
 if ! command -v orca >/dev/null 2>&1; then
   echo "orca CLI not found on PATH" >&2
   exit 1
 fi
-if ! orca status --json 2>/dev/null | grep -q '"reachable": true'; then
+if ! orca_reachable; then
   echo "Orca runtime not reachable. Open Orca and retry." >&2
+  exit 1
+fi
+
+# Preflight the per-role CLIs. Without this a missing binary produces a tab that
+# dies with "command not found", a soft tui-idle warning, and a recorded-but-dead
+# handle — the first real dispatch then fails looking like an orchestration bug.
+MISSING=""
+for r in $ROLES; do
+  cli="$(role_cli "$r")"
+  if ! command -v "$cli" >/dev/null 2>&1; then
+    MISSING="$MISSING  $r → $cli not on PATH"$'\n'
+  fi
+done
+if [[ -n "$MISSING" ]]; then
+  echo "Missing role CLIs:" >&2
+  printf '%s' "$MISSING" >&2
+  echo "Install them, or bootstrap a subset: --roles architect,executor" >&2
   exit 1
 fi
 
@@ -58,57 +86,33 @@ fi
 
 echo "Bootstrapping role workers (worktree=$WORKTREE project=$PROJECT_NAME)…"
 
-ARCH_HANDLE="$(create_role "$(role_meta architect | cut -f1)" "$(role_launch_cmd architect)")"
-SOL_HANDLE="$(create_role "$(role_meta executor | cut -f1)" "$(role_launch_cmd executor)")"
-GROK_HANDLE="$(create_role "$(role_meta thrifty | cut -f1)" "$(role_launch_cmd thrifty)")"
-FALLBACK_HANDLE="$(create_role "$(role_meta fallback | cut -f1)" "$(role_launch_cmd fallback)")"
+handles_set_meta "$HANDLES_FILE" \
+  "worktree=$WORKTREE" \
+  "project=$PROJECT_NAME" \
+  "routing_ssot=.orca/orchestration/roles.yaml" \
+  "playbook=.orca/orchestration/PLAYBOOK.md"
 
-wait_idle "$ARCH_HANDLE"
-wait_idle "$SOL_HANDLE"
-wait_idle "$GROK_HANDLE"
-wait_idle "$FALLBACK_HANDLE"
+# ensure_terminal is create + wait-idle + seed + record, and it reuses a role's
+# terminal when one is already live. That makes bootstrap idempotent and
+# RESUMABLE: if role 3 fails, re-running finishes the job instead of rebuilding
+# — and no rollback is needed, which would only destroy working terminals.
+FAILED=""
+for role in $ROLES; do
+  if handle="$(ensure_terminal "$role")"; then
+    echo "  $role → $handle"
+  else
+    echo "  $role → FAILED" >&2
+    FAILED="$FAILED $role"
+  fi
+done
 
-seed "$ARCH_HANDLE" architect "Claude Opus 4.8" "$(role_fallback_body architect)"
-seed "$SOL_HANDLE" executor "GPT-5.6 Sol" "$(role_fallback_body executor)"
-seed "$GROK_HANDLE" thrifty "Grok 4.5" "$(role_fallback_body thrifty)"
-seed "$FALLBACK_HANDLE" fallback "Antigravity Gemini 3.5 Flash (Medium)" "$(role_fallback_body fallback)"
+if [[ -n "$FAILED" ]]; then
+  echo "Bootstrap incomplete for:$FAILED" >&2
+  echo "Re-run this script to finish — roles already up are reused, not recreated." >&2
+  exit 1
+fi
 
-python3 - "$HANDLES_FILE" "$ARCH_HANDLE" "$SOL_HANDLE" "$GROK_HANDLE" "$FALLBACK_HANDLE" "$WORKTREE" <<'PY'
-import json, sys, datetime
-path, arch, sol, grok, fallback, wt = sys.argv[1:7]
-data = {
-  "version": 1,
-  "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-  "worktree": wt,
-  "architect": arch,
-  "executor": sol,
-  "thrifty": grok,
-  "fallback": fallback,
-  "roles": {
-    "architect": {"handle": arch, "title": "role-opus-architect", "model": "claude-opus-4-8", "agent": "claude"},
-    "executor":  {"handle": sol,  "title": "role-sol-executor",   "model": "gpt-5.6-sol",     "agent": "codex"},
-    "thrifty":   {"handle": grok, "title": "role-grok-thrifty",   "model": "grok-4.5",        "agent": "grok"},
-    "fallback":  {
-      "handle": fallback, "title": "role-agy-fallback",
-      "model": "Gemini 3.5 Flash (Medium)", "agent": "antigravity", "cli": "agy",
-    },
-  },
-  "limit_failover": {
-    "enabled": True,
-    "target_role": "fallback",
-    "model": "Gemini 3.5 Flash (Medium)",
-    "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
-  },
-  "routing_ssot": ".orca/orchestration/roles.yaml",
-  "playbook": ".orca/orchestration/PLAYBOOK.md",
-}
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-print(f"Wrote {path}")
-print(json.dumps(data["roles"], indent=2))
-PY
-
+echo "Wrote $HANDLES_FILE"
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
 echo "After dispatch: worker tabs auto-close (background reaper + worker AUTO-CLOSE)."
 echo "  Optional block for results: orca orchestration check --wait --types worker_done,escalation,decision_gate"

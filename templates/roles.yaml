@@ -319,17 +319,9 @@ limit_failover:
   target_role: fallback
   agent: antigravity
   model: "Gemini 3.5 Flash (Medium)"
-  detect_patterns:
-    # Mirrors scripts/orca-fallback-on-limit.sh LIMIT_RE (doc only; script is authoritative)
-    - "session limit"
-    - "rate limit"
-    - "usage limit"
-    - "overloaded"
-    - "quota exceeded"
-    - "try again later"
-    - "429"
-    - "hit your limit"
-    - "capacity"
+  # Detection patterns live ONLY in scripts/orca-fallback-on-limit.sh (LIMIT_RE).
+  # A copy here has no consumer — nothing parses this file — and the two had
+  # already drifted, so the copy is deleted rather than re-synced.
   policy: |
     1. Do not hammer the limited primary
     2. Create NEW task ROLE=fallback with goal + partial progress

@@ -112,6 +112,45 @@ rm -rf "$legacy"
 # --- T8 no secrets ---
 assert T8_no_secrets "! grep -rE '(BEGIN .*PRIVATE KEY|sk-[A-Za-z0-9]{20,})' \"$ORCH\" >/dev/null 2>&1"
 
+# --- T9 dry-run writes nothing ---
+dry="$(mktemp -d)"
+"$INSTALL" --project-root "$dry" --project-name dry-app --dry-run >/tmp/install-t9.out 2>&1
+assert T9_no_scaffold "[[ ! -d \"$dry/.orca\" ]]"
+assert T9_no_gitignore "[[ ! -f \"$dry/.gitignore\" ]]"
+assert T9_reports_work "grep -q 'would install' /tmp/install-t9.out"
+# dry-run on an existing install must not touch it either
+cp "$ORCH/roles.yaml" "$tmpdir/roles.before"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app --dry-run >/tmp/install-t9b.out 2>&1
+assert T9_existing_untouched "cmp -s \"$tmpdir/roles.before\" \"$ORCH/roles.yaml\""
+rm -rf "$dry"
+
+# --- T10 .bak rotation keeps older forks ---
+# A fork used to survive one upgrade then vanish on the next, when .bak was
+# overwritten by the newly-replaced file.
+printf '\n# FORK_ONE\n' >> "$ORCH/scripts/orca-status.sh"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app >/tmp/install-t10a.out 2>&1
+assert T10_bak_has_fork_one "grep -q FORK_ONE \"$ORCH/scripts/orca-status.sh.bak\""
+printf '\n# FORK_TWO\n' >> "$ORCH/scripts/orca-status.sh"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app >/tmp/install-t10b.out 2>&1
+assert T10_bak_has_fork_two "grep -q FORK_TWO \"$ORCH/scripts/orca-status.sh.bak\""
+assert T10_older_fork_kept "grep -rq FORK_ONE \"$ORCH/scripts/\""
+
+# --- T11 uninstall keeps user-owned files ---
+un="$(mktemp -d)"
+"$INSTALL" --project-root "$un" --project-name un-app >/tmp/install-t11a.out 2>&1
+UORCH="$un/.orca/orchestration"
+printf '{"thrifty":{"model":"x"}}\n' > "$UORCH/roles.local.json"
+printf '\n# MY_FORK\n' >> "$UORCH/personas/thrifty.md"
+"$INSTALL" --project-root "$un" --uninstall >/tmp/install-t11b.out 2>&1
+assert T11_scripts_gone "[[ ! -f \"$UORCH/scripts/orca-dispatch-role.sh\" ]]"
+assert T11_roles_gone "[[ ! -f \"$UORCH/roles.yaml\" ]]"
+assert T11_hints_kept "[[ -f \"$UORCH/project_hints.yaml\" ]]"
+assert T11_local_kept "[[ -f \"$UORCH/roles.local.json\" ]]"
+assert T11_fork_kept "grep -q MY_FORK \"$UORCH/personas/thrifty.md\""
+assert T11_clean_persona_gone "[[ ! -f \"$UORCH/personas/architect.md\" ]]"
+assert T11_reports_kept "grep -q 'Kept' /tmp/install-t11b.out"
+rm -rf "$un"
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then

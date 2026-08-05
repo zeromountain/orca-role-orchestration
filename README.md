@@ -20,9 +20,11 @@ The defaults are intentionally opinionated. Launch commands live in `scripts/orc
 Check the local runtime before bootstrapping:
 
 ```bash
-orca status --json
-which orca claude codex grok agy
+.orca/orchestration/scripts/orca-status.sh   # after install; exit 1 = something to fix
 ```
+
+Don't have all four CLIs? Point a role at a model you do have — see
+[per-project overrides](#per-project-model-overrides).
 
 ## Install for Claude Code (plugin marketplace)
 
@@ -112,22 +114,64 @@ Restart or reload your agent so it discovers `SKILL.md`.
 | Your hints | `.orca/orchestration/project_hints.yaml` | Created once; **never** overwritten |
 | Personas | `.orca/orchestration/personas/*.md` | Refresh if unmodified; skip if forked |
 | Scripts / docs | `scripts/`, `PLAYBOOK.md`, … | Always refreshed |
+| Your overrides | `.orca/orchestration/roles.local.json` | Created by you; **never** touched |
 | Version stamp | `install-manifest.json` | Written every run |
 
-Recovery (overwrite forked personas too):
+A changed managed file is backed up to `.bak`, and an existing `.bak` rotates to
+`.bak.1`, `.bak.2`, … so an older fork is never destroyed.
 
 ```bash
-…/install-to-project.sh --project-root "$(pwd)" --reset
+…/install-to-project.sh --project-root "$(pwd)" --dry-run     # preview, writes nothing
+…/install-to-project.sh --project-root "$(pwd)" --reset       # overwrite forked personas
+…/install-to-project.sh --project-root "$(pwd)" --uninstall   # keeps your files
 ```
 
-Then bootstrap workers:
+## Per-project model overrides
+
+Optional `.orca/orchestration/roles.local.json` repoints a role without forking a
+script — for when you don't have one of the default CLIs:
+
+```json
+{
+  "thrifty": {
+    "model": "claude-sonnet-5",
+    "launch_command": "claude --model claude-sonnet-5 --dangerously-skip-permissions"
+  }
+}
+```
+
+Fields: `title`, `model`, `agent`, `launch_command`. Role **names** stay fixed at
+the four — they are wired into routing, DAGs, personas and every command file.
+Bootstrap can also run a subset: `--roles architect,executor`.
+
+Then bootstrap workers (idempotent — re-run to finish a partial bootstrap):
 
 ```bash
 orca repo add --path "$(pwd)" # only if the project is not already in Orca
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree "path:$(pwd)"
 ```
 
-See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md) for the supervised lifecycle.
+See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md)
+for the supervised lifecycle. Detail lives in [`references/`](./references):
+[installation](./references/installation.md) · [routing](./references/routing.md) ·
+[image generation](./references/image-generation.md) · [model roles](./references/model-roles.md).
+
+## Development
+
+```bash
+tests/repo-lint.sh    # plugin manifests, Claude/Codex command pairs, personas
+tests/install.sh      # installer regressions (managed / user-owned / fork policy)
+tests/runtime.sh      # runtime scripts against a fake `orca` — no Orca needed
+shellcheck scripts/*.sh tests/*.sh tests/fake-orca/orca
+```
+
+`tests/runtime.sh` puts `tests/fake-orca/` first on `PATH` and installs the
+scaffold into a tmp project, so each case also proves that what the installer
+emits is runnable. `tests/fake-orca/orca` supports failure injection via
+`$FAKE_ORCA_STATE/fail/<subcommand>` — that is what covers the close/reap
+failure paths. CI runs all three suites plus shellcheck on macOS and Ubuntu.
+
+Changes to managed files are recorded in [`CHANGELOG.md`](./CHANGELOG.md).
 
 ## Security
 

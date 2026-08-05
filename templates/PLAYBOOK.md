@@ -27,10 +27,12 @@ Edit the persona file (not the scripts) to tune a role. Missing file → scripts
 ## Preconditions
 
 ```bash
-orca status --json   # runtime.reachable true
+.orca/orchestration/scripts/orca-status.sh   # preflight + roles + leaks, one command
 # Settings → Experimental → Agent orchestration ON
-which claude codex grok agy
 ```
+
+Exit 0 = ready. Exit 1 prints what is wrong (Orca unreachable, a role CLI missing
+from PATH, an unreadable `handles.json`, or a worker tab left open by a failed reap).
 
 Same-checkout work: `orca terminal create --worktree active` (do not invent worktrees).
 
@@ -40,7 +42,12 @@ Same-checkout work: `orca terminal create --worktree active` (do not invent work
 .orca/orchestration/scripts/orca-bootstrap-roles.sh
 # or
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+# subset, when you do not have every role's CLI installed:
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --roles architect,executor
 ```
+
+Idempotent and resumable: a role whose tab is already live is reused, so re-running
+after a partial failure finishes the job instead of rebuilding.
 
 Tabs: `role-opus-architect` · `role-sol-executor` · `role-grok-thrifty` · `role-agy-fallback`
 Handles: `.orca/orchestration/handles.json` (gitignore).
@@ -127,3 +134,13 @@ Always include project constraints from AGENTS.md / CLAUDE.md in the body.
 |--------|------|
 | hand off / 넘겨줘 | full handoff — `terminal send` only (no lifecycle close) |
 | supervise / 조율 / DAG / 완료 대기 | supervised — task-create + dispatch --inject (auto-reaper closes tab) + optional check --wait |
+
+## When something looks wrong
+
+```bash
+.orca/orchestration/scripts/orca-status.sh
+```
+
+Section 3 lists dispatches that never reached `closed`. A `reap_failed` or
+`close_failed` row means the reaper gave up while the worker tab may still be
+open and billing — close it with `orca-close-role.sh <role|term_*>`.

@@ -5,6 +5,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$ORCH/../.." && pwd)"
+# shellcheck source=orca-roles-lib.sh
+source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 DISPATCH="$HERE/orca-dispatch-role.sh"
 FROM=""
@@ -75,11 +77,34 @@ fi
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
 
-if [[ ! -f "$HANDLES_FILE" ]] || ! python3 -c '
-import json,sys
-d=json.load(open(sys.argv[1]))
-sys.exit(0 if (d.get("roles") or {}).get("fallback",{}).get("handle") or d.get("fallback") else 1)
-' "$HANDLES_FILE" 2>/dev/null; then
+# 0 = fallback handle present, 1 = genuinely absent, 2 = file unreadable.
+# Treating 2 as "absent" is what spawns a SECOND role-agy-fallback terminal
+# when a reader catches handles.json mid-write.
+fallback_state() {
+  [[ -f "$HANDLES_FILE" ]] || return 1
+  python3 - "$HANDLES_FILE" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as stream:
+        d = json.load(stream)
+except Exception:
+    raise SystemExit(2)
+if not isinstance(d, dict):
+    raise SystemExit(2)
+handle = (d.get("roles") or {}).get("fallback", {}).get("handle") or d.get("fallback")
+raise SystemExit(0 if handle else 1)
+PY
+}
+
+fallback_state
+FB_STATE=$?
+if [[ "$FB_STATE" -eq 2 ]]; then
+  echo "ERROR: $HANDLES_FILE exists but is not readable JSON." >&2
+  echo "  Refusing to create a duplicate fallback terminal on a guess." >&2
+  echo "  Fix with: .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree active" >&2
+  exit 1
+fi
+if [[ "$FB_STATE" -eq 1 ]]; then
   echo "No fallback handle — creating role-agy-fallback…"
   WT="$(python3 - "$HANDLES_FILE" <<'PY' 2>/dev/null || echo active
 import json
@@ -89,34 +114,10 @@ with open(sys.argv[1]) as stream:
     print(json.load(stream).get("worktree", "active"))
 PY
 )"
-  CREATE="$(orca terminal create --worktree "$WT" --title "role-agy-fallback" \
-    --command 'agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions' --json)"
-  FB="$(printf '%s' "$CREATE" | python3 -c '
-import json,sys
-d=json.load(sys.stdin); r=d.get("result") or d
-print(r.get("handle") or (r.get("terminal") or {}).get("handle") or "")
-')"
-  orca terminal rename --terminal "$FB" --title "role-agy-fallback" --json >/dev/null 2>&1 || true
-  python3 - "$HANDLES_FILE" "$FB" <<'PY'
-import json,sys,datetime,os
-path, fb = sys.argv[1:3]
-d=json.load(open(path)) if os.path.exists(path) else {}
-d.setdefault("roles", {})
-d["fallback"]=fb
-d["roles"]["fallback"]={
-  "handle": fb, "title": "role-agy-fallback",
-  "model": "Gemini 3.5 Flash (Medium)", "agent": "antigravity", "cli": "agy",
-}
-d["limit_failover"]={
-  "enabled": True, "target_role": "fallback",
-  "model": "Gemini 3.5 Flash (Medium)",
-  "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
-}
-d["updatedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
-with open(path,"w") as f:
-    json.dump(d,f,indent=2); f.write("\n")
-print("fallback handle:", fb)
-PY
+  WORKTREE="$WT"
+  FB="$(create_role "$(role_meta fallback | cut -f1)" "$(role_launch_cmd fallback)")"
+  handles_set "$HANDLES_FILE" fallback "$FB"
+  echo "fallback handle: $FB"
 fi
 
 if preview_limited "$HANDLE"; then

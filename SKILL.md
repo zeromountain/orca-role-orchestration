@@ -17,174 +17,85 @@ description: >
 
 # Orca Role Orchestration
 
-Portable four-role setup for Orca Agent IDE. Coordinator routes work by model strength; workers report `worker_done` under supervised dispatch.
+Portable four-role setup for Orca Agent IDE. The coordinator routes work by model
+strength; workers report `worker_done` under supervised dispatch and their tabs
+close automatically.
 
-## Roles (fixed)
+## Roles
 
-| Role | Model | Launch |
-|------|-------|--------|
-| **architect** | Claude Opus 4.8 | `claude --model claude-opus-4-8 --dangerously-skip-permissions` |
-| **executor** | GPT-5.6 Sol | `codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox` |
-| **thrifty** | Grok 4.5 | `grok --model grok-4.5 --permission-mode bypassPermissions` |
-| **fallback** | Gemini 3.5 Flash (Medium) | `agy --model "Gemini 3.5 Flash (Medium)" --dangerously-skip-permissions` |
+| Role | Model | Owns |
+|------|-------|------|
+| **architect** | Claude Opus 4.8 (`claude`) | Design, ambiguous scope, high-risk review |
+| **executor** | GPT-5.6 Sol (`codex`) | Hard implementation, debug, verification, raster images |
+| **thrifty** | Grok 4.5 (`grok`) | Small fixes, code maps, research, prototypes |
+| **fallback** | Gemini 3.5 Flash Medium (`agy`) | Continuity after a rate/session limit only |
 
-Principle: **Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.**
+**Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.**
 
-Load `references/model-roles.md` only when the user asks why a role was chosen.
+Launch commands live in `scripts/orca-roles-lib.sh` (`role_meta` / `role_launch_cmd`) —
+the single source. A consumer repoints a role via `.orca/orchestration/roles.local.json`
+without forking anything; see `references/installation.md`.
 
-Each role's persona lives in `personas/<role>.md` (single source). Bootstrap seeds the
-worker with the full persona; dispatch prepends the file's `<!-- STANCE: … -->` line as a
-per-task reminder. Missing file → bootstrap uses a built-in one-liner and dispatch omits the reminder.
+Each role's persona is `personas/<role>.md`. Bootstrap seeds the full persona;
+dispatch prepends that file's `<!-- STANCE: … -->` line as a per-task reminder.
 
 ## Preconditions
 
 ```bash
-orca status --json   # runtime.reachable true
+.orca/orchestration/scripts/orca-status.sh   # preflight + roles + unclosed dispatches
 # Settings → Experimental → Agent orchestration ON
-which orca claude codex grok agy
 ```
 
-If the project is not in Orca: `orca repo add --path <abs-project-root>`.
+Exit 0 = ready. Exit 1 names the problem. If the project is not in Orca:
+`orca repo add --path <abs-project-root>`. If the scaffold is missing, install it
+(mode A). Run this before diagnosing anything else.
 
-## Skill layout
-
-```
-orca-role-orchestration/
-  SKILL.md                     # single skill at plugin root (Claude Code layout)
-  .claude-plugin/
-    plugin.json                # Claude plugin identity
-    marketplace.json           # Claude self-marketplace catalog (source: "./")
-  .codex-plugin/
-    plugin.json                # Codex plugin identity (skills: "./", hooks: {})
-  .agents/plugins/
-    marketplace.json           # Codex marketplace catalog (source url "./")
-  commands/                    # Claude Code slash commands (auto-discovered)
-    install.md bootstrap.md dispatch.md wait.md fallback.md close.md
-  prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
-    orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
-    orca-fallback.md orca-close.md
-  scripts/
-    install-to-project.sh      # project scaffold install/update (idempotent)
-    install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
-    orca-bootstrap-roles.sh
-    orca-dispatch-role.sh      # recreates dead/missing role tabs
-    orca-close-role.sh         # manual emergency close
-    orca-reap-task.sh          # background auto-close on dispatch complete
-    orca-wait-done.sh          # optional blocking wait
-    orca-roles-lib.sh          # shared role meta / create / seed
-    orca-fallback-on-limit.sh
-    check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
-  templates/                   # copied into project by install
-    roles.yaml                 # managed routing (always refreshed)
-    project_hints.yaml         # user-owned (create once)
-    personas/                  # architect|executor|thrifty|fallback|coordinator .md
-  tests/install.sh
-  references/model-roles.md
-```
-
-Resolve the skill root from this file’s directory. A conventional installation is:
-
-`~/.agents/skills/orca-role-orchestration/`
-(Grok may also see `~/.grok/skills/orca-role-orchestration` → symlink)
-
-**Claude Code plugin marketplace** (self-marketplace; root `SKILL.md` is the single skill):
-
-```text
-/plugin marketplace add zeromountain/orca-role-orchestration
-/plugin install orca-role-orchestration@orca-role-orchestration
-```
-
-Slash commands ship with the plugin (namespace `orca-role-orchestration`):
+## Commands
 
 | Claude Code | Codex | Script |
 |-------------|-------|--------|
 | `/orca-role-orchestration:install` | `/orca-install` | `install-to-project.sh` |
 | `/orca-role-orchestration:bootstrap` | `/orca-bootstrap` | `orca-bootstrap-roles.sh` |
 | `/orca-role-orchestration:dispatch <role> <task>` | `/orca-dispatch` | `orca-dispatch-role.sh` |
+| `/orca-role-orchestration:status` | `/orca-status` | `orca-status.sh` |
 | `/orca-role-orchestration:wait` | `/orca-wait` | `orca-wait-done.sh` |
 | `/orca-role-orchestration:fallback <role> <goal>` | `/orca-fallback` | `orca-fallback-on-limit.sh` |
 | `/orca-role-orchestration:close <role>` | `/orca-close` | `orca-close-role.sh` (emergency) |
 
-Claude Code auto-discovers `commands/` from the plugin root. Codex plugin manifests carry
-no prompt field, so `install-skill.sh` symlinks `prompts/*.md` into `$CODEX_HOME/prompts/`
-(run it once after `codex plugin add` to get the Codex slash commands).
-
-Namespaced skill: `/orca-role-orchestration:…`. Manifests: `.claude-plugin/plugin.json` + `marketplace.json` (`source: "./"`).
-
-**Codex plugin marketplace** (same repo root; do not move layout):
-
-```bash
-codex plugin marketplace add zeromountain/orca-role-orchestration
-codex plugin add orca-role-orchestration@orca-role-orchestration
-```
-
-Manifests: `.codex-plugin/plugin.json` (`skills: "./"`, `hooks: {}`) + `.agents/plugins/marketplace.json`. Do not move `scripts/` or `templates/` — installers require skill-root layout.
-
-The default worker launch commands bypass provider permission checks. Use them only
-in trusted repositories, or remove the bypass flags before bootstrapping.
-
 ## Modes
 
-### A) Install or update (one free re-run command)
+### A) Install or update
 
-**Claude Code** — marketplace (discovery + skill load):
-
-```text
-/plugin marketplace add zeromountain/orca-role-orchestration
-/plugin install orca-role-orchestration@orca-role-orchestration
-```
-
-**Codex** — marketplace:
-
-```bash
-codex plugin marketplace add zeromountain/orca-role-orchestration
-codex plugin add orca-role-orchestration@orca-role-orchestration
-```
-
-**Global skill** (clone-or-pull + multi-agent symlinks; preferred for project scaffold path):
-
-```bash
-./scripts/install-skill.sh
-# or: curl -fsSL …/install-skill.sh | bash
-# remove: ./scripts/install-skill.sh --uninstall   # drops our symlinks; keeps the checkout
-```
-
-**Project scaffold** — same command for first install and every update:
+One flagless command, safe to re-run. `--dry-run` previews, `--reset` recovers,
+`--uninstall` removes. Marketplace and layout detail: `references/installation.md`.
 
 ```bash
 SKILL=~/.agents/skills/orca-role-orchestration
 "$SKILL/scripts/install-to-project.sh" --project-root "$(pwd)"
-# optional: --project-name my-app
-# recovery: --reset   # overwrite forked personas too (always .bak)
 ```
 
-| Path | Policy |
-|------|--------|
-| `roles.yaml` | **Managed** — always refreshed to skill template |
-| `project_hints.yaml` | **Yours** — created once, never overwritten |
-| `personas/*.md` | Refresh if unmodified; skip if locally forked |
-| scripts, PLAYBOOK, SCRIPTS | Managed refresh (`.bak` on content change) |
-| `install-manifest.json` | Version stamp (`git describe`) + file hashes |
-
-Legacy single-file installs auto-migrate: extract `project` + `project_hints` → `project_hints.yaml`, then refresh managed `roles.yaml`.
-
-Then customize **`project_hints.yaml`** (not `roles.yaml`) and bootstrap workers.
+Customize `project_hints.yaml` (never `roles.yaml` — it is managed and gets
+overwritten on every update).
 
 ### B) Bootstrap role workers
 
 ```bash
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+# subset, when you lack a role's CLI:
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --roles architect,executor
 ```
 
-Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral and auto-closed**: each `orca-dispatch-role.sh` starts a background reaper and injects AUTO-CLOSE into the worker. Next dispatch recreates a dead handle.
+Idempotent and resumable — a live role is reused, so re-running after a partial
+failure finishes the job. Role tabs are ephemeral: dispatch recreates a dead one.
 
 ### C) Route + supervised dispatch
 
-Use **supervised** lifecycle only when the user wants coordinate / supervise / wait / DAG / results:
+Use the supervised lifecycle **only** when the user wants coordinate / supervise /
+wait / DAG / results.
 
-1. Read `.orca/orchestration/roles.yaml` routing_table **and** `.orca/orchestration/project_hints.yaml` (and AGENTS.md).
-2. Pick primary role (and secondary if dual path).
-3. Dispatch (auto-recreates dead/missing role tabs):
+1. Read `roles.yaml` `routing_table` **and** `project_hints.yaml` (and AGENTS.md).
+2. Pick the primary role (see the cheat sheet below; detail in `references/routing.md`).
+3. Dispatch — dead tabs are recreated automatically:
 
 ```bash
 .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan only: <goal>. Follow AGENTS.md."
@@ -192,33 +103,16 @@ Use **supervised** lifecycle only when the user wants coordinate / supervise / w
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
 ```
 
-Image generation (only after the clarity gate below):
+4. Wait for results only if you need the body — closing does not depend on it:
 
 ```bash
-.orca/orchestration/scripts/orca-dispatch-role.sh executor --spec "
-Use Codex \$imagegen skill only
-(read \${CODEX_HOME:-\$HOME/.codex}/skills/.system/imagegen/SKILL.md).
-Goal: <one-sentence deliverable>
-Subject: …
-Use: …
-Style: …
-Destination: <workspace path or preview-only>
-Constraints/Avoid: …
-Done: final path(s) + mode (built-in|CLI)
-"
-```
-
-4. Wait for results if needed (close is already automatic — no extra close step):
-
-```bash
-orca orchestration check --wait \
-  --types worker_done,escalation,decision_gate \
+orca orchestration check --wait --types worker_done,escalation,decision_gate \
   --timeout-ms 900000 --json
 ```
 
-Timeout / `count:0` = checkpoint, not failure. Tab close does not depend on this wait.
+Timeout or `count:0` is a checkpoint, not a failure.
 
-5. On rate/session limit:
+5. On a rate/session limit:
 
 ```bash
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role|term_*> --spec "Continue: <goal + partial>"
@@ -226,85 +120,70 @@ Timeout / `count:0` = checkpoint, not failure. Tab close does not depend on this
 
 ### D) Full handoff (no lifecycle)
 
-If user says hand off / 넘겨줘 without supervise language: do **not** task-create/dispatch/check. Use `orca terminal send` or non-lifecycle worktree handoff only. See generic `orchestration` skill ownership rules.
+If the user says hand off / 넘겨줘 without supervise language: do **not**
+task-create / dispatch / check. Use `orca terminal send` or a non-lifecycle
+worktree handoff. See the generic `orchestration` skill's ownership rules.
 
 ## Routing cheat sheet
 
 | User need | Role |
 |-----------|------|
 | Design, ambiguous scope, high-risk review | architect |
-| Hard implement, debug, typecheck/build, close PR unit | executor |
+| Hard implement, debug, typecheck/build, close a PR unit | executor |
 | Raster image generate/edit (Codex `$imagegen`) | executor |
-| Small fix, map code, research, code prototype | thrifty |
-| Primary hit session/rate/quota limit | fallback |
+| Small fix, map code, research, prototype | thrifty |
+| Primary hit a session/rate/quota limit | fallback |
 
 Standard DAG: `architect(plan) → executor|thrifty(impl) → architect(review-only)`.
-Image DAG: clarity gate → `executor` (`$imagegen`) only.
 Cost ladder: `thrifty → executor → architect`.
 
-## Image generation (Codex `$imagegen`)
+Full routing table, DAG catalog, and edit-ownership rules: `references/routing.md`.
 
-When the user wants a **new or edited raster image** (hero, mockup photo, illustration, sprite, product shot, transparent cutout, etc.):
+## Image generation
 
-1. **Route to executor (Codex)** — never thrifty/Grok or Claude image tools for these tasks.
-2. **Clarity gate (coordinator, before dispatch):** if the brief is missing success-critical slots, **ask the user first**. Do not invent brand names, extra subjects, or marketing copy.
+Raster image work routes to **executor** with Codex `$imagegen` only. Before
+dispatching, apply the clarity gate: if subject, intended use, or destination is
+missing, **ask the user** — do not invent brand names or copy.
 
-| Slot | Ask when missing |
-|------|------------------|
-| Subject | what is in the frame |
-| Intended use | hero, ad, sprite, preview-only, … |
-| Destination | project path vs preview-only (if project-bound) |
-| Style / constraints | only if user cares (medium, palette, no text, aspect) |
-| Edit target | for edits: which file + what must stay unchanged |
-
-If the request is already specific enough, skip questions and dispatch.
-
-3. **Spec must require** Codex skill `$imagegen` only (`${CODEX_HOME:-$HOME/.codex}/skills/.system/imagegen/SKILL.md`). Built-in path by default; CLI fallback only after user confirmation.
-4. **Not `$imagegen`:** extending SVG/vector icon sets, logos that must match repo-native vectors, simple shapes better done in HTML/CSS/SVG.
+Full gate, spec template, and exclusions: `references/image-generation.md`.
 
 ## Spec hygiene
 
-Scripts auto-prefix `[ROLE=<role> | <model>]`. Body should include:
+Scripts auto-prefix `[ROLE=<role> | <model>]` and append the AUTO-CLOSE contract.
+Your spec body should carry:
 
-- Goal (one sentence end state)
-- Constraints (from AGENTS.md / product guardrails)
+- Goal — one sentence, the end state
+- Constraints — from AGENTS.md / product guardrails
 - Allowed file scope
 - Done definition / verification commands
 
-Image specs: subject, use, destination, constraints/avoid, `$imagegen`-only mandate.
-
-Edit ownership: one role edits a file set at a time; review-only architect does not bulk rewrite.
-
-## Coordinator checklist
-
-1. `orca status --json` ready
-2. Scaffold present (`roles.yaml` + `project_hints.yaml` + scripts) or re-run install
-3. Handles valid or bootstrap (dispatch also recreates dead tabs)
-4. Route by roles.yaml + project_hints.yaml (image intent → clarity gate → executor/`$imagegen`)
-5. Dispatch via `orca-dispatch-role.sh` (auto-reaper + worker AUTO-CLOSE — no manual close)
-6. Limit → fallback script
-7. Synthesize worker_done bodies; re-dispatch fixes if needed
-
-## Do not
-
-- Substitute generic subagents for Orca dispatch when user asked for Orca role orchestration
-- Use fallback as default quality lane
-- Retry a limited primary until its window resets
-- Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
-- Generate images without a clear brief (ask first) or with non-Codex image tools when `$imagegen` is the path
-- Pass `--no-reap` unless you intentionally want tabs to linger
+One role edits a given file set at a time; a review-only architect does not bulk-rewrite.
 
 ## Exit-on-done (automatic)
 
-Supervised workers must not linger after a task. Close is **automatic** on every `orca-dispatch-role.sh`:
+Close is automatic on every dispatch, two ways: a background reaper polls
+`dispatch-show` and closes on `completed|failed`, and an AUTO-CLOSE block injected
+into the spec has the worker close its own tab after `worker_done`. Opt out only
+with `--no-reap`.
 
-1. **Background reaper** (`orca-reap-task.sh`) polls `dispatch-show` and runs `orca terminal close --tab` when status is `completed` or `failed`. Does not consume inbox messages.
-2. **Worker AUTO-CLOSE block** is injected into every task spec: after `worker_done`, the worker runs the same close command on its handle.
-3. Next dispatch recreates a live terminal if the handle is dead/missing.
+If a reaper cannot read the status or a close fails, it records `reap_failed` /
+`close_failed` and exits non-zero rather than pretending success — surface those
+with `orca-status.sh` and close manually with `orca-close-role.sh`.
 
-Opt out only with `--no-reap`. Manual emergency: `orca-close-role.sh <role|term_*>`.
+## Do not
+
+- Substitute generic subagents for Orca dispatch when the user asked for Orca role orchestration
+- Use fallback as the default quality lane, or retry a limited primary before its window resets
+- Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
+- Generate images without a clear brief, or with non-Codex tools when `$imagegen` is the path
+- Edit `roles.yaml` to customize (managed — use `project_hints.yaml` / `roles.local.json`)
+- Pass `--no-reap` unless you intend tabs to linger
 
 ## Related
 
+- `references/installation.md` — layout, marketplaces, update policy, role overrides
+- `references/routing.md` — full routing table, DAG catalog, failover
+- `references/image-generation.md` — `$imagegen` clarity gate and spec
+- `references/model-roles.md` — why each model holds its role
+- `.orca/orchestration/PLAYBOOK.md` — installed project playbook
 - Generic Orca lifecycle: skill `orchestration`
-- Project playbook after install: `.orca/orchestration/PLAYBOOK.md`

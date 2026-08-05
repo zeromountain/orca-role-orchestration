@@ -63,7 +63,7 @@ msgs = r.get("messages") or []
 count = r.get("count")
 if count is None:
     count = len(msgs) if isinstance(msgs, list) else 0
-print(f"COUNT={count}")
+print("COUNT=" + shlex.quote(str(count)))
 if not msgs:
     print("MSG_TYPE=")
     print("FROM_HANDLE=")
@@ -85,7 +85,12 @@ print("TASK_ID=" + shlex.quote(str(payload.get("taskId") or "")))
 print("SUBJECT=" + shlex.quote(str(m.get("subject") or "")))
 ')"
 
-if [[ "${COUNT:-0}" -eq 0 || -z "${MSG_TYPE:-}" ]]; then
+# A non-numeric COUNT would abort the script on `-eq` under set -e; treat any
+# unexpected value as "no messages" rather than crashing the coordinator.
+if ! [[ "${COUNT:-0}" =~ ^[0-9]+$ ]]; then
+  COUNT=0
+fi
+if [[ "$COUNT" -eq 0 || -z "${MSG_TYPE:-}" ]]; then
   echo "No matching message (timeout/checkpoint). Worker not closed." >&2
   exit 0
 fi
@@ -148,40 +153,24 @@ if [[ -z "$CLOSE_HANDLE" || "$CLOSE_HANDLE" != term_* ]]; then
 fi
 
 echo "Auto-closing completed worker tab: $CLOSE_HANDLE" >&2
-# Prefer whole-tab close so the sub-session disappears from the sidebar
-if orca terminal close --terminal "$CLOSE_HANDLE" --tab --json >/dev/null 2>&1 \
-  || orca terminal close --terminal "$CLOSE_HANDLE" --json >/dev/null 2>&1; then
-  echo "Closed $CLOSE_HANDLE" >&2
-else
-  echo "Close returned non-zero for $CLOSE_HANDLE (may already be gone)" >&2
+close_terminal "$CLOSE_HANDLE"
+CLOSE_RC=$?
+case "$CLOSE_RC" in
+  0) echo "Closed $CLOSE_HANDLE" >&2 ;;
+  1) echo "$CLOSE_HANDLE already gone" >&2 ;;
+  *) echo "CLOSE FAILED for $CLOSE_HANDLE (Orca unreachable?)" >&2 ;;
+esac
+
+if [[ -n "$TASK_ID" ]]; then
+  if [[ "$CLOSE_RC" -le 1 ]]; then
+    ledger_update "$LEDGER_FILE" "$TASK_ID" "status=closed"
+  else
+    ledger_update "$LEDGER_FILE" "$TASK_ID" "status=close_failed"
+  fi
 fi
 
-# Mark ledger row closed (best-effort)
-if [[ -n "$TASK_ID" && -f "$LEDGER_FILE" ]]; then
-  python3 - "$LEDGER_FILE" "$TASK_ID" <<'PY' 2>/dev/null || true
-import json, sys, datetime
-path, tid = sys.argv[1:3]
-rows = []
-try:
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if row.get("taskId") == tid:
-                row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                row["status"] = "closed"
-            rows.append(row)
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-except Exception:
-    pass
-PY
+# A failed close means the tab is still burning a session — do not report success.
+if [[ "$CLOSE_RC" -gt 1 ]]; then
+  exit 1
 fi
-
 exit 0

@@ -49,92 +49,94 @@ if [[ -z "$TASK_ID" || -z "$HANDLE" ]]; then
 fi
 
 close_handle() {
-  local h="$1"
-  if [[ -z "$h" || "$h" != term_* ]]; then
-    return 0
-  fi
-  if ! terminal_is_live "$h" 2>/dev/null; then
-    echo "reap: $h already gone"
-    return 0
-  fi
-  echo "reap: closing $h (tab)"
-  if orca terminal close --terminal "$h" --tab --json >/dev/null 2>&1 \
-    || orca terminal close --terminal "$h" --json >/dev/null 2>&1; then
-    echo "reap: closed $h"
-  else
-    echo "reap: close non-zero for $h (ok if already gone)"
-  fi
+  # → 0 closed or already gone, 1 close genuinely failed
+  local h="$1" rc
+  close_terminal "$h"
+  rc=$?
+  case "$rc" in
+    0) echo "reap: closed $h"; return 0 ;;
+    1) echo "reap: $h already gone"; return 0 ;;
+    *) echo "reap: CLOSE FAILED for $h (Orca unreachable?)" >&2; return 1 ;;
+  esac
 }
 
 mark_ledger() {
+  # $1=status, remaining args are extra k=v fields
   local status="$1"
-  [[ -f "$LEDGER_FILE" ]] || return 0
-  python3 - "$LEDGER_FILE" "$TASK_ID" "$status" <<'PY' 2>/dev/null || true
-import json, sys, datetime
-path, tid, status = sys.argv[1:4]
-rows = []
-try:
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if row.get("taskId") == tid:
-                row["status"] = status
-                row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                row["reaped"] = True
-            rows.append(row)
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-except Exception:
-    pass
-PY
+  shift
+  ledger_update "$LEDGER_FILE" "$TASK_ID" "status=$status" "reaped=true" "$@"
 }
 
+# Give up loudly. Deliberately does NOT close: when the status is unreadable the
+# task may still be running, and killing a live worker is worse than leaving it.
+# The non-zero exit plus the ledger row is what makes the leak visible
+# (surfaced by orca-status.sh) instead of silent.
+reap_fail() {
+  local reason="$1"
+  echo "reap: FAILED — $reason (task=$TASK_ID handle=$HANDLE role=${ROLE:-})" >&2
+  echo "reap: worker tab $HANDLE may still be open — check orca-status.sh" >&2
+  mark_ledger "reap_failed" "reason=$reason"
+  exit 1
+}
+
+# Prints the dispatch status, or __parse_error__ when the response could not be
+# read at all. Collapsing those two into "unknown" is what let a JSON shape
+# change silently burn the whole timeout and exit 0.
 dispatch_status() {
-  orca orchestration dispatch-show --task "$TASK_ID" --json 2>/dev/null | python3 -c '
+  local out
+  out="$(orca orchestration dispatch-show --task "$TASK_ID" --json 2>/dev/null)" \
+    || { printf '__parse_error__'; return 0; }
+  printf '%s' "$out" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("unknown")
+    print("__parse_error__")
     raise SystemExit(0)
 r = d.get("result") or d
 disp = r.get("dispatch") or r
-print(disp.get("status") or "unknown")
-' 2>/dev/null || echo "unknown"
+status = disp.get("status") if isinstance(disp, dict) else None
+print(status or "__parse_error__")
+' 2>/dev/null || printf '__parse_error__'
 }
 
 echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
-POLL_S="$(python3 -c "print(max(1, int($POLL_MS)/1000))")"
+POLL_S="$(python3 -c 'import sys; print(max(0.1, int(sys.argv[1])/1000))' "$POLL_MS")"
+PARSE_ERRORS=0
+MAX_PARSE_ERRORS=5
 
 while true; do
   NOW_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
   ELAPSED=$((NOW_MS - START_MS))
   if [[ "$ELAPSED" -ge "$TIMEOUT_MS" ]]; then
-    echo "reap: timeout after ${ELAPSED}ms — not closing (task may still be running)"
-    exit 0
+    reap_fail "timeout after ${ELAPSED}ms without a terminal status"
   fi
 
   STATUS="$(dispatch_status)"
   case "$STATUS" in
     completed|failed)
       echo "reap: task $TASK_ID status=$STATUS — closing worker"
-      close_handle "$HANDLE"
-      mark_ledger "closed"
-      exit 0
+      if close_handle "$HANDLE"; then
+        mark_ledger "closed"
+        exit 0
+      fi
+      reap_fail "dispatch $STATUS but the worker tab could not be closed"
       ;;
-    dispatched|pending|ready|running|unknown|"")
+    __parse_error__)
+      PARSE_ERRORS=$((PARSE_ERRORS + 1))
+      if [[ "$PARSE_ERRORS" -ge "$MAX_PARSE_ERRORS" ]]; then
+        reap_fail "dispatch-show unreadable ${PARSE_ERRORS}x (output shape changed?)"
+      fi
+      sleep "$POLL_S"
+      ;;
+    dispatched|pending|ready|running|"")
+      PARSE_ERRORS=0
       sleep "$POLL_S"
       ;;
     *)
       # unknown future statuses: keep polling until timeout
+      PARSE_ERRORS=0
       sleep "$POLL_S"
       ;;
   esac

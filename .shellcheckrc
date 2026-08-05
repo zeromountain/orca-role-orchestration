@@ -1,0 +1,8 @@
+# SC1091: sourced files are resolved at runtime from the INSTALLED path
+#         (.orca/orchestration/scripts/), not from the repo layout. The
+#         `# shellcheck source=` directives already name the real target.
+disable=SC1091
+
+# SC2294: the assert() helpers in tests/ take a condition as a string on
+#         purpose so the failing expression can be printed verbatim.
+disable=SC2294

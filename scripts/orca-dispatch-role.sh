@@ -152,27 +152,23 @@ disp=r.get("dispatch") or r
 print(disp.get("id") or disp.get("dispatch_id") or "")
 ' 2>/dev/null || true)"
 
-# Ledger for reaper / wait-done
-python3 - "$LEDGER_FILE" "$TASK_ID" "$DISPATCH_ID" "$ROLE" "$HANDLE" <<'PY'
-import json, sys, datetime, os
-path, task_id, dispatch_id, role, handle = sys.argv[1:6]
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-row = {
-    "taskId": task_id,
-    "dispatchId": dispatch_id or None,
-    "role": role,
-    "handle": handle,
-    "status": "dispatched",
-    "dispatchedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-}
-with open(path, "a") as f:
-    f.write(json.dumps(row) + "\n")
-print(f"ledger += {role} {task_id} → {handle}", file=sys.stderr)
-PY
+# Ledger for reaper / wait-done. Locked append: concurrent reapers rewrite this
+# file, and an unlocked append lands on the pre-rewrite copy and is lost.
+ledger_append "$LEDGER_FILE" \
+  "taskId=$TASK_ID" \
+  "dispatchId=$DISPATCH_ID" \
+  "role=$ROLE" \
+  "handle=$HANDLE" \
+  "status=dispatched"
+echo "ledger += $ROLE $TASK_ID → $HANDLE" >&2
 
 # Background reaper: auto-close on completed|failed (default ON)
 if [[ "$NO_REAP" -eq 0 ]]; then
   mkdir -p "$REAPER_DIR"
+  # Keep the last 50 reaper logs; this directory otherwise grows forever.
+  ls -1t "$REAPER_DIR"/*.log 2>/dev/null | tail -n +51 | while read -r old; do
+    rm -f "$old" "${old%.log}.pid"
+  done
   LOG="$REAPER_DIR/${TASK_ID}.log"
   PID_FILE="$REAPER_DIR/${TASK_ID}.pid"
   nohup "$HERE/orca-reap-task.sh" \
