@@ -164,10 +164,13 @@ rm -rf "$agentsdir"
 #     below would otherwise match this very assertion.
 # `git grep` (not a raw recursive grep) so this only ever sees tracked files —
 # no .git internals, no local build/test scratch — and pathspec `:(exclude)`
-# scopes out just those two paths, nothing else.
+# scopes out just those paths, nothing else.
+#   - CHANGELOG.md  same treatment as docs/superpowers/ below: it records a
+#     bug's OLD behavior (the model string a fix corrected away from), and
+#     rewriting that description would falsify the history it exists to keep.
 STALE_RE='claude-opus-4-8|Opus 4[.]8|Gemini 3[.]5'
 stale_hits="$(git -C "$ROOT" grep -InE "$STALE_RE" -- \
-  ':(exclude)docs/superpowers' ':(exclude)tests/install.sh' 2>/dev/null || true)"
+  ':(exclude)docs/superpowers' ':(exclude)tests/install.sh' ':(exclude)CHANGELOG.md' 2>/dev/null || true)"
 if [[ -n "$stale_hits" ]]; then
   echo "  stale model strings found outside the excluded paths:" >&2
   echo "$stale_hits" | sed 's/^/    /' >&2
@@ -191,6 +194,63 @@ assert T13_gitignore_labels "grep -qF '.orca/orchestration/debate-labels/' \"$tm
 assert T13_gitignore_manifests "grep -qF '.orca/orchestration/debate-manifests/' \"$tmpdir/.gitignore\""
 gi_labels_count=$(grep -cF '.orca/orchestration/debate-labels/' "$tmpdir/.gitignore" 2>/dev/null || true)
 assert T13_gitignore_labels_no_dup "[[ \"$gi_labels_count\" -eq 1 ]]"
+
+# --- T14 orca-status.sh ships and is executable ---
+assert T14_script_status "[[ -x \"$ORCH/scripts/orca-status.sh\" ]]"
+assert T14_gitignore_ledger "grep -qF '.orca/orchestration/dispatch-ledger.jsonl' \"$tmpdir/.gitignore\""
+assert T14_gitignore_reapers "grep -qF '.orca/orchestration/reapers/' \"$tmpdir/.gitignore\""
+assert T14_gitignore_lock "grep -qF '.orca/orchestration/*.lock' \"$tmpdir/.gitignore\""
+
+# --- T15 dry-run writes nothing ---
+dry="$(mktemp -d)"
+"$INSTALL" --project-root "$dry" --project-name dry-app --dry-run >/tmp/install-t15.out 2>&1
+assert T15_no_scaffold "[[ ! -d \"$dry/.orca\" ]]"
+assert T15_no_gitignore "[[ ! -f \"$dry/.gitignore\" ]]"
+assert T15_reports_work "grep -q 'would install' /tmp/install-t15.out"
+# dry-run on an existing install must not touch it either
+cp "$ORCH/roles.yaml" "$tmpdir/roles.before"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app --dry-run >/tmp/install-t15b.out 2>&1
+assert T15_existing_untouched "cmp -s \"$tmpdir/roles.before\" \"$ORCH/roles.yaml\""
+rm -rf "$dry"
+
+# --- T16 .bak rotation keeps older forks ---
+# A fork used to survive one upgrade then vanish on the next, when .bak was
+# overwritten by the newly-replaced file.
+printf '\n# FORK_ONE\n' >> "$ORCH/scripts/orca-status.sh"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app >/tmp/install-t16a.out 2>&1
+assert T16_bak_has_fork_one "grep -q FORK_ONE \"$ORCH/scripts/orca-status.sh.bak\""
+printf '\n# FORK_TWO\n' >> "$ORCH/scripts/orca-status.sh"
+"$INSTALL" --project-root "$tmpdir" --project-name test-app >/tmp/install-t16b.out 2>&1
+assert T16_bak_has_fork_two "grep -q FORK_TWO \"$ORCH/scripts/orca-status.sh.bak\""
+assert T16_older_fork_kept "grep -rq FORK_ONE \"$ORCH/scripts/\""
+
+# --- T17 uninstall keeps user-owned files ---
+un="$(mktemp -d)"
+"$INSTALL" --project-root "$un" --project-name un-app >/tmp/install-t17a.out 2>&1
+UORCH="$un/.orca/orchestration"
+printf '{"thrifty":{"model":"x"}}\n' > "$UORCH/roles.local.json"
+printf '\n# MY_FORK\n' >> "$UORCH/personas/thrifty.md"
+"$INSTALL" --project-root "$un" --uninstall >/tmp/install-t17b.out 2>&1
+assert T17_scripts_gone "[[ ! -f \"$UORCH/scripts/orca-dispatch-role.sh\" ]]"
+assert T17_status_gone "[[ ! -f \"$UORCH/scripts/orca-status.sh\" ]]"
+assert T17_roles_gone "[[ ! -f \"$UORCH/roles.yaml\" ]]"
+assert T17_hints_kept "[[ -f \"$UORCH/project_hints.yaml\" ]]"
+assert T17_local_kept "[[ -f \"$UORCH/roles.local.json\" ]]"
+assert T17_fork_kept "grep -q MY_FORK \"$UORCH/personas/thrifty.md\""
+assert T17_clean_persona_gone "[[ ! -f \"$UORCH/personas/architect.md\" ]]"
+assert T17_reports_kept "grep -q 'Kept' /tmp/install-t17b.out"
+rm -rf "$un"
+
+# --- T18 roles.local.json override survives upgrade and --reset ---
+ov="$(mktemp -d)"
+"$INSTALL" --project-root "$ov" --project-name ov-app >/tmp/install-t18a.out 2>&1
+OVORCH="$ov/.orca/orchestration"
+printf '{"thrifty":{"model":"claude-sonnet-5"}}\n' > "$OVORCH/roles.local.json"
+"$INSTALL" --project-root "$ov" --project-name ov-app >/tmp/install-t18b.out 2>&1
+assert T18_survives_upgrade "grep -q claude-sonnet-5 \"$OVORCH/roles.local.json\""
+"$INSTALL" --project-root "$ov" --project-name ov-app --reset >/tmp/install-t18c.out 2>&1
+assert T18_survives_reset "grep -q claude-sonnet-5 \"$OVORCH/roles.local.json\""
+rm -rf "$ov"
 
 echo
 echo "Results: $pass passed, $fail failed"

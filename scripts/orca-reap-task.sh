@@ -15,6 +15,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
 # shellcheck source=orca-roles-lib.sh
 source "$HERE/orca-roles-lib.sh"
+# Read as a bare global by handles_get/ensure_terminal in orca-roles-lib.sh.
+# shellcheck disable=SC2034
 HANDLES_FILE="$ORCH/handles.json"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
 
@@ -121,47 +123,101 @@ mark_ledger() {
   # directory, then os.replace (atomic on a local filesystem) — a killed
   # writer leaves, at worst, a stray .tmp.<pid> file next to an untouched,
   # still-valid ledger.
+  # $2.. = optional extra k=v fields (e.g. reason=... for reap_fail below).
   local status="$1"
+  shift
   [[ -f "$LEDGER_FILE" ]] || return 0
-  python3 - "$LEDGER_FILE" "$TASK_ID" "$status" <<'PY' 2>/dev/null || true
-import json, os, sys, datetime
+  python3 - "$LEDGER_FILE" "$TASK_ID" "$status" "$@" <<'PY' 2>/dev/null || true
+import json, os, sys, datetime, fcntl
 path, tid, status = sys.argv[1:4]
+extra = {}
+for kv in sys.argv[4:]:
+    k, _, v = kv.partition("=")
+    extra[k] = v
 rows = []
 try:
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if row.get("taskId") == tid:
-                row["status"] = status
-                row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                row["reaped"] = True
-            rows.append(row)
-    tmp_path = path + ".tmp." + str(os.getpid())
-    with open(tmp_path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-    os.replace(tmp_path, path)
+    # Locked in addition to the existing temp+replace atomicity: this reaper
+    # is one of potentially several running concurrently (one per in-flight
+    # dispatch), and two overlapping full-file read-modify-write cycles are a
+    # lost-update race regardless of how atomically each one lands — the
+    # loser's os.replace still wins with a stale snapshot that is missing
+    # whatever the other reaper (or a fresh dispatch's append) just wrote.
+    with open(path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("taskId") == tid:
+                    row["status"] = status
+                    row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    row["reaped"] = True
+                    row.update(extra)
+                rows.append(row)
+        tmp_path = path + ".tmp." + str(os.getpid())
+        with open(tmp_path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        os.replace(tmp_path, path)
 except Exception:
     pass
 PY
 }
 
+# Give up loudly. Deliberately does NOT close: when the status could not be
+# read the task may still be running, and killing a live worker is worse than
+# leaving it. The non-zero exit plus the ledger row is what makes the leak
+# visible (surfaced by orca-status.sh) instead of silent.
+reap_fail() {
+  local reason="$1"
+  echo "reap: FAILED — $reason (task=$TASK_ID handle=$HANDLE role=${ROLE:-})" >&2
+  echo "reap: worker tab $HANDLE may still be open — check orca-status.sh" >&2
+  mark_ledger "reap_failed" "reason=$reason"
+  exit 1
+}
+
+# Shadows orca-roles-lib.sh's shared dispatch_status() for the rest of THIS
+# script only (a later function definition wins in bash; the shared lib is
+# still used unmodified by every other caller). The shared version collapses
+# any read/parse failure to the single word "unknown", indistinguishable from
+# a dispatch that is genuinely still pending — which is exactly what let a
+# `dispatch-show` JSON-shape change poll silently to the 1h timeout below and
+# exit 0 without ever closing the tab. __parse_error__ keeps that failure
+# mode distinct so the loop can bound and escalate it instead.
+dispatch_status() {
+  local out
+  out="$(orca orchestration dispatch-show --task "$1" --json 2>/dev/null)" \
+    || { printf '__parse_error__'; return 0; }
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("__parse_error__")
+    raise SystemExit(0)
+r = d.get("result") or d
+disp = r.get("dispatch") or r
+status = disp.get("status") if isinstance(disp, dict) else None
+print(status or "__parse_error__")
+' 2>/dev/null || printf '__parse_error__'
+}
+
 echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
-POLL_S="$(python3 -c "print(max(1, int($POLL_MS)/1000))")"
+POLL_S="$(python3 -c 'import sys; print(max(0.1, int(sys.argv[1])/1000))' "$POLL_MS")"
+PARSE_ERRORS=0
+MAX_PARSE_ERRORS=5
 
 while true; do
   NOW_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
   ELAPSED=$((NOW_MS - START_MS))
   if [[ "$ELAPSED" -ge "$TIMEOUT_MS" ]]; then
-    echo "reap: timeout after ${ELAPSED}ms — not closing (task may still be running)"
-    exit 0
+    reap_fail "timeout after ${ELAPSED}ms without a terminal status"
   fi
 
   STATUS="$(dispatch_status "$TASK_ID")"
@@ -184,11 +240,20 @@ while true; do
       esac
       exit 0
       ;;
+    __parse_error__)
+      PARSE_ERRORS=$((PARSE_ERRORS + 1))
+      if [[ "$PARSE_ERRORS" -ge "$MAX_PARSE_ERRORS" ]]; then
+        reap_fail "dispatch-show unreadable ${PARSE_ERRORS}x (output shape changed?)"
+      fi
+      sleep "$POLL_S"
+      ;;
     dispatched|pending|ready|running|unknown|"")
+      PARSE_ERRORS=0
       sleep "$POLL_S"
       ;;
     *)
       # unknown future statuses: keep polling until timeout
+      PARSE_ERRORS=0
       sleep "$POLL_S"
       ;;
   esac

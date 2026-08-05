@@ -5,7 +5,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
-ROOT="$(cd "$ORCH/../.." && pwd)"
 # shellcheck source=orca-roles-lib.sh
 source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
@@ -79,11 +78,35 @@ fi
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
 
-if [[ ! -f "$HANDLES_FILE" ]] || ! python3 -c '
-import json,sys
-d=json.load(open(sys.argv[1]))
-sys.exit(0 if (d.get("roles") or {}).get("fallback",{}).get("handle") or d.get("fallback") else 1)
-' "$HANDLES_FILE" 2>/dev/null; then
+# 0 = fallback handle present, 1 = genuinely absent, 2 = file unreadable.
+# Treating 2 the same as 1 is what used to spawn a SECOND role-agy-fallback
+# terminal when a reader caught handles.json mid-write from a concurrent
+# bootstrap/dispatch — corrupt and absent look identical to a bare `!` check.
+fallback_state() {
+  [[ -f "$HANDLES_FILE" ]] || return 1
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as stream:
+        d = json.load(stream)
+except Exception:
+    raise SystemExit(2)
+if not isinstance(d, dict):
+    raise SystemExit(2)
+handle = (d.get("roles") or {}).get("fallback", {}).get("handle") or d.get("fallback")
+raise SystemExit(0 if handle else 1)
+' "$HANDLES_FILE"
+}
+
+fallback_state
+FB_STATE=$?
+if [[ "$FB_STATE" -eq 2 ]]; then
+  echo "ERROR: $HANDLES_FILE exists but is not readable JSON." >&2
+  echo "  Refusing to create a duplicate fallback terminal on a guess." >&2
+  echo "  Fix with: .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree active" >&2
+  exit 1
+fi
+if [[ "$FB_STATE" -eq 1 ]]; then
   echo "No fallback handle — creating role-agy-fallback…"
   WT="$(python3 - "$HANDLES_FILE" <<'PY' 2>/dev/null || echo active
 import json
@@ -101,24 +124,37 @@ d=json.load(sys.stdin); r=d.get("result") or d
 print(r.get("handle") or (r.get("terminal") or {}).get("handle") or "")
 ')"
   orca terminal rename --terminal "$FB" --title "role-agy-fallback" --json >/dev/null 2>&1 || true
+  # Locked + atomic: bootstrap or a dispatch-triggered ensure_terminal recreate
+  # can rewrite the same file concurrently with this fallback creation.
   python3 - "$HANDLES_FILE" "$FB" "$FALLBACK_MODEL" <<'PY'
-import json,sys,datetime,os
+import datetime, fcntl, json, os, sys
 path, fb, model = sys.argv[1:4]
-d=json.load(open(path)) if os.path.exists(path) else {}
-d.setdefault("roles", {})
-d["fallback"]=fb
-d["roles"]["fallback"]={
-  "handle": fb, "title": "role-agy-fallback",
-  "model": model, "agent": "antigravity", "cli": "agy",
-}
-d["limit_failover"]={
-  "enabled": True, "target_role": "fallback",
-  "model": model,
-  "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
-}
-d["updatedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
-with open(path,"w") as f:
-    json.dump(d,f,indent=2); f.write("\n")
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        d = json.load(open(path)) if os.path.exists(path) else {}
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("roles", {})
+    d["fallback"] = fb
+    d["roles"]["fallback"] = {
+        "handle": fb, "title": "role-agy-fallback",
+        "model": model, "agent": "antigravity", "cli": "agy",
+    }
+    d["limit_failover"] = {
+        "enabled": True, "target_role": "fallback",
+        "model": model,
+        "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
+    }
+    d["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 print("fallback handle:", fb)
 PY
 fi

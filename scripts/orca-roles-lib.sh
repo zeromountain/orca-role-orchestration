@@ -3,58 +3,169 @@
 # Sourced only — do not execute. No set -e here (callers own shell options).
 # Single source for role launch strings (not roles.yaml).
 
+role_overrides() {
+  # $1=role → title\x1f model\x1f agent\x1f launch_command, empty where unset.
+  # Optional user-owned .orca/orchestration/roles.local.json, e.g.
+  #   {"thrifty": {"model": "claude-sonnet-5",
+  #                "launch_command": "claude --model claude-sonnet-5 …"}}
+  # JSON, not YAML: there is no YAML parser in this package by design.
+  # Role NAMES stay fixed; only their bindings are overridable.
+  local f="${ORCH:-.}/roles.local.json"
+  if [[ ! -f "$f" ]]; then
+    printf '\037\037\037\037\n'
+    return 0
+  fi
+  python3 - "$f" "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as stream:
+        d = json.load(stream)
+except Exception:
+    print("\x1f\x1f\x1f\x1f")
+    raise SystemExit(0)
+role = (d.get(sys.argv[2]) or {}) if isinstance(d, dict) else {}
+if not isinstance(role, dict):
+    role = {}
+fields = [role.get(k) or "" for k in ("title", "model", "agent", "launch_command")]
+# \x1f (unit separator): a NON-whitespace delimiter, so bash `read` keeps empty
+# fields in place instead of collapsing them (tab is IFS whitespace and would
+# silently shift every field after the first empty one).
+print("\x1f".join(str(f).replace("\x1f", " ").replace("\n", " ") for f in fields))
+PY
+}
+
 role_meta() {
   # $1=role → title<TAB>model<TAB>agent
+  local title model agent o_title o_model o_agent o_cmd
   case "$1" in
-    architect) printf '%s\t%s\t%s\n' "role-opus-architect" "claude-opus-5" "claude" ;;
-    executor)  printf '%s\t%s\t%s\n' "role-sol-executor"   "gpt-5.6-sol"     "codex" ;;
-    thrifty)   printf '%s\t%s\t%s\n' "role-grok-thrifty"   "grok-4.5"        "grok" ;;
-    ui)        printf '%s\t%s\t%s\n' "role-agy-ui"         "Gemini 3.6 Flash (Medium)" "antigravity" ;;
-    reviewer)  printf '%s\t%s\t%s\n' "role-opus-reviewer"  "claude-opus-5"   "claude" ;;
-    fallback)  printf '%s\t%s\t%s\n' "role-agy-fallback"   "Gemini 3.6 Flash (Medium)" "antigravity" ;;
-    debater_claude) printf '%s\t%s\t%s\n' "debate-opus"  "claude-opus-5" "claude" ;;
-    debater_codex)  printf '%s\t%s\t%s\n' "debate-sol"   "gpt-5.6-sol"   "codex" ;;
-    debater_grok)   printf '%s\t%s\t%s\n' "debate-grok"  "grok-4.5"      "grok" ;;
-    debater_gemini) printf '%s\t%s\t%s\n' "debate-agy"   "Gemini 3.6 Flash (Medium)" "antigravity" ;;
+    architect) title="role-opus-architect"; model="claude-opus-5"; agent="claude" ;;
+    executor)  title="role-sol-executor";   model="gpt-5.6-sol";   agent="codex" ;;
+    thrifty)   title="role-grok-thrifty";   model="grok-4.5";      agent="grok" ;;
+    ui)        title="role-agy-ui";         model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
+    reviewer)  title="role-opus-reviewer";  model="claude-opus-5"; agent="claude" ;;
+    fallback)  title="role-agy-fallback";   model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
+    debater_claude) title="debate-opus"; model="claude-opus-5"; agent="claude" ;;
+    debater_codex)  title="debate-sol";  model="gpt-5.6-sol";   agent="codex" ;;
+    debater_grok)   title="debate-grok"; model="grok-4.5";      agent="grok" ;;
+    debater_gemini) title="debate-agy";  model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
+  IFS=$'\037' read -r o_title o_model o_agent o_cmd < <(role_overrides "$1")
+  [[ -n "${o_title// }" ]] && title="$o_title"
+  [[ -n "${o_model// }" ]] && model="$o_model"
+  [[ -n "${o_agent// }" ]] && agent="$o_agent"
+  printf '%s\t%s\t%s\n' "$title" "$model" "$agent"
 }
 
 role_launch_cmd() {
   # $1=role → CLI launch command string
+  local cmd o_title o_model o_agent o_cmd
   case "$1" in
     architect)
-      printf '%s\n' 'claude --model claude-opus-5 --dangerously-skip-permissions'
+      cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     executor)
-      printf '%s\n' 'codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+      cmd='codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
       ;;
     thrifty)
-      printf '%s\n' 'grok --model grok-4.5 --permission-mode bypassPermissions'
+      cmd='grok --model grok-4.5 --permission-mode bypassPermissions'
       ;;
     ui)
-      printf '%s\n' 'agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     reviewer)
-      printf '%s\n' 'claude --model claude-opus-5 --dangerously-skip-permissions'
+      cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     fallback)
-      printf '%s\n' 'agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     debater_claude)
-      printf '%s\n' 'claude --model claude-opus-5 --dangerously-skip-permissions'
+      cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     debater_codex)
-      printf '%s\n' 'codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+      cmd='codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
       ;;
     debater_grok)
-      printf '%s\n' 'grok --model grok-4.5 --permission-mode bypassPermissions'
+      cmd='grok --model grok-4.5 --permission-mode bypassPermissions'
       ;;
     debater_gemini)
-      printf '%s\n' 'agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
+  IFS=$'\037' read -r o_title o_model o_agent o_cmd < <(role_overrides "$1")
+  [[ -n "${o_cmd// }" ]] && cmd="$o_cmd"
+  printf '%s\n' "$cmd"
+}
+
+role_cli() {
+  # $1=role → the executable that must be on PATH for that role to start.
+  # Not the same as role_meta's agent field: a "ui"/"fallback"/debater_gemini
+  # role's agent is "antigravity" but its binary is `agy`. An overridden
+  # launch command wins — otherwise preflight would check the default binary
+  # a user deliberately replaced via roles.local.json.
+  local o_title o_model o_agent o_cmd
+  IFS=$'\037' read -r o_title o_model o_agent o_cmd < <(role_overrides "$1")
+  if [[ -n "${o_cmd// }" ]]; then
+    printf '%s\n' "${o_cmd%% *}"
+    return 0
+  fi
+  case "$1" in
+    architect|reviewer|debater_claude) printf 'claude\n' ;;
+    executor|debater_codex)            printf 'codex\n' ;;
+    thrifty|debater_grok)              printf 'grok\n' ;;
+    ui|fallback|debater_gemini)        printf 'agy\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+ledger_append() {
+  # $1=ledger_file, then k=v pairs for the new row. Locked append: a fresh
+  # dispatch's row can otherwise land in the brief window between a
+  # concurrent reaper's read and its os.replace of the same file — the
+  # reaper's stale snapshot wins and this row silently vanishes, even though
+  # its OWN write is a plain, safe append.
+  local file="$1"
+  shift
+  python3 - "$file" "$@" <<'PY'
+import datetime, fcntl, json, os, sys
+path = sys.argv[1]
+row = {}
+for kv in sys.argv[2:]:
+    k, _, v = kv.partition("=")
+    row[k] = v or None
+row["dispatchedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    with open(path, "a") as f:
+        f.write(json.dumps(row) + "\n")
+PY
+}
+
+orca_reachable() {
+  # Parse the JSON rather than grepping for a literal '"reachable": true' —
+  # a whitespace change in the CLI's output would silently read as "down".
+  orca status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+
+def find(node):
+    if isinstance(node, dict):
+        if node.get("reachable") is True:
+            return True
+        return any(find(v) for v in node.values())
+    if isinstance(node, list):
+        return any(find(v) for v in node)
+    return False
+
+
+raise SystemExit(0 if find(d) else 1)
+'
 }
 
 role_fallback_body() {
@@ -1103,7 +1214,16 @@ PY
 persona_body() {
   # $1 = role key. Echo persona file content minus the H1 and the STANCE comment.
   # Return non-zero if the file is absent (caller falls back to a hardcoded one-liner).
-  local role="$1" file="${ORCH:-.}/personas/$role.md"
+  #
+  # Two `local` statements, not one: word expansion for every word on a
+  # single `local a=... b=...$a...` line happens before either assignment
+  # takes effect, so `$role` inside a same-line `file=` would resolve to
+  # whatever `role` was ALREADY in scope before this line ran, not `$1`.
+  # Currently masked — persona_body's only caller already has an outer
+  # `role` matching what it passes in — but a future caller with a
+  # different outer `role` would silently build the wrong file path.
+  local role="$1"
+  local file="${ORCH:-.}/personas/$role.md"
   [[ -f "$file" ]] || return 1
   grep -vE '^# |^<!-- STANCE:' "$file"
 }
@@ -1312,48 +1432,43 @@ PY
 }
 
 handles_set() {
-  # $1=handles_file $2=role $3=handle — update that role's handle (and top-level key)
-  local file="$1" role="$2" handle="$3"
-  python3 - "$file" "$role" "$handle" <<'PY'
-import json, sys, datetime, os
-path, role, handle = sys.argv[1:4]
-meta = {
-    "architect": {"title": "role-opus-architect", "model": "claude-opus-5", "agent": "claude"},
-    "executor":  {"title": "role-sol-executor",   "model": "gpt-5.6-sol",     "agent": "codex"},
-    "thrifty":   {"title": "role-grok-thrifty",   "model": "grok-4.5",        "agent": "grok"},
-    "ui":        {
-        "title": "role-agy-ui",
-        "model": "Gemini 3.6 Flash (Medium)",
-        "agent": "antigravity",
-        "cli": "agy",
-    },
-    "reviewer":  {"title": "role-opus-reviewer",  "model": "claude-opus-5",   "agent": "claude"},
-    "fallback":  {
-        "title": "role-agy-fallback",
-        "model": "Gemini 3.6 Flash (Medium)",
-        "agent": "antigravity",
-        "cli": "agy",
-    },
-    "debater_claude": {"title": "debate-opus", "model": "claude-opus-5", "agent": "claude"},
-    "debater_codex":  {"title": "debate-sol",  "model": "gpt-5.6-sol",   "agent": "codex"},
-    "debater_grok":   {"title": "debate-grok", "model": "grok-4.5",      "agent": "grok"},
-    "debater_gemini": {
-        "title": "debate-agy",
-        "model": "Gemini 3.6 Flash (Medium)",
-        "agent": "antigravity",
-        "cli": "agy",
-    },
-}
-d = json.load(open(path)) if os.path.exists(path) else {"version": 1, "roles": {}}
-d.setdefault("roles", {})
-d[role] = handle
-row = dict(meta.get(role) or {})
-row["handle"] = handle
-d["roles"][role] = row
-d["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-with open(path, "w") as f:
-    json.dump(d, f, indent=2)
-    f.write("\n")
+  # $1=handles_file $2=role $3=handle — update that role's handle (and top-level key).
+  #
+  # Locked + atomic (temp file + os.replace, same discipline as this file's
+  # own lock_write): bootstrap creates roles sequentially but a fallback
+  # creation or a dispatch-triggered ensure_terminal recreate can run
+  # concurrently with it, and two overlapping plain `open(path,"w")` rewrites
+  # of this file are a lost-update race — whichever finishes last wins,
+  # silently discarding the other role's just-recorded handle.
+  local file="$1" role="$2" handle="$3" title model agent
+  IFS=$'\t' read -r title model agent < <(role_meta "$role") || true
+  python3 - "$file" "$role" "$handle" "$title" "$model" "$agent" <<'PY'
+import datetime, fcntl, json, os, sys
+path, role, handle, title, model, agent = sys.argv[1:7]
+CLI_BY_AGENT = {"antigravity": "agy"}
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        d = {"version": 1, "roles": {}}
+    if not isinstance(d, dict):
+        d = {"version": 1, "roles": {}}
+    d.setdefault("roles", {})
+    d[role] = handle
+    row = {"handle": handle, "title": title, "model": model, "agent": agent}
+    cli = CLI_BY_AGENT.get(agent)
+    if cli:
+        row["cli"] = cli
+    d["roles"][role] = row
+    d["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 print(f"handles_set {role}={handle}", file=sys.stderr)
 PY
 }

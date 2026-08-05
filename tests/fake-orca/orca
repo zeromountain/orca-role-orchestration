@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Fake `orca` CLI for tests/runtime.sh. Put this directory FIRST on PATH.
+#
+# A PATH shim (not a shell function) is required: orca-dispatch-role.sh nohups
+# the reaper as a separate process, and functions are not inherited.
+#
+# All state lives under $FAKE_ORCA_STATE (one tmpdir per test):
+#   calls.log          one line per invocation — the main assertion surface
+#   counter            monotonic id source for term_/task_/disp_ ids
+#   terminals          "<handle>\t<title>" per live terminal
+#   sends/<handle>     concatenated `terminal send --text` bodies (seed assertions)
+#   preview/<handle>   text returned by `terminal show` (limit-pattern tests)
+#   status/<task_id>   dispatch status; default "dispatched"
+#   check.json         canned `orchestration check --wait` payload
+#   fail/<key>         FAILURE INJECTION. Presence makes that subcommand fail.
+#                      key = subcommand with spaces as dashes: status,
+#                      terminal-list, terminal-close, terminal-create,
+#                      dispatch-show, check
+#                      body = "garbage" (emit non-JSON, exit 0) or anything
+#                      else / empty (exit 1). Default: exit 1.
+set -uo pipefail
+
+STATE="${FAKE_ORCA_STATE:?FAKE_ORCA_STATE must be set}"
+mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli"
+touch "$STATE/calls.log" "$STATE/terminals"
+
+printf '%s\n' "$*" >>"$STATE/calls.log"
+
+# Read the value following a flag, e.g. flag_val --terminal "$@"
+flag_val() {
+  local want="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "$want" ]]; then
+      printf '%s' "${2:-}"
+      return 0
+    fi
+    shift
+  done
+  return 0
+}
+
+next_id() {
+  local n
+  n="$(cat "$STATE/counter" 2>/dev/null || echo 0)"
+  n=$((n + 1))
+  printf '%s' "$n" >"$STATE/counter"
+  printf '%s' "$n"
+}
+
+# Honour an injected failure for this subcommand key. Returns non-zero (and
+# emits) only when the caller should stop; otherwise falls through.
+maybe_fail() {
+  local key="$1" f="$STATE/fail/$1" mode
+  [[ -e "$f" ]] || return 0
+  mode="$(cat "$f" 2>/dev/null || true)"
+  if [[ "$mode" == "garbage" ]]; then
+    printf 'not json — %s is broken\n' "$key"
+    exit 0
+  fi
+  echo "fake-orca: injected failure for $key" >&2
+  exit 1
+}
+
+SUB1="${1:-}"
+SUB2="${2:-}"
+
+case "$SUB1 $SUB2" in
+  "status "*)
+    # The match word "$SUB1 $SUB2" always has an embedded space (even when
+    # $SUB2 is empty, giving "status "), so a bare "status" alternative here
+    # could never match — this pattern alone covers every case.
+    maybe_fail status
+    # bootstrap greps the literal string '"reachable": true' (json.dumps indent style)
+    cat <<'JSON'
+{
+  "result": {
+    "runtime": {
+      "reachable": true
+    }
+  }
+}
+JSON
+    ;;
+
+  "terminal create")
+    maybe_fail terminal-create
+    handle="term_$(next_id)"
+    title="$(flag_val --title "$@")"
+    cmd="$(flag_val --command "$@")"
+    printf '%s\t%s\n' "$handle" "$title" >>"$STATE/terminals"
+    # Record which CLI this handle is "running" so `terminal read` can answer
+    # the readiness gate (_terminal_ready_check in orca-roles-lib.sh) with a
+    # screen shaped correctly for that CLI — first word of the launch command.
+    mkdir -p "$STATE/cli"
+    printf '%s' "${cmd%% *}" >"$STATE/cli/$handle"
+    printf '{"result":{"handle":"%s","title":"%s"}}\n' "$handle" "$title"
+    ;;
+
+  "terminal rename")
+    maybe_fail terminal-rename
+    printf '{"result":{"ok":true}}\n'
+    ;;
+
+  "terminal wait")
+    maybe_fail terminal-wait
+    printf '{"result":{"state":"tui-idle"}}\n'
+    ;;
+
+  "terminal send")
+    maybe_fail terminal-send
+    h="$(flag_val --terminal "$@")"
+    flag_val --text "$@" >>"$STATE/sends/${h:-unknown}"
+    # seed() (orca-roles-lib.sh) accepts EITHER result.send.accepted or a
+    # top-level "ok" — top-level is what the real API returns (see the
+    # terminal-read handler's comment on the same point).
+    printf '{"ok":true,"result":{"ok":true}}\n'
+    ;;
+
+  "terminal list")
+    maybe_fail terminal-list
+    python3 - "$STATE/terminals" <<'PY'
+import json, sys
+terminals = []
+with open(sys.argv[1]) as stream:
+    for line in stream:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        handle, _, title = line.partition("\t")
+        terminals.append({"handle": handle, "title": title, "connected": True})
+print(json.dumps({"result": {"terminals": terminals}}))
+PY
+    ;;
+
+  "terminal close")
+    maybe_fail terminal-close
+    h="$(flag_val --terminal "$@")"
+    python3 - "$STATE/terminals" "$h" <<'PY'
+import sys
+path, handle = sys.argv[1:3]
+with open(path) as stream:
+    kept = [ln for ln in stream if ln.partition("\t")[0] != handle]
+with open(path, "w") as stream:
+    stream.writelines(kept)
+PY
+    printf '{"result":{"closed":"%s"}}\n' "$h"
+    ;;
+
+  "terminal show")
+    maybe_fail terminal-show
+    h="$(flag_val --terminal "$@")"
+    python3 - "$STATE/preview/${h:-none}" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+preview = open(path).read() if os.path.exists(path) else ""
+print(json.dumps({"result": {"terminal": {"preview": preview}}}))
+PY
+    ;;
+
+  "terminal read")
+    maybe_fail terminal-read
+    h="$(flag_val --terminal "$@")"
+    cli="$(cat "$STATE/cli/${h:-none}" 2>/dev/null || echo "")"
+    # A screen shaped to satisfy _terminal_ready_check's positive pattern for
+    # each CLI on the FIRST read, so the readiness gate inside seed() passes
+    # immediately instead of polling out to ROLE_READY_TIMEOUT_SECONDS.
+    python3 - "$h" "$cli" <<'PY'
+import json, sys
+handle, cli = sys.argv[1], sys.argv[2]
+# Keyed on the CLI binary (recorded at `terminal create` time from the launch
+# command's first word), but seed()/_terminal_ready_check select behaviour by
+# AGENT name (role_meta's 3rd field) — "agy" the binary vs. "antigravity" the
+# agent for ui/fallback/debater_gemini. Cover both spellings.
+lines = {
+    "claude": ["bypass permissions on", "❯ "],
+    "grok":   ["❯ "],
+    "agy": [">"], "antigravity": [">"],
+}.get(cli, ["$ "])  # codex (and unknown): no positive pattern is required
+# "ok" is a TOP-LEVEL field (sibling of "result"), matching the real API —
+# _terminal_ready_check checks d.get("ok") on the outer object, not inside
+# "result". Nesting it there (as most other fake handlers here do for THEIR
+# own consumers) made every terminal read as unreadable regardless of CLI.
+print(json.dumps({
+    "ok": True,
+    "result": {
+        "terminal": {"handle": handle, "status": "running", "tail": lines},
+    },
+}))
+PY
+    ;;
+
+  "orchestration task-create")
+    maybe_fail task-create
+    printf '{"result":{"task":{"id":"task_%s"}}}\n' "$(next_id)"
+    ;;
+
+  "orchestration dispatch")
+    maybe_fail dispatch
+    printf '{"result":{"dispatch":{"id":"disp_%s"}}}\n' "$(next_id)"
+    ;;
+
+  "orchestration dispatch-show")
+    maybe_fail dispatch-show
+    t="$(flag_val --task "$@")"
+    st="$(cat "$STATE/status/${t:-none}" 2>/dev/null || echo dispatched)"
+    printf '{"result":{"dispatch":{"id":"disp_x","status":"%s"}}}\n' "$st"
+    ;;
+
+  "orchestration check")
+    maybe_fail check
+    if [[ -f "$STATE/check.json" ]]; then
+      cat "$STATE/check.json"
+    else
+      printf '{"result":{"count":0,"messages":[]}}\n'
+    fi
+    ;;
+
+  *)
+    echo "fake-orca: unhandled subcommand: $SUB1 $SUB2" >&2
+    exit 64
+    ;;
+esac
+exit 0

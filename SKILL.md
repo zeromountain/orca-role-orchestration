@@ -40,6 +40,11 @@ and the `debater_*` seats are created lazily on their first dispatch.
 
 Principle: **Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.**
 
+A consumer without one of these CLIs can repoint a role without forking any
+script: `.orca/orchestration/roles.local.json` (user-owned, never overwritten)
+overrides `model`/`launch_command`/`title`/`agent` per role. Role **names**
+stay fixed — only their bindings are overridable. See `references/installation.md`.
+
 Load `references/model-roles.md` only when the user asks why a role was chosen.
 
 Each role's persona lives in `personas/<role>.md` (single source). Bootstrap seeds the
@@ -49,14 +54,17 @@ per-task reminder. Missing file → bootstrap uses a built-in one-liner and disp
 ## Preconditions
 
 ```bash
-orca status --json   # runtime.reachable true
+.orca/orchestration/scripts/orca-status.sh   # preflight + role CLIs + unclosed dispatches
 # Settings → Experimental → Agent orchestration ON
-which orca claude codex grok agy
 
 # Run scope (Orca contract update, 2026-07-31) — REQUIRED for any dispatch
 orca orchestration run-current --json          # {"run": null} means not bound
 orca orchestration run-create --objective "…"  # bind one if null
 ```
+
+`orca-status.sh` exit 0 = ready; exit 1 names what is wrong (Orca unreachable,
+a role CLI missing from PATH, an unreadable `handles.json`, or a worker tab
+left open by a failed reap). Run it before diagnosing anything else.
 
 If the project is not in Orca: `orca repo add --path <abs-project-root>`.
 
@@ -92,19 +100,20 @@ orca-role-orchestration/
   .agents/plugins/
     marketplace.json           # Codex marketplace catalog (source url "./")
   commands/                    # Claude Code slash commands (auto-discovered)
-    install.md bootstrap.md dispatch.md wait.md fallback.md debate.md close.md
+    install.md bootstrap.md dispatch.md wait.md fallback.md debate.md close.md status.md
   prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
     orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
-    orca-fallback.md orca-debate.md orca-close.md
+    orca-fallback.md orca-debate.md orca-close.md orca-status.md
   scripts/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
     orca-bootstrap-roles.sh
     orca-dispatch-role.sh      # recreates dead/missing role tabs
+    orca-status.sh             # doctor: preflight, role liveness, unclosed dispatches
     orca-close-role.sh         # manual emergency close
     orca-reap-task.sh          # background auto-close on dispatch complete
     orca-wait-done.sh          # optional blocking wait
-    orca-roles-lib.sh          # shared role meta / create / seed
+    orca-roles-lib.sh          # shared role meta / create / seed / roles.local.json overrides
     orca-fallback-on-limit.sh
     orca-debate.sh              # drive a 3-round four-model idea debate
     orca-debate-round.sh        # one debate round: fan out, poll, collect, lint
@@ -116,8 +125,12 @@ orca-role-orchestration/
     project_hints.yaml         # user-owned (create once)
     personas/                  # architect|executor|thrifty|ui|reviewer|fallback
                                 # |coordinator|debater_{claude,codex,grok,gemini} .md
-  tests/install.sh tests/debate.sh
-  references/model-roles.md
+  tests/
+    install.sh                 # installer regressions
+    runtime.sh                 # runtime scripts against a fake `orca` on PATH
+    repo-lint.sh                # manifests, command/prompt pairs, personas
+    debate.sh
+  references/model-roles.md references/installation.md
 ```
 
 Resolve the skill root from this file’s directory. A conventional installation is:

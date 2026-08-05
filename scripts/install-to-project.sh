@@ -18,19 +18,27 @@ SCRIPTS_SRC="$SKILL_DIR/scripts"
 ROOT=""
 PROJECT_NAME=""
 RESET=0
+DRY_RUN=0
+UNINSTALL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project-root) ROOT="${2:?}"; shift 2 ;;
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
     --reset) RESET=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
     -h|--help)
       cat <<'EOF'
-Usage: install-to-project.sh [--project-root PATH] [--project-name NAME] [--reset]
+Usage: install-to-project.sh [--project-root PATH] [--project-name NAME]
+                            [--reset] [--dry-run] [--uninstall]
 
-  (default)  Install or update. Safe to re-run.
-             Managed files refresh; project_hints.yaml and forked personas preserved.
-  --reset    Overwrite managed files and forked personas (each gets .bak).
+  (default)    Install or update. Safe to re-run.
+               Managed files refresh; project_hints.yaml and forked personas preserved.
+  --reset      Overwrite managed files and forked personas (each gets .bak).
+  --dry-run    Report what would change; write nothing.
+  --uninstall  Remove managed scripts and docs. Keeps project_hints.yaml,
+               forked personas, roles.local.json and local runtime state.
 EOF
       exit 0
       ;;
@@ -45,6 +53,11 @@ EOF
       ;;
   esac
 done
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on PATH — required by this installer and by every runtime script." >&2
+  exit 1
+fi
 
 if [[ -z "$ROOT" ]]; then
   ROOT="$(pwd)"
@@ -82,7 +95,62 @@ skill_version() {
 VERSION="$(skill_version)"
 echo "orca-role-orchestration ${VERSION} → ${ROOT} (project=${PROJECT_NAME})"
 
-mkdir -p "$ORCH" "$SCRIPTS_DST" "$ORCH/personas"
+MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh"
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+  echo "Removing managed scaffold from $ORCH"
+  KEPT=""
+  for s in $MANAGED_SCRIPTS; do
+    [[ -f "$SCRIPTS_DST/$s" ]] && rm -f "$SCRIPTS_DST/$s" && echo "  removed scripts/$s"
+  done
+  rmdir "$SCRIPTS_DST" 2>/dev/null || true
+  for f in roles.yaml PLAYBOOK.md SCRIPTS.md handles.example.json install-manifest.json; do
+    [[ -f "$ORCH/$f" ]] && rm -f "$ORCH/$f" && echo "  removed $f"
+  done
+  # Personas are removed only when they still match the shipped template —
+  # a forked persona is the user's, same policy as a normal install/--reset.
+  for p in "$TPL"/personas/*.md; do
+    base="$(basename "$p")"
+    dst="$ORCH/personas/$base"
+    [[ -f "$dst" ]] || continue
+    tmp="$(mktemp)"
+    if [[ "$p" == *.md ]]; then
+      python3 - "$p" "$tmp" "$PROJECT_NAME" <<'PY'
+import pathlib, sys
+source, destination, project_name = sys.argv[1:4]
+text = pathlib.Path(source).read_text()
+pathlib.Path(destination).write_text(text.replace("{{PROJECT_NAME}}", project_name))
+PY
+    else
+      cp "$p" "$tmp"
+    fi
+    if cmp -s "$tmp" "$dst"; then
+      rm -f "$dst"
+      echo "  removed personas/$base"
+    else
+      KEPT="$KEPT personas/$base"
+    fi
+    rm -f "$tmp"
+  done
+  rmdir "$ORCH/personas" 2>/dev/null || true
+  for f in project_hints.yaml roles.local.json handles.json dispatch-ledger.jsonl; do
+    [[ -e "$ORCH/$f" ]] && KEPT="$KEPT $f"
+  done
+  [[ -d "$ORCH/reapers" ]] && KEPT="$KEPT reapers/"
+  echo ""
+  if [[ -n "$KEPT" ]]; then
+    echo "Kept (yours):$KEPT"
+    echo "  Delete manually if you want them gone: rm -rf $ORCH"
+  else
+    rmdir "$ORCH" 2>/dev/null || true
+    echo "Nothing of yours was left behind."
+  fi
+  exit 0
+fi
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$ORCH" "$SCRIPTS_DST" "$ORCH/personas"
+fi
 
 # report lists (bash 3.2 compatible — no mapfile)
 REPORT_REFRESHED=()
@@ -117,6 +185,24 @@ print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 }
 
+# Keep .bak as the newest backup but never destroy an older one: an existing
+# .bak rotates to .bak.1/.bak.2/… first. Without this, a forked managed file
+# survives one upgrade (captured in .bak) and is silently lost on the next
+# upgrade, when that .bak is itself overwritten.
+backup_file() {
+  local dst="$1" n=1
+  if [[ -f "${dst}.bak" ]]; then
+    if cmp -s "${dst}.bak" "$dst"; then
+      return 0
+    fi
+    while [[ -e "${dst}.bak.${n}" ]]; do
+      n=$((n + 1))
+    done
+    mv "${dst}.bak" "${dst}.bak.${n}"
+  fi
+  cp "$dst" "${dst}.bak"
+}
+
 # Write managed file: bak on content change, skip if identical
 write_managed() {
   local src="$1"
@@ -129,8 +215,17 @@ write_managed() {
     REPORT_UNCHANGED+=("$label")
     return 0
   fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    rm -f "$tmp"
+    if [[ -f "$dst" ]]; then
+      REPORT_REFRESHED+=("$label (would change)")
+    else
+      REPORT_INSTALLED+=("$label (would install)")
+    fi
+    return 0
+  fi
   if [[ -f "$dst" ]]; then
-    cp "$dst" "${dst}.bak"
+    backup_file "$dst"
   fi
   mv "$tmp" "$dst"
   if [[ "$dst" == *.sh ]]; then
@@ -144,7 +239,7 @@ write_managed() {
 }
 
 # --- one-time migration: pre-split roles.yaml → project_hints.yaml ---
-if [[ -f "$ORCH/roles.yaml" && ! -f "$ORCH/project_hints.yaml" ]]; then
+if [[ "$DRY_RUN" -eq 0 && -f "$ORCH/roles.yaml" && ! -f "$ORCH/project_hints.yaml" ]]; then
   python3 - "$ORCH/roles.yaml" "$ORCH/project_hints.yaml" "$TPL/project_hints.yaml" "$PROJECT_NAME" <<'PY'
 import pathlib
 import re
@@ -222,6 +317,11 @@ for p in "$TPL"/personas/*.md; do
   label="personas/$base"
   rendered="$(render_to_tmp "$p")"
   if [[ ! -f "$dst" ]]; then
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      rm -f "$rendered"
+      REPORT_INSTALLED+=("$label (would install)")
+      continue
+    fi
     mv "$rendered" "$dst"
     REPORT_INSTALLED+=("$label")
     continue
@@ -230,7 +330,12 @@ for p in "$TPL"/personas/*.md; do
   cur_hash="$(sha256_file "$dst")"
   if [[ "$RESET" -eq 1 ]]; then
     if ! cmp -s "$rendered" "$dst"; then
-      cp "$dst" "${dst}.bak"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        rm -f "$rendered"
+        REPORT_REFRESHED+=("$label (would reset)")
+        continue
+      fi
+      backup_file "$dst"
       mv "$rendered" "$dst"
       REPORT_REFRESHED+=("$label (reset)")
     else
@@ -250,6 +355,9 @@ for p in "$TPL"/personas/*.md; do
     if cmp -s "$rendered" "$dst"; then
       rm -f "$rendered"
       REPORT_UNCHANGED+=("$label")
+    elif [[ "$DRY_RUN" -eq 1 ]]; then
+      rm -f "$rendered"
+      REPORT_REFRESHED+=("$label (would refresh)")
     else
       mv "$rendered" "$dst"
       REPORT_REFRESHED+=("$label")
@@ -266,15 +374,15 @@ write_managed "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md" "PLAYBOOK.md"
 write_managed "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md" "SCRIPTS.md"
 write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.example.json"
 
-for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh; do
+for s in $MANAGED_SCRIPTS; do
   write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
 
 # Relocate legacy project/scripts/orca-*.sh if present.
 # Never touch the skill package's own scripts/ when installing into the skill repo itself.
 OLD_SCRIPTS_DIR="$ROOT/scripts"
-if [[ "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
-  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh; do
+if [[ "$DRY_RUN" -eq 0 && "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
+  for s in $MANAGED_SCRIPTS; do
     if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
       # Skip if this is the skill source file (same path as SCRIPTS_SRC)
       if [[ "$OLD_SCRIPTS_DIR/$s" -ef "$SCRIPTS_SRC/$s" ]]; then
@@ -289,6 +397,9 @@ if [[ "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != 
 fi
 
 # --- write install-manifest.json ---
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "(dry run — no files written)"
+else
 python3 - "$MANIFEST" "$VERSION" "$ORCH" <<'PY'
 import hashlib
 import json
@@ -322,12 +433,14 @@ data = {
 }
 pathlib.Path(manifest_path).write_text(json.dumps(data, indent=2) + "\n")
 PY
+fi   # end DRY_RUN guard for manifest
 
 # gitignore local runtime state
+if [[ "$DRY_RUN" -eq 0 ]]; then
 GI="$ROOT/.gitignore"
 touch "$GI"
 gi_added=0
-for entry in '.orca/orchestration/handles.json' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/'; do
+for entry in '.orca/orchestration/handles.json' '.orca/orchestration/dispatch-ledger.jsonl' '.orca/orchestration/*.lock' '.orca/orchestration/reapers/' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/'; do
   if ! grep -qF "$entry" "$GI" 2>/dev/null; then
     if [[ "$gi_added" -eq 0 ]]; then
       printf '\n# Orca local runtime state\n' >> "$GI"
@@ -365,9 +478,11 @@ $MARKER
 - Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
 - Idea debate: \`.orca/orchestration/scripts/orca-debate.sh --topic "…"\`
 - Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
+- Doctor: \`.orca/orchestration/scripts/orca-status.sh\`
 EOF
   REPORT_REFRESHED+=("AGENTS.md (section appended)")
 fi
+fi   # end DRY_RUN guard for gitignore/AGENTS.md
 
 # --- report ---
 print_list() {
@@ -385,7 +500,11 @@ print_list "refreshed" "${REPORT_REFRESHED[@]+"${REPORT_REFRESHED[@]}"}"
 print_list "preserved" "${REPORT_PRESERVED[@]+"${REPORT_PRESERVED[@]}"}"
 print_list "migrated" "${REPORT_MIGRATED[@]+"${REPORT_MIGRATED[@]}"}"
 
-echo "Done."
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "Dry run — nothing written. Re-run without --dry-run to apply."
+else
+  echo "Done."
+fi
 echo "Next:"
 echo "  1) Customize .orca/orchestration/project_hints.yaml if needed"
 echo "  2) orca repo add --path $ROOT   # if not already in Orca"

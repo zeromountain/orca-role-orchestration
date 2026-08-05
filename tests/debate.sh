@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Unit tests for the debate library and role-library additions.
 # Pure: no Orca runtime required.
+#
+# Whole-file directive (must precede any code to apply file-wide):
+#   SC2030/2031: every ( ... ) subshell below deliberately scopes env var
+#     overrides to one test case so they can't leak into the next.
+#   SC2034: many _out/_rc captures exist only to print context in a failure
+#     message and are legitimately unread on the passing path.
+#   SC2154/SC2016/SC2086: shellcheck parsing quirks around a single-quoted
+#     trap string and an intentionally-literal grep pattern; not bugs.
+# shellcheck disable=SC2030,SC2031,SC2034,SC2154,SC2016,SC2086
 set -euo pipefail
 # assert() runs its command as an `if` condition, which -e never trips on.
 # Any other command expected to fail must be if-guarded (see the quorum test).

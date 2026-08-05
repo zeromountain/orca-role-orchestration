@@ -3,6 +3,8 @@
 # Sourced only — do not execute. No set -e here (callers own shell options).
 # Round prompt text lives here (single source); roles.yaml only documents the flow.
 
+# Read as a bare global by orca-debate.sh and orca-debate-round.sh.
+# shellcheck disable=SC2034
 DEBATERS_DEFAULT="claude,codex,grok,gemini"
 
 # Task 2: dead-man watchdog for `--persist` tabs. Generous relative to a
@@ -18,7 +20,15 @@ DEBATERS_DEFAULT="claude,codex,grok,gemini"
 # other work" design would leave gaps as long as a round itself. Instead
 # the watchdog refreshes the heartbeat on the owner's behalf, once per poll
 # cycle, for as long as `kill -0 <owner pid>` keeps succeeding.
+# Read as a bare global by orca-debate.sh.
+# shellcheck disable=SC2034
 DEBATE_LOCK_TTL_SECONDS_DEFAULT=1800
+# FLAGGED, not fixed here: nothing in this repo actually reads this constant.
+# orca-sweep-orphans.sh has its own independent, hardcoded `POLL_SECONDS=20`
+# (same value, today) instead of sourcing this one — a drift risk if either
+# changes without the other. Left as documentation rather than guessing at
+# which of the two should become the single source.
+# shellcheck disable=SC2034
 WATCHDOG_POLL_SECONDS_DEFAULT=20
 
 # Task 3 fix round 1: closes a TOCTOU race in orca-debate.sh's cross-slug
@@ -351,6 +361,12 @@ EOF
 
 debate_spec() {
   # $1=phase $2=short $3=debate_dir $4=round $5=out_file $6=own_label $7=topic_file
+  # FLAGGED, not fixed here: `short` is captured but never read in this
+  # function body. Every call site still passes it, so this is either a
+  # forgotten wire-up (the generated spec text was meant to reference it) or
+  # a genuinely vestigial parameter — not touching the debate prompt text to
+  # guess which.
+  # shellcheck disable=SC2034
   local phase="$1" short="$2" dir="$3" round="$4" out="$5" own="$6" topic_file="$7"
   local topic
   topic="$(cat "$topic_file" 2>/dev/null || echo "(topic file missing)")"

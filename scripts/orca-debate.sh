@@ -34,6 +34,8 @@ HANDLES_FILE="$ORCH/handles.json"
 # inside create_role's command substitution, misreporting every fresh
 # create as a generic "create_role failed".
 WORKTREE="active"
+# Read as a bare global by create_role in orca-roles-lib.sh.
+# shellcheck disable=SC2034
 WORKTREE="$(python3 - "$HANDLES_FILE" <<'PY' 2>/dev/null || echo active
 import json, sys
 with open(sys.argv[1]) as stream:

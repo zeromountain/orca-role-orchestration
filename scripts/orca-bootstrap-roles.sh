@@ -13,6 +13,7 @@ OUT_DIR="$ORCH"
 HANDLES_FILE="$OUT_DIR/handles.json"
 WORKTREE="active"
 PROJECT_NAME="$(basename "$ROOT")"
+ROLES_OPT=""
 if [[ -f "$ROOT/package.json" ]]; then
   PROJECT_NAME="$(python3 - "$ROOT/package.json" "$PROJECT_NAME" <<'PY' 2>/dev/null || echo "$PROJECT_NAME"
 import json
@@ -28,20 +29,51 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --worktree) WORKTREE="${2:?}"; shift 2 ;;
     --project-name) PROJECT_NAME="${2:?}"; shift 2 ;;
+    --roles) ROLES_OPT="$(printf '%s' "${2:?}" | tr ',' ' ')"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 [--worktree <selector>] [--project-name NAME]"
+      echo "Usage: $0 [--worktree <selector>] [--project-name NAME] [--roles a,b]"
+      echo "  --roles  subset of the four primaries to bootstrap (default: all four)"
       exit 0
       ;;
     *) echo "Unknown: $1" >&2; exit 1 ;;
   esac
 done
 
+ROLES=(architect executor thrifty fallback)
+if [[ -n "$ROLES_OPT" ]]; then
+  ROLES=()
+  for r in $ROLES_OPT; do
+    case "$r" in
+      architect|executor|thrifty|fallback) ROLES+=("$r") ;;
+      *) echo "--roles must be a subset of architect,executor,thrifty,fallback (got: $r)" >&2; exit 1 ;;
+    esac
+  done
+fi
+
 if ! command -v orca >/dev/null 2>&1; then
   echo "orca CLI not found on PATH" >&2
   exit 1
 fi
-if ! orca status --json 2>/dev/null | grep -q '"reachable": true'; then
+if ! orca_reachable; then
   echo "Orca runtime not reachable. Open Orca and retry." >&2
+  exit 1
+fi
+
+# Preflight the per-role CLIs. Without this a missing binary produces a tab
+# that dies with "command not found", a soft tui-idle warning, and a
+# recorded-but-dead handle — the first real dispatch then fails looking like
+# an orchestration bug instead of a missing install.
+MISSING=""
+for r in "${ROLES[@]}"; do
+  cli="$(role_cli "$r")"
+  if ! command -v "$cli" >/dev/null 2>&1; then
+    MISSING="$MISSING  $r → $cli not on PATH"$'\n'
+  fi
+done
+if [[ -n "$MISSING" ]]; then
+  echo "Missing role CLIs:" >&2
+  printf '%s' "$MISSING" >&2
+  echo "Install them, or bootstrap a subset: --roles architect,executor" >&2
   exit 1
 fi
 
@@ -53,6 +85,8 @@ if [[ -f "$ROOT/AGENTS.md" ]]; then
 elif [[ -f "$ROOT/CLAUDE.md" ]]; then
   CONSTRAINTS="Read and follow CLAUDE.md in the project root."
 else
+  # Read as a bare global by seed() in orca-roles-lib.sh.
+  # shellcheck disable=SC2034
   CONSTRAINTS="Follow repository conventions; never commit secrets."
 fi
 
@@ -62,30 +96,40 @@ echo "Bootstrapping role workers (worktree=$WORKTREE project=$PROJECT_NAME)…"
 # handles_set calls below (inside the create loop) always have a file to
 # read-modify-write against, and so this metadata (routing_ssot, playbook,
 # limit_failover) is present even if every subsequent role fails.
+#
+# Locked + atomic: this can race handles_set (same file, same lock name) if a
+# fallback creation or a dispatch-triggered recreate runs concurrently with
+# bootstrap — a plain open(path,"w") here would win-or-lose that race and
+# silently drop whichever write finished second.
 python3 - "$HANDLES_FILE" "$WORKTREE" <<'PY'
-import json, os, sys, datetime
+import datetime, fcntl, json, os, sys
 path, worktree = sys.argv[1:3]
-data = {"version": 1, "worktree": worktree, "roles": {}}
-if os.path.exists(path):
-    try:
-        loaded = json.load(open(path))
-        if isinstance(loaded, dict):
-            data = loaded
-            data["worktree"] = worktree
-    except Exception:
-        pass
-data.setdefault("roles", {})
-data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-data["routing_ssot"] = ".orca/orchestration/roles.yaml"
-data["playbook"] = ".orca/orchestration/PLAYBOOK.md"
-data["limit_failover"] = {
-    "enabled": True,
-    "target_role": "fallback",
-    "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
-}
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    data = {"version": 1, "worktree": worktree, "roles": {}}
+    if os.path.exists(path):
+        try:
+            loaded = json.load(open(path))
+            if isinstance(loaded, dict):
+                data = loaded
+                data["worktree"] = worktree
+        except Exception:
+            pass
+    data.setdefault("roles", {})
+    data["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    data["routing_ssot"] = ".orca/orchestration/roles.yaml"
+    data["playbook"] = ".orca/orchestration/PLAYBOOK.md"
+    data["limit_failover"] = {
+        "enabled": True,
+        "target_role": "fallback",
+        "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
+    }
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 PY
 
 # Failure isolation (Task 1, defect C): the four primary roles are created,
@@ -101,9 +145,10 @@ PY
 # always exactly 4 elements, so expanding them under `set -u` is always safe;
 # FAILURES is a plain accumulated string (not an array) specifically because
 # it CAN be empty on the all-succeed path, and an empty array's "${arr[@]}"
-# expansion aborts some bash 3.2 builds under `set -u`.
-ROLES=(architect executor thrifty fallback)
-HANDLES=("" "" "" "")
+# expansion aborts some bash 3.2 builds under `set -u`. ROLES itself is set
+# above (default all four, or the --roles subset).
+HANDLES=()
+for _ in "${ROLES[@]}"; do HANDLES+=(""); done
 FAILURES=""
 FAIL_COUNT=0
 

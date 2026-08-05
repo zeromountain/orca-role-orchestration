@@ -138,7 +138,7 @@ msgs = r.get("messages") or []
 count = r.get("count")
 if count is None:
     count = len(msgs) if isinstance(msgs, list) else 0
-print(f"COUNT={count}")
+print("COUNT=" + shlex.quote(str(count)))
 if not msgs:
     print("MSG_TYPE=")
     print("FROM_HANDLE=")
@@ -160,7 +160,11 @@ print("TASK_ID=" + shlex.quote(str(payload.get("taskId") or "")))
 print("SUBJECT=" + shlex.quote(str(m.get("subject") or "")))
 ')"
 
-  if [[ "${COUNT:-0}" -eq 0 || -z "${MSG_TYPE:-}" ]]; then
+  # A non-numeric COUNT (an unexpected API response shape) would abort this
+  # script on `-eq` under set -e; treat it as "no messages" rather than
+  # crashing the coordinator.
+  if ! [[ "${COUNT:-0}" =~ ^[0-9]+$ ]]; then COUNT=0; fi
+  if [[ "$COUNT" -eq 0 || -z "${MSG_TYPE:-}" ]]; then
     echo "No matching message (timeout/checkpoint). Worker not closed." >&2
     exit 0
   fi
@@ -204,7 +208,7 @@ if not isinstance(msgs, list):
 count = r.get("count")
 if count is None:
     count = len(msgs)
-print(f"COUNT={count}")
+print("COUNT=" + shlex.quote(str(count)))
 
 
 def extract(m):
@@ -256,7 +260,8 @@ for s in skipped:
     )
 ' "$TASK_FILTER")"
 
-    if [[ "${COUNT:-0}" -eq 0 ]]; then
+    if ! [[ "${COUNT:-0}" =~ ^[0-9]+$ ]]; then COUNT=0; fi
+    if [[ "$COUNT" -eq 0 ]]; then
       echo "No matching message (timeout/checkpoint). Worker not closed." >&2
       exit 0
     fi
@@ -368,31 +373,44 @@ esac
 # is).
 if [[ -n "$TASK_ID" && -f "$LEDGER_FILE" ]]; then
   python3 - "$LEDGER_FILE" "$TASK_ID" "$CLOSE_STATUS" <<'PY' 2>/dev/null || true
-import json, os, sys, datetime
+import json, os, sys, datetime, fcntl
 path, tid, status = sys.argv[1:4]
 rows = []
 try:
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if row.get("taskId") == tid:
-                row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                row["status"] = status
-            rows.append(row)
-    tmp_path = path + ".tmp." + str(os.getpid())
-    with open(tmp_path, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-    os.replace(tmp_path, path)
+    # Locked in addition to the existing temp+replace atomicity: this script
+    # and orca-reap-task.sh's background reaper can both be watching the same
+    # task, and two overlapping full-file read-modify-write cycles are a
+    # lost-update race no matter how atomically each one lands on disk.
+    with open(path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("taskId") == tid:
+                    row["closedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    row["status"] = status
+                rows.append(row)
+        tmp_path = path + ".tmp." + str(os.getpid())
+        with open(tmp_path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        os.replace(tmp_path, path)
 except Exception:
     pass
 PY
 fi
 
+# A close that did not take effect ($CLOSE_STATUS=close_failed/undetermined)
+# still exits 0 here, matching orca-reap-task.sh's own completed/failed
+# branch: this script's job is "did I learn my task's outcome", not "did the
+# close mechanically verify" — the ledger status is the record of that,
+# checked by orca-status.sh, not this exit code. (tests/debate.sh WCV1 pins
+# this down explicitly: a close that never takes must not mark the ledger
+# "closed", but the wait itself must still report success.)
 exit 0

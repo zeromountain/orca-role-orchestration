@@ -9,6 +9,7 @@
 | `.orca/orchestration/scripts/orca-close-role.sh` | Manual close of role tab (`--tab`) |
 | `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / create / seed (sourced) |
 | `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.6 Flash (Medium) |
+| `.orca/orchestration/scripts/orca-status.sh` | Doctor: preflight, role liveness, unclosed dispatches, reapers |
 | `.orca/orchestration/scripts/orca-debate.sh` | Drive a 3-round four-model idea debate |
 | `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
 | `.orca/orchestration/scripts/orca-debate-lib.sh` | Debate helpers + round prompts (sourced) |
@@ -19,7 +20,9 @@ Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and q
 
 ```bash
 chmod +x .orca/orchestration/scripts/orca-*.sh
+.orca/orchestration/scripts/orca-status.sh                 # check before you start
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
+.orca/orchestration/scripts/orca-bootstrap-roles.sh --roles architect,executor
 .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan: …"
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec-file /tmp/task.md
 .orca/orchestration/scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
@@ -41,4 +44,9 @@ Close is **automatic** on every `orca-dispatch-role.sh` (background reaper). Opt
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json
 ```
 
-`handles.json` is local-only; do not commit. See `handles.example.json`.
+When a dispatch misbehaves, run `orca-status.sh` first. It is the only place
+that surfaces `reap_failed` / `close_failed` rows — a worker tab that stayed
+open after its reaper gave up. Exit code 1 means something needs attention.
+
+`handles.json`, `dispatch-ledger.jsonl`, and `reapers/` are local-only; do not
+commit them. See `handles.example.json`.

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stub role CLI for tests. Never actually executed by the fake orca — the launch
+# command is only recorded as a string — but bootstrap's preflight requires the
+# binary to exist on PATH.
+echo "stub agy: $*"
+exit 0
