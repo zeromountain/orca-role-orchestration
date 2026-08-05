@@ -42,15 +42,23 @@ esac
 say() { [[ "$QUIET" -eq 1 ]] || printf '%s\n' "$*"; }
 problem() { printf '%s\n' "$*" >&2; PROBLEMS=$((PROBLEMS + 1)); }
 
-version="$(python3 -c '
+version_info="$(python3 -c '
 import json, sys
 try:
-    print(json.load(open(sys.argv[1])).get("skill_version") or "unknown")
+    d = json.load(open(sys.argv[1]))
+    print((d.get("skill_version") or "unknown") + "\t" + (d.get("installed_at") or "unknown"))
 except Exception:
-    print("unknown")
-' "$MANIFEST" 2>/dev/null || echo unknown)"
+    print("unknown\tunknown")
+' "$MANIFEST" 2>/dev/null || echo "unknown	unknown")"
+version="${version_info%%$'\t'*}"
+installed_at="${version_info#*$'\t'}"
 say "orca-role-orchestration scaffold ($version)"
 say "  root: $ORCH"
+if [[ "$version" == "unknown" ]]; then
+  say "  install: legacy or missing install-manifest.json — re-run scripts/install-to-project.sh"
+else
+  say "  installed: $installed_at"
+fi
 say ""
 
 # --- 1 preflight ------------------------------------------------------------
@@ -132,9 +140,13 @@ PY
   count="$(printf '%s' "$OPEN_ROWS" | sed -n 's/^__COUNT__//p')"
   printf '%s\n' "$OPEN_ROWS" | grep -v '^__COUNT__' | grep -v '^$' || true
   if [[ "${count:-0}" -gt 0 ]]; then
-    # reap_failed means the reaper gave up with the tab possibly still open.
-    if printf '%s' "$OPEN_ROWS" | grep -q 'reap_failed\|close_failed'; then
-      problem "  ${count} open row(s), including FAILED reaps — worker tabs may still be burning sessions."
+    # reap_failed/close_failed: the reaper gave up with the tab possibly
+    # still open. stalled/closed_stalled: the idle probe found a worker that
+    # stopped making progress (see orca-reap-task.sh) — the tab itself may
+    # already be closed, but the underlying task never actually reported
+    # done and is worth a human look either way.
+    if printf '%s' "$OPEN_ROWS" | grep -q 'reap_failed\|close_failed\|stalled'; then
+      problem "  ${count} open row(s), including FAILED or STALLED dispatches — worker tabs may still be burning sessions, or finished without reporting."
       problem "    close manually: orca-close-role.sh <role|term_*>"
     else
       say "  ${count} row(s) still in flight"

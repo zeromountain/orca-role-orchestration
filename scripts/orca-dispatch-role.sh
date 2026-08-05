@@ -172,6 +172,22 @@ RUN_ID="$(resolve_run_id)"
 RUN_ARGS=()
 if [[ -n "$RUN_ID" ]]; then
   RUN_ARGS=(--run "$RUN_ID")
+else
+  # Deadlock fix (RC-1): dispatching with no Run bound structurally dooms
+  # this task's own worker_done — dispatch_tail_block's RUN SCOPE block
+  # (the instruction that tells the worker to add --run to its OWN `send`)
+  # is only emitted when RUN_ID is non-empty, so without one the worker's
+  # eventual worker_done is refused (legacy_read_only) even when the task
+  # itself succeeded. Measured in production: dispatch-ledger.jsonl rows
+  # stuck at status=dispatched for days, each with a reaper log reading
+  # "timeout after 3600000ms — not closing (task may still be running)" —
+  # dispatch-show never moves because nothing ever reports done. Refusing
+  # here, before task-create, costs nothing (no task exists yet to strand)
+  # and matches the readiness-gate ordering above for the same reason.
+  echo "orca-dispatch-role.sh: no Run bound to this terminal — refusing to dispatch ROLE=$ROLE." >&2
+  echo "Dispatching now would create a task whose worker_done can never be delivered." >&2
+  run_scope_hint >&2
+  exit 1
 fi
 
 # Spec always carries a tail contract: auto-close (default) or stay-open

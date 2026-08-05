@@ -59,7 +59,7 @@ new_project() {
   SCRIPTS="$PROJ/.orca/orchestration/scripts"
   STATE="$tmproot/$1.state"
   # Same layout the fake creates on first call — tests write here beforehand.
-  mkdir -p "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail"
+  mkdir -p "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/screen"
   touch "$STATE/calls.log" "$STATE/terminals"
   export FAKE_ORCA_STATE="$STATE"
 }
@@ -311,6 +311,129 @@ assert R8_no_grok_launch "! grep -q 'grok --model grok-4.5' \"$STATE/calls.log\"
 assert R8_survives_upgrade "grep -q claude-sonnet-5 \"$PROJ/.orca/orchestration/roles.local.json\""
 "$INSTALL" --project-root "$PROJ" --project-name r8 --reset >"$tmproot/r8.reset.log" 2>&1
 assert R8_survives_reset "grep -q claude-sonnet-5 \"$PROJ/.orca/orchestration/roles.local.json\""
+
+# --- R9 reaper detects a stalled worker (frozen screen) and closes it -------
+# The deadlock this whole fix exists for: dispatch-show never leaves
+# "dispatched" (worker_done was refused, or the worker crashed), but the
+# worker's OWN screen shows it sitting at an unchanging ready prompt. Tight
+# idle knobs so the test runs in ~1s instead of the 2-minute production grace.
+echo "R9 reaper detects a stalled worker (frozen screen)"
+new_project r9
+printf 'term_r9\trole-grok-thrifty\n' >>"$STATE/terminals"
+seed_ledger_row task_r9 term_r9 thrifty
+printf '%s\n' "❯ " >"$STATE/screen/term_r9"
+"$SCRIPTS/orca-reap-task.sh" --task task_r9 --handle term_r9 --role thrifty \
+  --poll-ms 50 --timeout-ms 10000 \
+  --idle-grace-ms 0 --idle-probe-ms 100 --idle-strikes 3 \
+  >"$tmproot/r9.log" 2>&1
+r9_rc=$?
+assert R9_nonzero_exit "[[ $r9_rc -ne 0 ]]"
+assert R9_ledger_closed_stalled "[[ \"\$(ledger_status task_r9)\" == closed_stalled ]]"
+assert R9_terminal_gone "[[ \"\$(live_titled term_r9)\" -eq 0 ]]"
+assert R9_log_says_stalled "grep -q stalled \"$tmproot/r9.log\""
+
+# --- R10 reaper notices a self-closed terminal without waiting out the ------
+# --- full reap timeout (the worker followed AUTO-CLOSE after a refused -----
+# --- worker_done, but dispatch-show never moved off its prior status) ------
+echo "R10 reaper vs a worker that already closed its own tab"
+new_project r10
+seed_ledger_row task_r10 term_r10_gone thrifty
+# Deliberately never added to $STATE/terminals: terminal_is_live reports 1
+# (definitely absent) for a handle that never appears in `terminal list`.
+"$SCRIPTS/orca-reap-task.sh" --task task_r10 --handle term_r10_gone --role thrifty \
+  --poll-ms 50 --timeout-ms 10000 \
+  --idle-grace-ms 0 --idle-probe-ms 100 --idle-strikes 3 \
+  >"$tmproot/r10.log" 2>&1
+r10_rc=$?
+assert R10_exit0 "[[ $r10_rc -eq 0 ]]"
+assert R10_ledger_closed "[[ \"\$(ledger_status task_r10)\" == closed ]]"
+assert R10_no_close_call "[[ \"\$(calls_matching 'terminal close')\" -eq 0 ]]"
+
+# --- R11 idle detection never fires on a screen that keeps changing --------
+# (false-positive guard): content that differs every poll, even while it also
+# matches a CLI's positive "ready" pattern on every single read, must never
+# accumulate a strike streak. This is the core safety property RC-2 depends
+# on — a model that is still actually generating must never be killed.
+echo "R11 idle detection ignores a genuinely changing screen"
+new_project r11
+printf 'term_r11\trole-grok-thrifty\n' >>"$STATE/terminals"
+seed_ledger_row task_r11 term_r11 thrifty
+: >"$STATE/screen/term_r11.dynamic"
+"$SCRIPTS/orca-reap-task.sh" --task task_r11 --handle term_r11 --role thrifty \
+  --poll-ms 50 --timeout-ms 1500 \
+  --idle-grace-ms 0 --idle-probe-ms 100 --idle-strikes 3 \
+  >"$tmproot/r11.log" 2>&1
+r11_rc=$?
+assert R11_reap_failed_not_stalled "[[ \"\$(ledger_status task_r11)\" == reap_failed ]]"
+assert R11_never_stalled "[[ \"\$(ledger_status task_r11)\" != closed_stalled ]]"
+assert R11_terminal_still_live "[[ \"\$(live_titled term_r11)\" -eq 1 ]]"
+assert R11_nonzero_exit "[[ $r11_rc -ne 0 ]]"
+
+# --- R12 awaiting_reply suppresses idle detection ---------------------------
+# A worker left open on a decision_gate/escalation (orca-wait-done.sh marks
+# the ledger row "awaiting_reply" — see its own comment) is deliberately
+# idle, waiting on the COORDINATOR. Same frozen screen as R9, but the idle
+# probe must never count it: the run should reach the ordinary timeout path
+# (reap_failed), not the idle fast path (closed_stalled).
+echo "R12 awaiting_reply suppresses idle detection"
+new_project r12
+printf 'term_r12\trole-grok-thrifty\n' >>"$STATE/terminals"
+f="$PROJ/.orca/orchestration/dispatch-ledger.jsonl"
+mkdir -p "$(dirname "$f")"
+printf '{"taskId":"task_r12","dispatchId":"disp_x","role":"thrifty","handle":"term_r12","status":"awaiting_reply"}\n' >>"$f"
+printf '%s\n' "❯ " >"$STATE/screen/term_r12"
+"$SCRIPTS/orca-reap-task.sh" --task task_r12 --handle term_r12 --role thrifty \
+  --poll-ms 50 --timeout-ms 1000 \
+  --idle-grace-ms 0 --idle-probe-ms 100 --idle-strikes 3 \
+  >"$tmproot/r12.log" 2>&1
+r12_rc=$?
+assert R12_nonzero_exit "[[ $r12_rc -ne 0 ]]"
+assert R12_reap_failed "[[ \"\$(ledger_status task_r12)\" == reap_failed ]]"
+assert R12_never_stalled "[[ \"\$(ledger_status task_r12)\" != closed_stalled ]]"
+assert R12_terminal_still_live "[[ \"\$(live_titled term_r12)\" -eq 1 ]]"
+
+# --- R13 dispatch refuses to run with no Run bound --------------------------
+# fake-orca has no "orchestration run-current" case, so it falls through to
+# its `*)` handler (exit 64) and resolve_run_id soft-fails to empty — the
+# same shape a real, older/unbound Orca terminal produces. Dispatching a task
+# whose worker_done can never be delivered (see RUN SCOPE in
+# orca-roles-lib.sh) must now be refused before task-create ever runs.
+echo "R13 dispatch refuses to run with no Run bound"
+new_project r13
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r13.boot.log" 2>&1
+: >"$STATE/calls.log"   # isolate this dispatch's own calls from bootstrap's
+"$SCRIPTS/orca-dispatch-role.sh" thrifty --spec "do the thing" \
+  >"$tmproot/r13.log" 2>&1
+r13_rc=$?
+assert R13_nonzero_exit "[[ $r13_rc -ne 0 ]]"
+assert R13_no_task_create "[[ \"\$(calls_matching 'orchestration task-create')\" -eq 0 ]]"
+assert R13_no_dispatch_call "[[ \"\$(calls_matching 'orchestration dispatch ')\" -eq 0 ]]"
+assert R13_no_ledger_row "[[ ! -f \"$PROJ/.orca/orchestration/dispatch-ledger.jsonl\" ]]"
+assert R13_says_run_scope "grep -q 'run-create' \"$tmproot/r13.log\""
+
+# --- R14 a message consumed for the wrong task is spooled, not lost --------
+# orca-wait-done.sh's task-filtered wait has no per-task selector on the
+# underlying `check` call — a non-matching message is unavoidably consumed
+# by the poll that received it. Previously that message just evaporated
+# (logged to stderr and gone); now it lands in inbox-spool.jsonl and a LATER
+# wait for that task recovers it from the spool instead of polling to its
+# own timeout having "never" seen it.
+echo "R14 wait-done spools a message meant for a different task"
+new_project r14
+printf 'term_r14\trole-grok-thrifty\n' >>"$STATE/terminals"
+cat >"$STATE/check.json" <<'JSON'
+{"result":{"count":1,"messages":[{"type":"worker_done","from_handle":"term_other","subject":"done","payload":{"taskId":"task_other"}}]}}
+JSON
+"$SCRIPTS/orca-wait-done.sh" --task task_r14_none --timeout-ms 300 \
+  >"$tmproot/r14a.log" 2>&1
+assert R14_spooled "[[ -f \"$PROJ/.orca/orchestration/inbox-spool.jsonl\" ]]"
+assert R14_spool_has_task "grep -q task_other \"$PROJ/.orca/orchestration/inbox-spool.jsonl\""
+: >"$STATE/check.json"   # a second wait must not need a fresh `check` result
+printf '{"result":{"count":0,"messages":[]}}\n' >"$STATE/check.json"
+"$SCRIPTS/orca-wait-done.sh" --task task_other --role thrifty --timeout-ms 300 \
+  >"$tmproot/r14b.log" 2>&1
+assert R14_recovered "grep -q 'Recovered spooled message' \"$tmproot/r14b.log\""
+assert R14_spool_drained "! grep -q task_other \"$PROJ/.orca/orchestration/inbox-spool.jsonl\" 2>/dev/null"
 
 echo
 echo "Results: $pass passed, $fail failed"

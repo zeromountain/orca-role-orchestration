@@ -2038,6 +2038,25 @@ sys.stdout.write(run.get("id") or "")
 ' 2>/dev/null || true
 }
 
+# Shared remediation text for "no Run bound" — used both after the fact
+# (warn_if_legacy_read_only, once a call already came back refused) and
+# proactively (orca-dispatch-role.sh, before it ever calls task-create; see
+# its own comment for why an empty RUN_ID is refused up front now instead of
+# just being logged about afterward).
+run_scope_hint() {
+  cat <<'EOF'
+Orca's Run-scoped orchestration needs an explicit run id. Bind one:
+
+  orca orchestration run-create --objective "<what this run is for>" --json
+
+then re-run this command. To reuse an existing Run instead:
+
+  orca orchestration run-list --json      # find the id
+  orca orchestration run-use --run <id>   # bind this terminal
+  # or bypass binding entirely: export ORCA_RUN_ID=run_xxxxxxxxxxxx
+EOF
+}
+
 # Emit a remediation hint when an orchestration mutation was refused for lack
 # of a Run scope. Callers pass the raw JSON they got back; a no-op for any
 # other failure, so it is safe to call on every error path.
@@ -2048,14 +2067,6 @@ warn_if_legacy_read_only() {
     echo "$what was refused: orchestration is in legacy READ-ONLY mode."
     echo "No effects were applied and no task id was produced."
     echo
-    echo "Orca's Run-scoped orchestration needs an explicit run id. Bind one:"
-    echo
-    echo "  orca orchestration run-create --objective \"<what this run is for>\" --json"
-    echo
-    echo "then re-run this command. To reuse an existing Run instead:"
-    echo
-    echo "  orca orchestration run-list --json      # find the id"
-    echo "  orca orchestration run-use --run <id>   # bind this terminal"
-    echo "  # or bypass binding entirely: export ORCA_RUN_ID=run_xxxxxxxxxxxx"
+    run_scope_hint
   } >&2
 }

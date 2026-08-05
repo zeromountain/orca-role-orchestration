@@ -48,6 +48,7 @@ ORCH="$(cd "$HERE/.." && pwd)"
 source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
+SPOOL_FILE="$ORCH/inbox-spool.jsonl"
 
 TIMEOUT_MS=900000
 TYPES="worker_done,escalation,decision_gate"
@@ -100,6 +101,99 @@ now_ms() {
   # to 0 on any failure) so a `$(( DEADLINE_MS - $(now_ms) ))` arithmetic
   # expansion downstream can never abort the script on a non-numeric value.
   python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo 0
+}
+
+# $1=task_id $2=status — best-effort update of that task's ledger row status
+# ONLY (no closedAt/reaped: those record a close CYCLE, and this is used for
+# decision_gate/unclaimed escalation, where the worker is deliberately still
+# open — see the should_close branch below). Same flock+tmp+os.replace
+# discipline as every other shared-state writer in this scaffold.
+mark_ledger_status() {
+  local tid="$1" status="$2"
+  [[ -n "$tid" && -f "$LEDGER_FILE" ]] || return 0
+  python3 - "$LEDGER_FILE" "$tid" "$status" <<'PY' 2>/dev/null || true
+import fcntl, json, os, sys
+path, tid, status = sys.argv[1:4]
+rows = []
+try:
+    with open(path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("taskId") == tid:
+                    row["status"] = status
+                rows.append(row)
+        tmp_path = path + ".tmp." + str(os.getpid())
+        with open(tmp_path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        os.replace(tmp_path, path)
+except Exception:
+    pass
+PY
+}
+
+# $1=task_id → if a spooled message for that task exists (left behind by a
+# PRIOR wait's task-filtered poll — see the python parser below), print it in
+# the same MATCHED=/MSG_TYPE=/FROM_HANDLE=/TASK_ID=/SUBJECT= shape that poll
+# emits, and remove it from the spool. MATCHED=0 (spool untouched) otherwise.
+#
+# Why this exists (RC-3): `orca orchestration check` has no per-task
+# selector — a poll consumes whatever batch is next, and this script used to
+# just log a non-matching message to stderr and let it evaporate. Two
+# concurrent (or back-to-back) task-filtered waits could then each consume
+# the other's message and both poll to their own timeout, never actually
+# stuck on the far side but presenting exactly like the same idle deadlock
+# this whole fix exists for. The spool makes a "wrong" delivery recoverable
+# instead of lost.
+spool_take() {
+  local tid="$1"
+  [[ -f "$SPOOL_FILE" ]] || { echo "MATCHED=0"; return 0; }
+  python3 - "$SPOOL_FILE" "$tid" <<'PY' 2>/dev/null || echo "MATCHED=0"
+import fcntl, json, os, shlex, sys
+path, tid = sys.argv[1:3]
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+    except FileNotFoundError:
+        rows = []
+    taken = None
+    remaining = []
+    for row in rows:
+        if taken is None and row.get("task") == tid:
+            taken = row
+        else:
+            remaining.append(row)
+    tmp = path + ".tmp." + str(os.getpid())
+    with open(tmp, "w") as f:
+        for row in remaining:
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp, path)
+if taken is None:
+    print("MATCHED=0")
+else:
+    print("MATCHED=1")
+    print("MSG_TYPE=" + shlex.quote(taken.get("type", "")))
+    print("FROM_HANDLE=" + shlex.quote(taken.get("from", "")))
+    print("TASK_ID=" + shlex.quote(taken.get("task", "")))
+    print("SUBJECT=" + shlex.quote(taken.get("subject", "")))
+PY
 }
 
 MSG_TYPE=""
@@ -189,14 +283,24 @@ else
       exit 0
     fi
 
+    # Check the spool BEFORE polling: a prior wait (ours or a different
+    # task's) may already have consumed and spooled the very message we're
+    # waiting for (see spool_take's own comment). Skips a redundant
+    # `check --wait` round trip when it has.
+    eval "$(spool_take "$TASK_FILTER")"
+    if [[ "${MATCHED:-0}" -eq 1 ]]; then
+      echo "Recovered spooled message type=$MSG_TYPE subject=$SUBJECT from=$FROM_HANDLE task=$TASK_ID" >&2
+      break
+    fi
+
     echo "Waiting (types=$TYPES timeout-ms=$REMAINING_MS task=$TASK_FILTER)…" >&2
     CHECK_JSON="$(orca orchestration check ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --wait --types "$TYPES" --timeout-ms "$REMAINING_MS" --json)"
     printf '%s\n' "$CHECK_JSON"
 
     eval "$(printf '%s' "$CHECK_JSON" | python3 -c '
-import json, sys, shlex
+import fcntl, json, os, sys, shlex
 
-task_filter = sys.argv[1]
+task_filter, spool_path = sys.argv[1], sys.argv[2]
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -250,15 +354,24 @@ else:
     print("TASK_ID=" + shlex.quote(selected["task"]))
     print("SUBJECT=" + shlex.quote(selected["subject"]))
 
-# Non-matching messages are never silently dropped from the record: each one
-# is logged to stderr (type/task/from/subject) even though it was already
-# consumed by the check call that returned it and cannot be un-consumed.
+# Non-matching messages are never silently dropped: each one is spooled (RC-3
+# -- see the spool_take comment above for why: the check call that returned
+# it has already consumed it, so whoever it actually belongs to would
+# otherwise wait for a message that already came and went) as well as logged
+# to stderr.
+if skipped and spool_path:
+    os.makedirs(os.path.dirname(spool_path) or ".", exist_ok=True)
+    with open(spool_path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(spool_path, "a") as f:
+            for s in skipped:
+                f.write(json.dumps(s) + "\n")
 for s in skipped:
     sys.stderr.write(
-        "  (skip) non-matching message type=%s task=%s from=%s subject=%s\n"
+        "  (skip) non-matching message type=%s task=%s from=%s subject=%s -- spooled for later\n"
         % (s["type"], s["task"], s["from"], s["subject"])
     )
-' "$TASK_FILTER")"
+' "$TASK_FILTER" "$SPOOL_FILE")"
 
     if ! [[ "${COUNT:-0}" =~ ^[0-9]+$ ]]; then COUNT=0; fi
     if [[ "$COUNT" -eq 0 ]]; then
@@ -284,8 +397,15 @@ fi
 if [[ "$should_close" -ne 1 ]]; then
   if [[ "$MSG_TYPE" == "decision_gate" ]]; then
     echo "decision_gate — leaving worker open; reply then re-wait." >&2
+    # RC-4: previously this state left no trace anywhere — orca-status.sh had
+    # no way to distinguish a worker correctly waiting on the coordinator's
+    # reply from one genuinely stuck, and orca-reap-task.sh's idle probe
+    # would (wrongly) start counting an unchanging screen against it. Marking
+    # the row lets both read the same fact instead of each guessing.
+    mark_ledger_status "$TASK_ID" "awaiting_reply"
   elif [[ "$MSG_TYPE" == "escalation" ]]; then
     echo "escalation — leaving worker open (use --close-on-escalation to force close)." >&2
+    mark_ledger_status "$TASK_ID" "awaiting_reply"
   fi
   exit 0
 fi

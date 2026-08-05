@@ -4,7 +4,7 @@
 |--------|---------|
 | `.orca/orchestration/scripts/orca-bootstrap-roles.sh` | Start 4 role workers + write `handles.json` |
 | `.orca/orchestration/scripts/orca-dispatch-role.sh` | Inject + **auto-reaper** (closes tab on complete); recreates dead tabs |
-| `.orca/orchestration/scripts/orca-reap-task.sh` | Background: poll dispatch status → `terminal close --tab` |
+| `.orca/orchestration/scripts/orca-reap-task.sh` | Background: poll dispatch status → `terminal close --tab`. Also detects a stalled worker (status stuck, screen unchanged, not busy) and closes on that too — `--idle-grace-ms`/`--idle-probe-ms`/`--idle-strikes`/`--no-close-on-idle` |
 | `.orca/orchestration/scripts/orca-wait-done.sh` | Optional blocking wait (+ close if reaper/worker missed); `--task ID` ignores any message for a different task instead of acting on it — pass it whenever you know the task id (`orca-dispatch-role.sh --wait` always does). Only one waiter at a time is supported: two concurrent `orca-wait-done.sh` processes race for the same `orca orchestration check` messages. |
 | `.orca/orchestration/scripts/orca-close-role.sh` | Manual close of role tab (`--tab`) |
 | `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / create / seed (sourced) |
@@ -45,8 +45,12 @@ orca orchestration check --wait --types worker_done,escalation,decision_gate --t
 ```
 
 When a dispatch misbehaves, run `orca-status.sh` first. It is the only place
-that surfaces `reap_failed` / `close_failed` rows — a worker tab that stayed
-open after its reaper gave up. Exit code 1 means something needs attention.
+that surfaces `reap_failed` / `close_failed` rows (a worker tab that stayed
+open after its reaper gave up) and `stalled` / `closed_stalled` rows (the
+idle probe found no progress — the tab may already be closed, but the task
+never actually reported done). `awaiting_reply` rows are not a problem: the
+worker is correctly idle, waiting on your reply to a `decision_gate` or
+`escalation`. Exit code 1 means something needs attention.
 
 `handles.json`, `dispatch-ledger.jsonl`, and `reapers/` are local-only; do not
 commit them. See `handles.example.json`.

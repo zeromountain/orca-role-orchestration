@@ -4,11 +4,27 @@
 # Polls `orca orchestration dispatch-show` (does NOT consume inbox messages).
 # On status completed|failed → `orca terminal close --tab`.
 #
+# Also watches for a STALLED worker (Task: deadlock fix): dispatch-show alone
+# cannot tell a genuinely working worker from one that crashed, hit a rate
+# limit, or had its own worker_done refused (see dispatch_tail_block's RUN
+# SCOPE comment in orca-roles-lib.sh) — every one of those leaves status
+# stuck exactly where it was, and this reaper used to poll all the way to
+# TIMEOUT_MS (1h) believing "may still be running" regardless. After
+# --idle-grace-ms, it periodically re-reads the worker's own screen
+# (_terminal_ready_check / _terminal_stability_key, orca-roles-lib.sh) and
+# treats an UNCHANGED, non-busy screen across --idle-strikes consecutive
+# probes as stalled: reports it, closes the tab, and marks the ledger
+# "closed_stalled" (or "stalled" with --no-close-on-idle). A BUSY verdict, or
+# any change in the normalized screen content, resets the streak — this must
+# never fire on a model that is still actually generating.
+#
 # Intended to be started in the background by orca-dispatch-role.sh so close
 # is automatic without the coordinator running wait-done or close-role.
 #
 # Usage:
 #   orca-reap-task.sh --task task_xxx --handle term_yyy [--role thrifty] [--timeout-ms N]
+#                      [--idle-grace-ms N] [--idle-probe-ms N] [--idle-strikes N]
+#                      [--no-close-on-idle]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -25,11 +41,17 @@ HANDLE=""
 ROLE=""
 TIMEOUT_MS=3600000   # 1h default reaper lifetime
 POLL_MS=5000
+IDLE_GRACE_MS=120000  # no idle probe before this much elapsed time
+IDLE_PROBE_MS=30000   # min gap between idle probes (a screen read, not free)
+IDLE_STRIKES=6        # consecutive unchanged probes before "stalled"
+CLOSE_ON_IDLE=1
 
 usage() {
   cat <<'EOF'
 Usage:
   orca-reap-task.sh --task <task_id> --handle <term_*> [--role ROLE] [--timeout-ms N] [--poll-ms N]
+                     [--idle-grace-ms N] [--idle-probe-ms N] [--idle-strikes N]
+                     [--no-close-on-idle]
 EOF
 }
 
@@ -40,6 +62,10 @@ while [[ $# -gt 0 ]]; do
     --role) ROLE="${2:?}"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     --poll-ms) POLL_MS="${2:?}"; shift 2 ;;
+    --idle-grace-ms) IDLE_GRACE_MS="${2:?}"; shift 2 ;;
+    --idle-probe-ms) IDLE_PROBE_MS="${2:?}"; shift 2 ;;
+    --idle-strikes) IDLE_STRIKES="${2:?}"; shift 2 ;;
+    --no-close-on-idle) CLOSE_ON_IDLE=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; usage; exit 1 ;;
   esac
@@ -48,6 +74,15 @@ done
 if [[ -z "$TASK_ID" || -z "$HANDLE" ]]; then
   usage
   exit 1
+fi
+
+# role_cli needs ORCH set for role_overrides (already sourced above); role may
+# legitimately be empty (older callers, or orca-close-role.sh-style direct
+# use) — _terminal_ready_check treats an empty/unknown cli as "no known
+# positive pattern", which is a real, handled case, not an error.
+ROLE_CLI=""
+if [[ -n "$ROLE" ]]; then
+  ROLE_CLI="$(role_cli "$ROLE" 2>/dev/null)" || ROLE_CLI=""
 fi
 
 close_handle() {
@@ -169,6 +204,125 @@ except Exception:
 PY
 }
 
+# $1=task_id → that task's own ledger row `status` field, or empty if none.
+# Read-only, no lock needed (a torn read at worst misses a very recent write
+# for one cycle; the next probe re-reads). Used only to check for
+# "awaiting_reply" (see below) — orca-wait-done.sh sets that status when a
+# decision_gate or an unclaimed escalation deliberately leaves the worker
+# open, waiting on the COORDINATOR, not stuck on its own.
+ledger_task_status() {
+  local tid="$1"
+  [[ -f "$LEDGER_FILE" ]] || { printf ''; return 0; }
+  python3 - "$LEDGER_FILE" "$tid" <<'PY' 2>/dev/null || true
+import json, sys
+path, tid = sys.argv[1:3]
+status = ""
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("taskId") == tid:
+                status = row.get("status") or ""
+except Exception:
+    pass
+print(status)
+PY
+}
+
+IDLE_STRIKE_COUNT=0
+IDLE_PREV_KEY=""
+
+# Idle/liveness probe, called at most once per IDLE_PROBE_MS from the main
+# loop below. Exits the whole script directly on a positive finding (gone, or
+# confirmed stalled); otherwise returns, having only updated the streak
+# counters above for next time.
+idle_probe() {
+  # Case 1: the terminal is already gone. This is the single most common
+  # real-world shape of the deadlock this reaper exists to catch — the
+  # worker's own AUTO-CLOSE instruction (dispatch_tail_block) says "after you
+  # send worker_done, immediately close", and a worker follows that even when
+  # the send itself was refused (legacy_read_only). dispatch-show then never
+  # moves off its prior status, and without this check the reaper would poll
+  # a dead terminal all the way to TIMEOUT_MS. terminal_is_live's contract:
+  # only rc 1 (definitely absent) is actioned; rc 2 (undetermined) falls
+  # through to the screen probe below, same as everywhere else in this repo.
+  local live_rc=0
+  terminal_is_live "$HANDLE" 2>/dev/null || live_rc=$?
+  if [[ "$live_rc" -eq 1 ]]; then
+    echo "reap: $HANDLE is gone but task $TASK_ID never left status=$STATUS — worker likely closed after its own worker_done was refused (no Run scope) or exited some other way"
+    mark_ledger "closed" "reason=terminal_gone_status_stuck"
+    exit 0
+  fi
+
+  # Case 2: the coordinator is deliberately waiting on THIS worker to reply
+  # (decision_gate, or an escalation nobody closed on — see
+  # orca-wait-done.sh). That worker is correctly idle, not stuck; never count
+  # strikes against it, and drop any streak already building so a stale
+  # measurement doesn't fire the instant the gate clears.
+  if [[ "$(ledger_task_status "$TASK_ID")" == "awaiting_reply" ]]; then
+    IDLE_STRIKE_COUNT=0
+    IDLE_PREV_KEY=""
+    return 0
+  fi
+
+  # Case 3: read the actual screen. Only two verdict shapes count as
+  # "evidence of no progress" — READY (worker is sitting at its own idle
+  # prompt) and NOT_READY(no-match) (screen doesn't match any known pattern,
+  # but is also not blank/vetoed/bad-status). Everything else — BUSY, or any
+  # of (unreadable)/(blank)/(status)/(vetoed) — resets the streak rather than
+  # guessing: this must never fire on a model that is still actively
+  # responding, which is exactly what BUSY means.
+  local verdict reason screen key
+  verdict="$(_terminal_ready_check "$HANDLE" "$ROLE_CLI")"
+  reason="$(printf '%s\n' "$verdict" | head -n1)"
+  screen="$(printf '%s\n' "$verdict" | tail -n +2)"
+
+  if [[ "$reason" == "READY" || "$reason" == "NOT_READY(no-match)"* ]]; then
+    key="$(_terminal_stability_key "$screen")"
+    if [[ -n "$IDLE_PREV_KEY" && "$key" == "$IDLE_PREV_KEY" ]]; then
+      IDLE_STRIKE_COUNT=$((IDLE_STRIKE_COUNT + 1))
+    else
+      IDLE_STRIKE_COUNT=1
+    fi
+    IDLE_PREV_KEY="$key"
+  else
+    IDLE_STRIKE_COUNT=0
+    IDLE_PREV_KEY=""
+  fi
+
+  if [[ "$IDLE_STRIKE_COUNT" -lt "$IDLE_STRIKES" ]]; then
+    return 0
+  fi
+
+  echo "reap: $HANDLE screen unchanged for $IDLE_STRIKE_COUNT probe(s) while task $TASK_ID stayed status=$STATUS — treating as stalled" >&2
+  printf '%s\n' "$screen" | tail -n 5 >&2
+
+  if [[ "$CLOSE_ON_IDLE" -eq 0 ]]; then
+    mark_ledger "stalled" "reason=idle_screen_unchanged"
+    echo "reap: --no-close-on-idle set — leaving $HANDLE open, not closing" >&2
+    IDLE_STRIKE_COUNT=0
+    IDLE_PREV_KEY=""
+    return 0
+  fi
+
+  local close_rc=0
+  close_handle "$HANDLE" || close_rc=$?
+  case "$close_rc" in
+    0) mark_ledger "closed_stalled" "reason=idle_screen_unchanged" ;;
+    1) mark_ledger "close_failed" "reason=idle_screen_unchanged" ;;
+    2) mark_ledger "close_undetermined" "reason=idle_screen_unchanged" ;;
+    *) mark_ledger "close_undetermined" "reason=idle_screen_unchanged" ;;
+  esac
+  echo "reap: FAILED — task $TASK_ID stalled (worker idle, dispatch-show never left status=$STATUS) — check orca-status.sh" >&2
+  exit 1
+}
+
 # Give up loudly. Deliberately does NOT close: when the status could not be
 # read the task may still be running, and killing a live worker is worse than
 # leaving it. The non-zero exit plus the ledger row is what makes the leak
@@ -207,11 +361,12 @@ print(status or "__parse_error__")
 ' 2>/dev/null || printf '__parse_error__'
 }
 
-echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS"
+echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS idle-grace-ms=$IDLE_GRACE_MS idle-probe-ms=$IDLE_PROBE_MS idle-strikes=$IDLE_STRIKES"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 POLL_S="$(python3 -c 'import sys; print(max(0.1, int(sys.argv[1])/1000))' "$POLL_MS")"
 PARSE_ERRORS=0
 MAX_PARSE_ERRORS=5
+NEXT_IDLE_PROBE_MS=$((START_MS + IDLE_GRACE_MS))
 
 while true; do
   NOW_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
@@ -249,11 +404,19 @@ while true; do
       ;;
     dispatched|pending|ready|running|unknown|"")
       PARSE_ERRORS=0
+      if [[ "$NOW_MS" -ge "$NEXT_IDLE_PROBE_MS" ]]; then
+        NEXT_IDLE_PROBE_MS=$((NOW_MS + IDLE_PROBE_MS))
+        idle_probe
+      fi
       sleep "$POLL_S"
       ;;
     *)
       # unknown future statuses: keep polling until timeout
       PARSE_ERRORS=0
+      if [[ "$NOW_MS" -ge "$NEXT_IDLE_PROBE_MS" ]]; then
+        NEXT_IDLE_PROBE_MS=$((NOW_MS + IDLE_PROBE_MS))
+        idle_probe
+      fi
       sleep "$POLL_S"
       ;;
   esac

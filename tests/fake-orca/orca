@@ -21,7 +21,7 @@
 set -uo pipefail
 
 STATE="${FAKE_ORCA_STATE:?FAKE_ORCA_STATE must be set}"
-mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli"
+mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli" "$STATE/screen"
 touch "$STATE/calls.log" "$STATE/terminals"
 
 printf '%s\n' "$*" >>"$STATE/calls.log"
@@ -160,11 +160,45 @@ PY
   "terminal read")
     maybe_fail terminal-read
     h="$(flag_val --terminal "$@")"
-    cli="$(cat "$STATE/cli/${h:-none}" 2>/dev/null || echo "")"
-    # A screen shaped to satisfy _terminal_ready_check's positive pattern for
-    # each CLI on the FIRST read, so the readiness gate inside seed() passes
-    # immediately instead of polling out to ROLE_READY_TIMEOUT_SECONDS.
-    python3 - "$h" "$cli" <<'PY'
+    # Two test-only overrides, checked before the default cli-keyed screen
+    # below (used by the idle-detection tests, R9/R11 — see tests/runtime.sh):
+    #   screen/<handle>.dynamic  — presence means "return DIFFERENT tail
+    #     content on every call", simulating a genuinely still-generating
+    #     model. A counter file tracks call count so consecutive reads never
+    #     produce an identical normalized screen.
+    #   screen/<handle>          — a static, literal tail (one line per file
+    #     line), for a screen that must never change across calls.
+    if [[ -f "$STATE/screen/${h:-none}.dynamic" ]]; then
+      n="$(cat "$STATE/screen/${h}.counter" 2>/dev/null || echo 0)"
+      n=$((n + 1))
+      printf '%s' "$n" >"$STATE/screen/${h}.counter"
+      python3 - "$h" "$n" <<'PY'
+import json, sys
+handle, n = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "ok": True,
+    "result": {
+        "terminal": {"handle": handle, "status": "running", "tail": [f"still generating chunk {n}", "❯ "]},
+    },
+}))
+PY
+    elif [[ -f "$STATE/screen/${h:-none}" ]]; then
+      python3 - "$h" "$STATE/screen/${h}" <<'PY'
+import json, sys
+handle, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    lines = f.read().splitlines()
+print(json.dumps({
+    "ok": True,
+    "result": {"terminal": {"handle": handle, "status": "running", "tail": lines}},
+}))
+PY
+    else
+      cli="$(cat "$STATE/cli/${h:-none}" 2>/dev/null || echo "")"
+      # A screen shaped to satisfy _terminal_ready_check's positive pattern for
+      # each CLI on the FIRST read, so the readiness gate inside seed() passes
+      # immediately instead of polling out to ROLE_READY_TIMEOUT_SECONDS.
+      python3 - "$h" "$cli" <<'PY'
 import json, sys
 handle, cli = sys.argv[1], sys.argv[2]
 # Keyed on the CLI binary (recorded at `terminal create` time from the launch
@@ -187,6 +221,7 @@ print(json.dumps({
     },
 }))
 PY
+    fi
     ;;
 
   "orchestration task-create")
@@ -210,6 +245,13 @@ PY
     maybe_fail check
     if [[ -f "$STATE/check.json" ]]; then
       cat "$STATE/check.json"
+      # `orchestration check` is destructive against the real inbox — a
+      # message it returns is consumed, not handed back again on the next
+      # call. Serving this fixture only once matches that: a test polling in
+      # a tight loop (no matching task id, no sleep between iterations —
+      # see orca-wait-done.sh) would otherwise pile up duplicate "spooled"
+      # copies of a message that, in reality, is only ever delivered once.
+      rm -f "$STATE/check.json"
     else
       printf '{"result":{"count":0,"messages":[]}}\n'
     fi

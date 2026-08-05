@@ -23,3 +23,6 @@
 # Orca local runtime state
 .orca/orchestration/debate-labels/
 .orca/orchestration/debate-manifests/
+
+# Orca local runtime state
+.orca/orchestration/*.lock

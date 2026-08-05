@@ -81,11 +81,26 @@ has its `worker_done` refused — the task stays `dispatched` forever even thoug
 the work finished. Every dispatch spec therefore carries a RUN SCOPE block
 telling the worker to add `--run` to its own calls. Measured: same role, same
 model, same task — `dispatched` without the block, `completed` with it.
+`orca-dispatch-role.sh` now refuses outright when no Run resolves, before
+`task-create` ever runs — a dispatch with no RUN SCOPE block would only ever
+strand a task, so the refusal costs nothing (see "Idle/stalled workers" below
+for the case where a dispatch went out before this fix and is stuck already).
 
 Left unbound, the failure is invisible at the point of cause: bootstrap and the
 debate preflight both pass, seats seed normally, and the work dies much later as
 worker timeouts that look like a model problem. `orca-debate.sh` therefore
 refuses up front instead of burning a round.
+
+**Idle/stalled workers.** `orca-reap-task.sh` cannot tell "still working" from
+"crashed, rate-limited, or its `worker_done` was refused" from `dispatch-show`
+status alone — that's `dispatched` in every one of those cases. After a grace
+period it also re-reads the worker's own screen, and closes the tab (ledger
+status `closed_stalled`, or `stalled` with `--no-close-on-idle`) once it has
+sat unchanged, not busy, for several consecutive probes. A worker the
+coordinator is deliberately waiting to reply to (`decision_gate`, or an
+unclaimed `escalation` — `orca-wait-done.sh` marks the ledger row
+`awaiting_reply`) is exempt: idle detection never fires on it. See
+`orca-reap-task.sh --help` for the `--idle-*` knobs.
 
 ## Skill layout
 
@@ -399,7 +414,7 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 
 Supervised workers must not linger after a task. Close is **automatic** on every `orca-dispatch-role.sh`:
 
-1. **Background reaper** (`orca-reap-task.sh`) polls `dispatch-show` and runs `orca terminal close --tab` when status is `completed` or `failed`. Does not consume inbox messages.
+1. **Background reaper** (`orca-reap-task.sh`) polls `dispatch-show` and runs `orca terminal close --tab` when status is `completed` or `failed`. Does not consume inbox messages. It also detects a **stalled** worker (status stuck, screen unchanged, not busy) after a grace period and closes on that too — see "Idle/stalled workers" above.
 2. **Worker AUTO-CLOSE block** is injected into every task spec: after `worker_done`, the worker runs the same close command on its handle.
 3. Next dispatch recreates a live terminal if the handle is dead/missing.
 

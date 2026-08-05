@@ -73,9 +73,9 @@ orca orchestration check --wait --types worker_done,escalation,decision_gate --t
 # the wrong tab): .orca/orchestration/scripts/orca-wait-done.sh --role thrifty --task task_xxx
 ```
 
-Role tabs are **ephemeral and auto-closed**: every dispatch starts a background reaper (`orca-reap-task.sh`) and injects an AUTO-CLOSE command into the worker. No manual close step. Next dispatch recreates a dead handle automatically.
+Role tabs are **ephemeral and auto-closed**: every dispatch starts a background reaper (`orca-reap-task.sh`) and injects an AUTO-CLOSE command into the worker. No manual close step. Next dispatch recreates a dead handle automatically. `orca-dispatch-role.sh` refuses to dispatch at all if no Run is bound (see `orca orchestration run-current`/`run-create` above) — a dispatch with no Run can never deliver `worker_done`, so it would only strand a task.
 
-Timeout / `count:0` = checkpoint, not failure if terminal still working.
+Timeout / `count:0` = checkpoint, not failure if terminal still working. The reaper also watches for a **stalled** worker — `dispatch-show` stuck, the worker's own screen unchanged and not busy for several probes — and closes on that too, distinct from a clean `completed`/`failed`. A worker deliberately left open on a `decision_gate` or unclaimed `escalation` (ledger status `awaiting_reply`) is exempt from stall detection.
 
 ## Limit failover
 
@@ -172,3 +172,8 @@ Always include project constraints from AGENTS.md / CLAUDE.md in the body.
 Section 3 lists dispatches that never reached `closed`. A `reap_failed` or
 `close_failed` row means the reaper gave up while the worker tab may still be
 open and billing — close it with `orca-close-role.sh <role|term_*>`.
+`stalled`/`closed_stalled` means the idle probe found a worker that stopped
+making progress (its tab may already be closed) — the task itself likely
+never actually reported done, worth a look regardless. `awaiting_reply` means
+a worker is correctly idle, waiting on your reply to a `decision_gate` or
+`escalation` — not a leak.
