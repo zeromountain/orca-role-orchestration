@@ -6,3 +6,8 @@ disable=SC1091
 # SC2294: the assert() helpers in tests/ take a condition as a string on
 #         purpose so the failing expression can be printed verbatim.
 disable=SC2294
+
+# SC2317: same root cause as SC2294 above — helper functions in tests/ are
+#         invoked only from inside strings that assert() later eval's, never
+#         as a direct call shellcheck's flow analysis can see.
+disable=SC2317

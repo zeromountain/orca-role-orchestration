@@ -28,6 +28,8 @@ ORCH="$(cd "$HERE/.." && pwd)"
 source "$HERE/orca-roles-lib.sh"
 # shellcheck source=orca-debate-lib.sh
 source "$HERE/orca-debate-lib.sh"
+# Read as a bare global by handles_get/ensure_terminal in orca-roles-lib.sh.
+# shellcheck disable=SC2034
 HANDLES_FILE="$ORCH/handles.json"
 
 DIR=""

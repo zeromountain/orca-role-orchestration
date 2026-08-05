@@ -433,6 +433,9 @@ PY
   # terminal_close_and_verify at all when do_close=0.
   local n_candidates=0 n_gone=0 n_would_close=0 n_still_live=0 n_undetermined=0 aborted=0
   local kind handle title role reason hrc
+  # `role` is unused below — `read` requires naming every positional field to
+  # parse the line correctly, even ones this loop body doesn't need.
+  # shellcheck disable=SC2034
   while IFS=$'\t' read -r kind handle title role reason; do
     [[ -z "$kind" ]] && continue
     case "$kind" in

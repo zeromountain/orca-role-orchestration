@@ -5,7 +5,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
-ROOT="$(cd "$ORCH/../.." && pwd)"
 # shellcheck source=orca-roles-lib.sh
 source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"

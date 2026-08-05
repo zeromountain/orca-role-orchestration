@@ -1214,7 +1214,16 @@ PY
 persona_body() {
   # $1 = role key. Echo persona file content minus the H1 and the STANCE comment.
   # Return non-zero if the file is absent (caller falls back to a hardcoded one-liner).
-  local role="$1" file="${ORCH:-.}/personas/$role.md"
+  #
+  # Two `local` statements, not one: word expansion for every word on a
+  # single `local a=... b=...$a...` line happens before either assignment
+  # takes effect, so `$role` inside a same-line `file=` would resolve to
+  # whatever `role` was ALREADY in scope before this line ran, not `$1`.
+  # Currently masked — persona_body's only caller already has an outer
+  # `role` matching what it passes in — but a future caller with a
+  # different outer `role` would silently build the wrong file path.
+  local role="$1"
+  local file="${ORCH:-.}/personas/$role.md"
   [[ -f "$file" ]] || return 1
   grep -vE '^# |^<!-- STANCE:' "$file"
 }

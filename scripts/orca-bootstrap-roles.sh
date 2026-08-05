@@ -85,6 +85,8 @@ if [[ -f "$ROOT/AGENTS.md" ]]; then
 elif [[ -f "$ROOT/CLAUDE.md" ]]; then
   CONSTRAINTS="Read and follow CLAUDE.md in the project root."
 else
+  # Read as a bare global by seed() in orca-roles-lib.sh.
+  # shellcheck disable=SC2034
   CONSTRAINTS="Follow repository conventions; never commit secrets."
 fi
 

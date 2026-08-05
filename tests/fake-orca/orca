@@ -65,7 +65,10 @@ SUB1="${1:-}"
 SUB2="${2:-}"
 
 case "$SUB1 $SUB2" in
-  "status "*|"status")
+  "status "*)
+    # The match word "$SUB1 $SUB2" always has an embedded space (even when
+    # $SUB2 is empty, giving "status "), so a bare "status" alternative here
+    # could never match — this pattern alone covers every case.
     maybe_fail status
     # bootstrap greps the literal string '"reachable": true' (json.dumps indent style)
     cat <<'JSON'

@@ -15,6 +15,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$(cd "$HERE/.." && pwd)"
 # shellcheck source=orca-roles-lib.sh
 source "$HERE/orca-roles-lib.sh"
+# Read as a bare global by handles_get/ensure_terminal in orca-roles-lib.sh.
+# shellcheck disable=SC2034
 HANDLES_FILE="$ORCH/handles.json"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
 

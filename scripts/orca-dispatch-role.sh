@@ -79,7 +79,9 @@ esac
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
 
-# Project context for seed() if recreate path runs
+# Project context for seed() if recreate path runs.
+# Read as a bare global by create_role in orca-roles-lib.sh.
+# shellcheck disable=SC2034
 WORKTREE="$(python3 - "$HANDLES_FILE" <<'PY' 2>/dev/null || echo active
 import json, sys
 with open(sys.argv[1]) as stream:
@@ -99,6 +101,8 @@ if [[ -f "$ROOT/AGENTS.md" ]]; then
 elif [[ -f "$ROOT/CLAUDE.md" ]]; then
   CONSTRAINTS="Read and follow CLAUDE.md in the project root."
 else
+  # Read as a bare global by seed() in orca-roles-lib.sh.
+  # shellcheck disable=SC2034
   CONSTRAINTS="Follow repository conventions; never commit secrets."
 fi
 
