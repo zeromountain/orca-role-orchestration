@@ -21,7 +21,7 @@
 set -uo pipefail
 
 STATE="${FAKE_ORCA_STATE:?FAKE_ORCA_STATE must be set}"
-mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail"
+mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli"
 touch "$STATE/calls.log" "$STATE/terminals"
 
 printf '%s\n' "$*" >>"$STATE/calls.log"
@@ -83,7 +83,13 @@ JSON
     maybe_fail terminal-create
     handle="term_$(next_id)"
     title="$(flag_val --title "$@")"
+    cmd="$(flag_val --command "$@")"
     printf '%s\t%s\n' "$handle" "$title" >>"$STATE/terminals"
+    # Record which CLI this handle is "running" so `terminal read` can answer
+    # the readiness gate (_terminal_ready_check in orca-roles-lib.sh) with a
+    # screen shaped correctly for that CLI — first word of the launch command.
+    mkdir -p "$STATE/cli"
+    printf '%s' "${cmd%% *}" >"$STATE/cli/$handle"
     printf '{"result":{"handle":"%s","title":"%s"}}\n' "$handle" "$title"
     ;;
 
@@ -101,7 +107,10 @@ JSON
     maybe_fail terminal-send
     h="$(flag_val --terminal "$@")"
     flag_val --text "$@" >>"$STATE/sends/${h:-unknown}"
-    printf '{"result":{"ok":true}}\n'
+    # seed() (orca-roles-lib.sh) accepts EITHER result.send.accepted or a
+    # top-level "ok" — top-level is what the real API returns (see the
+    # terminal-read handler's comment on the same point).
+    printf '{"ok":true,"result":{"ok":true}}\n'
     ;;
 
   "terminal list")
@@ -142,6 +151,38 @@ import json, os, sys
 path = sys.argv[1]
 preview = open(path).read() if os.path.exists(path) else ""
 print(json.dumps({"result": {"terminal": {"preview": preview}}}))
+PY
+    ;;
+
+  "terminal read")
+    maybe_fail terminal-read
+    h="$(flag_val --terminal "$@")"
+    cli="$(cat "$STATE/cli/${h:-none}" 2>/dev/null || echo "")"
+    # A screen shaped to satisfy _terminal_ready_check's positive pattern for
+    # each CLI on the FIRST read, so the readiness gate inside seed() passes
+    # immediately instead of polling out to ROLE_READY_TIMEOUT_SECONDS.
+    python3 - "$h" "$cli" <<'PY'
+import json, sys
+handle, cli = sys.argv[1], sys.argv[2]
+# Keyed on the CLI binary (recorded at `terminal create` time from the launch
+# command's first word), but seed()/_terminal_ready_check select behaviour by
+# AGENT name (role_meta's 3rd field) — "agy" the binary vs. "antigravity" the
+# agent for ui/fallback/debater_gemini. Cover both spellings.
+lines = {
+    "claude": ["bypass permissions on", "❯ "],
+    "grok":   ["❯ "],
+    "agy": [">"], "antigravity": [">"],
+}.get(cli, ["$ "])  # codex (and unknown): no positive pattern is required
+# "ok" is a TOP-LEVEL field (sibling of "result"), matching the real API —
+# _terminal_ready_check checks d.get("ok") on the outer object, not inside
+# "result". Nesting it there (as most other fake handlers here do for THEIR
+# own consumers) made every terminal read as unreadable regardless of CLI.
+print(json.dumps({
+    "ok": True,
+    "result": {
+        "terminal": {"handle": handle, "status": "running", "tail": lines},
+    },
+}))
 PY
     ;;
 

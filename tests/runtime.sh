@@ -30,6 +30,23 @@ assert() {
 tmproot="$(mktemp -d)"
 trap 'rm -rf "$tmproot"' EXIT
 export PATH="$FAKE_DIR:$PATH"
+# codex_trust_ensure (orca-roles-lib.sh) writes to $CODEX_HOME/config.toml
+# unconditionally whenever a codex-backed role is created — a real, global,
+# user-owned file by default, regardless of whether `orca` itself is faked.
+# Sandbox it so test runs never touch the developer's actual ~/.codex.
+export CODEX_HOME="$tmproot/codex-home"
+mkdir -p "$CODEX_HOME"
+
+# The terminal-readiness gate and seed-marker retry knobs (orca-roles-lib.sh)
+# default to real-CLI-boot-time scale (60s / 300s ceilings). The fake CLI
+# answers `terminal read`/`terminal send` instantly, so there is nothing to
+# wait out — these just make the suite run in seconds instead of minutes.
+export ROLE_READY_TIMEOUT_SECONDS=5
+export ROLE_READY_POLL_INTERVAL_SECONDS=1
+export ROLE_READY_MIN_ELAPSED_SECONDS=0
+export ROLE_BUSY_TIMEOUT_SECONDS=5
+export ROLE_SEED_MARKER_RETRIES=1
+export ROLE_SEED_MARKER_INTERVAL_SECONDS=0
 
 # new_project <name> → echoes the scripts dir; sets STATE/PROJ globals
 PROJ=""
@@ -106,13 +123,12 @@ assert R1_title_executor "grep -q role-sol-executor \"$STATE/calls.log\""
 assert R1_title_thrifty "grep -q role-grok-thrifty \"$STATE/calls.log\""
 assert R1_title_fallback "grep -q role-agy-fallback \"$STATE/calls.log\""
 assert R1_handles_parse "python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \"$H\""
-assert R1_architect_model "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-4-8\" else 1)' \"$H\""
+assert R1_architect_model "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-5\" else 1)' \"$H\""
 assert R1_four_live "[[ \"\$(live_titled role-)\" -eq 4 ]]"
-# A bootstrapped worker and a dispatch-recreated one must be told the same model
-# string. They were not: bootstrap seeded the display name ("Claude Opus 4.8"),
-# ensure_terminal seeded the model ID. Both go through ensure_terminal now.
+# A bootstrapped worker and a dispatch-recreated one must be told the same
+# model string — both paths route through ensure_terminal/role_meta now.
 arch_handle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["roles"]["architect"]["handle"])' "$H" 2>/dev/null || echo none)"
-assert R1_seed_model_id "grep -q 'claude-opus-4-8' \"$STATE/sends/$arch_handle\""
+assert R1_seed_model_id "grep -q 'claude-opus-5' \"$STATE/sends/$arch_handle\""
 
 # --- R2 reaper closes on completed (expected GREEN) ---
 echo "R2 reaper closes on completed"
@@ -146,6 +162,11 @@ assert R3_no_false_close "[[ \"\$(ledger_status task_r3)\" != closed ]]"
 # A `terminal list` hiccup must not be read as "already gone". The close is the
 # whole point of the reaper, so an unknown liveness result means attempt it
 # anyway — a redundant close is free, a skipped one leaks a billable session.
+# `terminal_close_and_verify` (orca-roles-lib.sh) then re-checks liveness to
+# confirm the close actually took: with `terminal list` still broken, that
+# confirmation is itself impossible, so the honest ledger status is
+# "close_undetermined", not "closed" — the terminal really is gone here (the
+# close call itself succeeds), the script just cannot prove it.
 echo "R4 close when liveness probe is unreadable  [regression: bug B]"
 new_project r4
 printf 'term_97\trole-sol-executor\n' >>"$STATE/terminals"
@@ -158,10 +179,16 @@ r4_rc=$?
 assert R4_exit0 "[[ $r4_rc -eq 0 ]]"
 assert R4_closed_anyway "[[ \"\$(calls_matching 'terminal close')\" -ge 1 ]]"
 assert R4_terminal_gone "[[ \"\$(live_titled term_97)\" -eq 0 ]]"
-assert R4_ledger_closed "[[ \"\$(ledger_status task_r4)\" == closed ]]"
+assert R4_ledger_undetermined "[[ \"\$(ledger_status task_r4)\" == close_undetermined ]]"
 
-# --- R4b close genuinely fails → escalate (RED until Tier 1.1/1.3) ---
-echo "R4b close genuinely fails  [regression: bug A]"
+# --- R4b close genuinely fails → visible in the ledger, not the exit code ---
+# orca-reap-task.sh deliberately exits 0 once a dispatch status was
+# successfully determined (completed/failed), regardless of how the close
+# itself went — the ledger status (closed/close_failed/close_undetermined) is
+# the failure signal for this path, not the process exit code. R3's timeout/
+# parse-error path is the one that escalates via exit 1; this is a different,
+# later failure mode where the reap CYCLE completed but the close did not.
+echo "R4b close genuinely fails  [regression]"
 new_project r4b
 printf 'term_96\trole-sol-executor\n' >>"$STATE/terminals"
 seed_ledger_row task_r4b term_96 executor
@@ -170,8 +197,8 @@ echo completed >"$STATE/status/task_r4b"
 "$SCRIPTS/orca-reap-task.sh" --task task_r4b --handle term_96 --poll-ms 100 --timeout-ms 3000 \
   >"$tmproot/r4b.log" 2>&1
 r4b_rc=$?
-assert R4b_nonzero_exit "[[ $r4b_rc -ne 0 ]]"
-assert R4b_not_marked_closed "[[ \"\$(ledger_status task_r4b)\" != closed ]]"
+assert R4b_exit0 "[[ $r4b_rc -eq 0 ]]"
+assert R4b_ledger_close_failed "[[ \"\$(ledger_status task_r4b)\" == close_failed ]]"
 assert R4b_terminal_still_live "[[ \"\$(live_titled term_96)\" -eq 1 ]]"
 
 # --- R5 concurrent ledger writers (RED until Tier 1.4) ---
@@ -277,7 +304,7 @@ H8="$PROJ/.orca/orchestration/handles.json"
 assert R8_exit0 "[[ $r8_rc -eq 0 ]]"
 assert R8_launch_overridden "grep -q 'claude --model claude-sonnet-5' \"$STATE/calls.log\""
 assert R8_model_recorded "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"thrifty\"][\"model\"]==\"claude-sonnet-5\" else 1)' \"$H8\""
-assert R8_default_role_intact "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-4-8\" else 1)' \"$H8\""
+assert R8_default_role_intact "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-5\" else 1)' \"$H8\""
 assert R8_no_grok_launch "! grep -q 'grok --model grok-4.5' \"$STATE/calls.log\""
 # The installer must never clobber this user-owned file.
 "$INSTALL" --project-root "$PROJ" --project-name r8 >"$tmproot/r8.reinstall.log" 2>&1

@@ -1,15 +1,21 @@
 # Orca Role Orchestration
 
-An installable Agent Skill and project scaffold for routing Orca Agent IDE work across four model-specific roles.
+An installable Agent Skill and project scaffold for routing Orca Agent IDE work across six model-specific roles, plus a four-model idea-debate mode.
 
 | Role | Default model | Best for |
 |---|---|---|
-| `architect` | Claude Opus 4.8 | Architecture, planning, high-risk review |
+| `architect` | Claude Opus 5 | Architecture, planning, high-risk review |
 | `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
 | `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
-| `fallback` | Gemini 3.5 Flash (Medium) via `agy` | Continuity after rate or session limits |
+| `ui` | Gemini 3.6 Flash (Medium) via `agy` | User-visible surface drafts, always routed back to architect for approval |
+| `reviewer` | Claude Opus 5 | Final pre-merge gate only — APPROVE/BLOCK, never implements |
+| `fallback` | Gemini 3.6 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
-The defaults are intentionally opinionated. Launch commands live in `scripts/orca-bootstrap-roles.sh` (not `roles.yaml`). Edit that script if you need different model IDs or CLI flags.
+Bootstrap starts the four primaries (`architect`/`executor`/`thrifty`/`fallback`); `ui` and
+`reviewer` tabs are created on their first dispatch. The idea-debate mode below adds four more
+read-only `debater_*` seats, one per provider.
+
+The defaults are intentionally opinionated. Launch commands live in `scripts/orca-roles-lib.sh` (`role_meta` / `role_launch_cmd`), not `roles.yaml` — edit that library if you need different model IDs or CLI flags.
 
 ## Prerequisites
 
@@ -140,8 +146,8 @@ script — for when you don't have one of the default CLIs:
 }
 ```
 
-Fields: `title`, `model`, `agent`, `launch_command`. Role **names** stay fixed at
-the four — they are wired into routing, DAGs, personas and every command file.
+Fields: `title`, `model`, `agent`, `launch_command`. Role **names** stay fixed —
+they are wired into routing, DAGs, personas and every command file.
 Bootstrap can also run a subset: `--roles architect,executor`.
 
 Then bootstrap workers (idempotent — re-run to finish a partial bootstrap):
@@ -152,9 +158,9 @@ orca repo add --path "$(pwd)" # only if the project is not already in Orca
 ```
 
 See [`SKILL.md`](./SKILL.md) for routing behavior and [`templates/PLAYBOOK.md`](./templates/PLAYBOOK.md)
-for the supervised lifecycle. Detail lives in [`references/`](./references):
-[installation](./references/installation.md) · [routing](./references/routing.md) ·
-[image generation](./references/image-generation.md) · [model roles](./references/model-roles.md).
+for the supervised lifecycle. Installation, update policy, and per-project overrides:
+[`references/installation.md`](./references/installation.md). Why each model holds its
+role: [`references/model-roles.md`](./references/model-roles.md).
 
 ## Development
 
@@ -173,11 +179,134 @@ failure paths. CI runs all three suites plus shellcheck on macOS and Ubuntu.
 
 Changes to managed files are recorded in [`CHANGELOG.md`](./CHANGELOG.md).
 
+## Using the skill
+
+Once the skill is loaded, ordinary requests route themselves — the scripts below are what the
+coordinator runs on your behalf, not something you normally type.
+
+| You ask for | Routed to | Shape |
+|---|---|---|
+| "Plan this refactor before anyone touches code" | `architect` | plan only, no edits |
+| "Implement the approved plan and get the build green" | `executor` | implement + verify |
+| "Map where auth lives" / "prototype this quickly" | `thrifty` | read-only survey, cheap changes |
+| "Draft the settings screen" | `ui` → `architect` | draft, then approval before implementing |
+| "Final check before merge" | `reviewer` | APPROVE / BLOCK, never implements |
+| "Make a hero image" | clarity gate → `executor` | Codex `$imagegen` only |
+| "Opus hit its limit — keep going" | `fallback` | continuity on Gemini Flash |
+| "Let's sharpen this idea" | four `debater_*` seats | [idea debate](#idea-debate) |
+
+Korean triggers work the same way (`역할 오케스트레이션`, `모델별 역할 분리`, `이미지 생성`,
+`아이디어 토론`, `니치 찾기`).
+
+Slash commands are the explicit form of the same routes — `/orca-role-orchestration:install`,
+`:bootstrap`, `:dispatch`, `:wait`, `:fallback`, `:debate`, `:close` in Claude Code, and
+`/orca-install`, `/orca-bootstrap`, `/orca-dispatch`, … in Codex.
+
+### Plan → implement → review
+
+The standard DAG, dispatched by hand. Each tab auto-closes when its task completes — there is no
+close step:
+
+```bash
+D=.orca/orchestration/scripts/orca-dispatch-role.sh
+
+# 1. Opus plans. No file edits in this pass.
+"$D" architect --spec "Plan only: add refresh-token rotation to the auth service.
+Constraints: follow AGENTS.md; no schema migration in this pass.
+Scope: src/auth/**. Done: numbered plan + risk list, zero file edits."
+
+# 2. Sol implements the approved plan and blocks until it reports back.
+"$D" executor --wait --spec "Implement the approved plan (rotation + revoke-on-reuse).
+Scope: src/auth/**, tests/auth/**. Done: pnpm typecheck && pnpm test:auth both green."
+
+# 3. Opus gates the diff. Review only.
+"$D" reviewer --spec "Pre-merge gate on the auth diff. APPROVE or BLOCK with reasons.
+Do not implement or rewrite."
+```
+
+Cheap work skips the ladder entirely — `"$D" thrifty --spec "Read-only: list every call site of
+issueToken(). No edits."`
+
+### Waiting on a result
+
+`--wait` on dispatch already pins the wait to that dispatch's own task. Waiting separately means
+passing the task id dispatch printed, otherwise the first matching message wins — including a
+leftover one from an unrelated flow:
+
+```bash
+.orca/orchestration/scripts/orca-wait-done.sh --task task_abc123 --timeout-ms 900000
+```
+
+A timeout or `count:0` is a checkpoint, not a failure.
+
+### Image generation
+
+Raster images route to `executor` through Codex `$imagegen`. If subject, intended use, or
+destination is missing, the coordinator asks before dispatching rather than inventing them:
+
+```bash
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --spec "
+Use Codex \$imagegen skill only
+(read \${CODEX_HOME:-\$HOME/.codex}/skills/.system/imagegen/SKILL.md).
+Goal: dark-mode hero image for the landing page.
+Subject: a single orca breaching over a calm night sea.
+Use: web hero, 16:9.
+Destination: public/img/hero.png
+Avoid: text, logos, brand marks.
+Done: final path + mode (built-in|CLI).
+"
+```
+
+Vector icon sets, repo-native logos, and shapes better done in CSS/SVG are not `$imagegen` work.
+
+### After a rate or session limit
+
+Hand the remaining work to the fallback seat instead of retrying the limited primary:
+
+```bash
+.orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect \
+  --spec "Continue: finish the rotation plan.
+Done so far: threat model + token schema. Remaining: revoke-on-reuse and rollout steps."
+```
+
+Fallback is continuity, not a default quality lane.
+
+## Idea debate
+
+Four models argue an idea into a niche direction — propose, critique each other anonymously,
+then converge:
+
+```bash
+.orca/orchestration/scripts/orca-debate.sh --topic "your idea or open question"
+```
+
+Transcript lands in `.orca/orchestration/debates/<slug>/` (gitignored); the decision document goes
+to `docs/ideas/`. Round output is written under a shuffled label from the start (`round-1/A.md`,
+never a model-named file); the label map and per-round manifest live outside the debate directory
+entirely, in `.orca/orchestration/debate-labels/` and `debate-manifests/` — nothing inside the
+debate directory itself, in a filename or in file contents, ever names a debater. See the
+anonymity guarantee and its limits under Security below. Only one debate runs at a time: starting
+a second one — same slug or a different one — while a debate is still live is refused, since
+terminals are reused per-role globally and two concurrent debates would otherwise collide in the
+same four sessions (a same-slug collision would also reset the live debate's tracked handles,
+leaving its tabs unprotected from the new driver's own cleanup).
+
 ## Security
 
 The default launch commands disable or bypass agent permission checks. Use them only in trusted repositories and review the commands before running `orca-bootstrap-roles.sh`. Remove the bypass flags if you want each provider's normal approval boundaries.
 
 Generated `.orca/orchestration/handles.json` files are local runtime state and must not be committed.
+
+**Idea-debate anonymity is not cryptographic.** The achievable guarantee is: nothing instructs a
+debater to deanonymize, and no single `diff`, `glob`, or file read *inside the debate directory*
+reveals authorship. Debaters run under the same permission-bypass flags as every other role, so
+this is enforced by the dispatch spec and persona (`templates/roles.yaml`'s `read_only` field is
+prompt-enforced, not a sandboxing fact) — a debater that ignored its instructions could still read
+`dispatch-ledger.jsonl`, `handles.json`, `terminal-journal.jsonl`, or `orca terminal list` titles,
+none of which live inside the debate directory but none of which are hidden from that process
+either. The transcript (`transcript.md`, inside the debate directory) is the one deliberate
+exception: it re-attributes each contribution by real short name for the human reader, written
+only after the debate has concluded and never referenced by any round spec.
 
 ## License
 

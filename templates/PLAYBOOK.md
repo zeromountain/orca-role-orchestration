@@ -6,10 +6,13 @@ Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 
 | Role | Model | CLI | Own |
 |------|-------|-----|-----|
-| **architect** | Claude Opus 4.8 | `claude` | Design, judgment, high-risk review |
+| **architect** | Claude Opus 5 | `claude` | Design, judgment, high-risk review |
 | **executor** | GPT-5.6 Sol | `codex` | Hard implement, terminal loops, verify, close work, raster images via `$imagegen` |
 | **thrifty** | Grok 4.5 | `grok` | Small tickets, explore, research, prototypes |
-| **fallback** | Gemini 3.5 Flash (Medium) | `agy` | **Rate/session limit only** |
+| **ui** | Gemini 3.6 Flash (Medium) | `agy` | User-visible surface, cheap drafts — every draft returns to architect for approval |
+| **reviewer** | Claude Opus 5 | `claude` | Final pre-merge gate only — APPROVE/BLOCK, never implements |
+| **fallback** | Gemini 3.6 Flash (Medium) | `agy` | **Rate/session limit only** |
+| **debater_*** | one seat per provider | claude/codex/grok/agy | Idea debate only — read-only, never implements |
 
 Principle: **Opus deepens, Sol closes, Grok widens.** Limit → agy Flash Medium.
 
@@ -50,6 +53,8 @@ Idempotent and resumable: a role whose tab is already live is reused, so re-runn
 after a partial failure finishes the job instead of rebuilding.
 
 Tabs: `role-opus-architect` · `role-sol-executor` · `role-grok-thrifty` · `role-agy-fallback`
+(`ui`, `reviewer`, and the `debater_*` seats are created lazily on their first dispatch —
+bootstrap only starts the four primaries above.)
 Handles: `.orca/orchestration/handles.json` (gitignore).
 
 ## Dispatch (supervised)
@@ -63,7 +68,9 @@ Only when user asks to supervise / coordinate / wait / DAG:
 
 # Optional: block until result (close is already automatic via reaper)
 orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json
-# or: .orca/orchestration/scripts/orca-wait-done.sh --role thrifty
+# or (always pass --task, the task_id printed by dispatch — bare --role can
+# act on a leftover message from an unrelated flow, e.g. a debate, and close
+# the wrong tab): .orca/orchestration/scripts/orca-wait-done.sh --role thrifty --task task_xxx
 ```
 
 Role tabs are **ephemeral and auto-closed**: every dispatch starts a background reaper (`orca-reap-task.sh`) and injects an AUTO-CLOSE command into the worker. No manual close step. Next dispatch recreates a dead handle automatically.
@@ -76,6 +83,22 @@ Timeout / `count:0` = checkpoint, not failure if terminal still working.
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --check-handle term_…
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue: …"
 ```
+
+## Idea debate
+
+```bash
+.orca/orchestration/scripts/orca-debate.sh --topic "…"
+.orca/orchestration/scripts/orca-debate.sh --topic "…" --judge architect
+.orca/orchestration/scripts/orca-debate.sh --topic "…" --debaters claude,codex,grok
+```
+
+propose → critique (anonymized) → converge. Four read-only seats, quorum 3, tabs persist between
+rounds and close when the driver exits. Transcript in `debates/<slug>/`; decision in `docs/ideas/`.
+
+A background watchdog (`orca-sweep-orphans.sh --watchdog`, started automatically) closes debater
+tabs on its own if the driver is killed or crashes mid-debate, so a lost driver never leaves a
+permission-bypassed session running unattended. Run `orca-sweep-orphans.sh` any time to report (or,
+with `--close`, close) any other untracked role/debate terminal.
 
 ## Routing cheat sheet
 
@@ -90,6 +113,9 @@ Timeout / `count:0` = checkpoint, not failure if terminal still working.
 | Research / alternatives | thrifty | architect critique → executor integrate |
 | Prototype (code/UI) | thrifty | architect before promote |
 | typecheck / build / test | executor | — |
+| UI/UX surface, layout, visual draft | ui | architect approval gate |
+| Final pre-merge gate | reviewer | — |
+| Idea research / brainstorm / find a niche | debate driver | — |
 
 ## Image generation clarity gate
 
@@ -117,6 +143,8 @@ Done: final path(s) + mode
 Plan → Execute → Review:  architect → executor|thrifty → architect(review-only)
 Image (clear brief):      executor ($imagegen)
 Image (ambiguous brief):  ask user → then executor ($imagegen)
+UI surface:               ui(draft) → architect(approve) → ui(implement) → architect(review)
+Idea debate:              propose → critique (anonymized) → converge → decide
 Cost ladder:              thrifty → executor → architect
 Limit:                    any primary → fallback (agy)
 Research:                 thrifty → architect → executor

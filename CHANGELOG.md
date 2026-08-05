@@ -5,6 +5,13 @@ the record of what changed under an existing install. Newest first.
 
 ## Unreleased
 
+This branch was written against a four-role scaffold and merged into `main`
+after it had independently grown a six-role model, an idea-debate mode, a
+terminal-readiness gate, and a Run-scope requirement. Several fixes below
+converged with equivalent, more thorough fixes already on `main` — those are
+noted inline; the merge kept `main`'s mechanism and layered this branch's
+fixes on top rather than duplicating either.
+
 ### Fixed — worker terminal leaks
 
 - **Reaper no longer expires silently.** `orca-reap-task.sh` collapsed every
@@ -18,8 +25,10 @@ the record of what changed under an existing install. Newest first.
   returned the same code for "confirmed gone" and "`orca terminal list` failed".
   The reaper read that as already-gone and skipped the close; `ensure_terminal`
   read it as dead and created a **second** terminal for a role that already had a
-  live one. It is now tri-state (live / gone / unknown): a close is always
-  attempted on unknown, and terminal creation refuses to guess.
+  live one. `main` independently converged on the same tri-state (live / gone /
+  unknown) fix, more thoroughly — it also distinguishes a handle that is present
+  but momentarily `connected:false` from one genuinely absent, which this branch
+  did not — so the merge kept `main`'s version.
 - **Concurrent ledger writers no longer drop rows.** One background reaper runs
   per in-flight dispatch, and `orca-wait-done.sh` may run alongside them. All did
   unlocked full-file read-modify-write over `dispatch-ledger.jsonl`, so the loser
@@ -28,10 +37,16 @@ the record of what changed under an existing install. Newest first.
 - **A corrupt `handles.json` no longer spawns a second fallback terminal.**
   `orca-fallback-on-limit.sh` could not tell "unreadable file" from "no fallback
   role" and created one on the guess. It now aborts with a repair hint.
-- **Close failures are reported.** All three copies of the close-and-swallow
-  block are replaced by one `close_terminal()` that distinguishes closed /
-  already-gone / failed; `orca-close-role.sh` and `orca-wait-done.sh` exit
-  non-zero on a genuine failure instead of printing "ok if already gone".
+- **Close failures are reported, not swallowed.** All three copies of a plain
+  "close, then trust the exit code" block used to print "ok if already gone"
+  regardless of the real outcome. `main` independently built the fix as
+  `terminal_close_and_verify()` — it re-checks liveness after the close
+  attempt instead of trusting the close call's own reported success, which is
+  stronger than this branch's original close-and-trust design, so the merge
+  kept `main`'s version and layered this branch's escalation on top: a reaper
+  that cannot confirm a close now records `close_failed` / `close_undetermined`
+  in the ledger and (for the separate case of an unreadable dispatch status)
+  exits non-zero instead of polling silently to its 1-hour timeout.
 
 ### Added
 
@@ -56,17 +71,20 @@ the record of what changed under an existing install. Newest first.
 
 ### Changed
 
-- **Bootstrap is idempotent and resumable.** It now calls `ensure_terminal` per
-  role instead of reimplementing create → wait → seed → record. A role whose tab
-  is live is reused, so re-running after a partial failure completes the
-  bootstrap rather than rebuilding it. No rollback: that would only destroy
-  working terminals.
-- **Role metadata exists once.** The title/model/agent triple was declared three
-  times in executable code — `role_meta()`, a dict in `handles_set()`, and a
-  third in bootstrap — and had already drifted: bootstrap seeded workers with the
-  display name ("Claude Opus 4.8") while dispatch seeded the model ID
-  ("claude-opus-4-8"), so the same role was told different things depending on
-  who started it. `role_meta()` is now the only source.
+- **Bootstrap is idempotent and resumable.** This branch's fix called
+  `ensure_terminal` per role instead of reimplementing create → wait → seed →
+  record. `main` independently arrived at the same idempotent-recreate design
+  for `ensure_terminal` itself, more thoroughly — a per-terminal creation
+  journal, durable-handle-before-seed ordering, and per-role failure isolation
+  in bootstrap's own three-phase loop — so the merge kept `main`'s version.
+- **Role metadata exists once.** The title/model/agent triple was declared
+  twice in executable code — `role_meta()` and a separate dict inside
+  `handles_set()` — and had drifted: bootstrap seeded workers with the
+  display name ("Claude Opus 4.8"/"Claude Opus 5") while dispatch seeded the
+  model ID ("claude-opus-4-8"/"claude-opus-5"), so the same role was told
+  different things depending on who started it. `role_meta()` is now the
+  only source, and it also resolves `roles.local.json` overrides, so a
+  customized role's recorded metadata is truthful too.
 - **Backups rotate.** A changed managed file still becomes `.bak`, but an
   existing `.bak` moves to `.bak.1`, `.bak.2`, … A fork used to survive one
   upgrade and be silently lost on the next.

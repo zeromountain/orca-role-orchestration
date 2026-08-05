@@ -54,6 +54,11 @@ EOF
   esac
 done
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found on PATH — required by this installer and by every runtime script." >&2
+  exit 1
+fi
+
 if [[ -z "$ROOT" ]]; then
   ROOT="$(pwd)"
 fi
@@ -87,13 +92,61 @@ skill_version() {
   fi
 }
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 not found on PATH — required for install and for every runtime script." >&2
-  exit 1
-fi
-
 VERSION="$(skill_version)"
 echo "orca-role-orchestration ${VERSION} → ${ROOT} (project=${PROJECT_NAME})"
+
+MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh"
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+  echo "Removing managed scaffold from $ORCH"
+  KEPT=""
+  for s in $MANAGED_SCRIPTS; do
+    [[ -f "$SCRIPTS_DST/$s" ]] && rm -f "$SCRIPTS_DST/$s" && echo "  removed scripts/$s"
+  done
+  rmdir "$SCRIPTS_DST" 2>/dev/null || true
+  for f in roles.yaml PLAYBOOK.md SCRIPTS.md handles.example.json install-manifest.json; do
+    [[ -f "$ORCH/$f" ]] && rm -f "$ORCH/$f" && echo "  removed $f"
+  done
+  # Personas are removed only when they still match the shipped template —
+  # a forked persona is the user's, same policy as a normal install/--reset.
+  for p in "$TPL"/personas/*.md; do
+    base="$(basename "$p")"
+    dst="$ORCH/personas/$base"
+    [[ -f "$dst" ]] || continue
+    tmp="$(mktemp)"
+    if [[ "$p" == *.md ]]; then
+      python3 - "$p" "$tmp" "$PROJECT_NAME" <<'PY'
+import pathlib, sys
+source, destination, project_name = sys.argv[1:4]
+text = pathlib.Path(source).read_text()
+pathlib.Path(destination).write_text(text.replace("{{PROJECT_NAME}}", project_name))
+PY
+    else
+      cp "$p" "$tmp"
+    fi
+    if cmp -s "$tmp" "$dst"; then
+      rm -f "$dst"
+      echo "  removed personas/$base"
+    else
+      KEPT="$KEPT personas/$base"
+    fi
+    rm -f "$tmp"
+  done
+  rmdir "$ORCH/personas" 2>/dev/null || true
+  for f in project_hints.yaml roles.local.json handles.json dispatch-ledger.jsonl; do
+    [[ -e "$ORCH/$f" ]] && KEPT="$KEPT $f"
+  done
+  [[ -d "$ORCH/reapers" ]] && KEPT="$KEPT reapers/"
+  echo ""
+  if [[ -n "$KEPT" ]]; then
+    echo "Kept (yours):$KEPT"
+    echo "  Delete manually if you want them gone: rm -rf $ORCH"
+  else
+    rmdir "$ORCH" 2>/dev/null || true
+    echo "Nothing of yours was left behind."
+  fi
+  exit 0
+fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$ORCH" "$SCRIPTS_DST" "$ORCH/personas"
@@ -133,8 +186,9 @@ PY
 }
 
 # Keep .bak as the newest backup but never destroy an older one: an existing
-# .bak rotates to .bak.1/.bak.2/… first. A fork used to survive one upgrade and
-# then be silently lost on the next, when .bak was overwritten.
+# .bak rotates to .bak.1/.bak.2/… first. Without this, a forked managed file
+# survives one upgrade (captured in .bak) and is silently lost on the next
+# upgrade, when that .bak is itself overwritten.
 backup_file() {
   local dst="$1" n=1
   if [[ -f "${dst}.bak" ]]; then
@@ -184,50 +238,8 @@ write_managed() {
   fi
 }
 
-if [[ "$UNINSTALL" -eq 1 ]]; then
-  echo "Removing managed scaffold from $ORCH"
-  KEPT=""
-  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh \
-           orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh \
-           orca-status.sh; do
-    [[ -f "$SCRIPTS_DST/$s" ]] && rm -f "$SCRIPTS_DST/$s" && echo "  removed scripts/$s"
-  done
-  rmdir "$SCRIPTS_DST" 2>/dev/null || true
-  for f in roles.yaml PLAYBOOK.md SCRIPTS.md handles.example.json install-manifest.json; do
-    [[ -f "$ORCH/$f" ]] && rm -f "$ORCH/$f" && echo "  removed $f"
-  done
-  # Personas are removed only when they still match the shipped template.
-  for p in "$TPL"/personas/*.md; do
-    base="$(basename "$p")"
-    dst="$ORCH/personas/$base"
-    [[ -f "$dst" ]] || continue
-    rendered="$(render_to_tmp "$p")"
-    if cmp -s "$rendered" "$dst"; then
-      rm -f "$dst"
-      echo "  removed personas/$base"
-    else
-      KEPT="$KEPT personas/$base"
-    fi
-    rm -f "$rendered"
-  done
-  rmdir "$ORCH/personas" 2>/dev/null || true
-  for f in project_hints.yaml roles.local.json handles.json dispatch-ledger.jsonl; do
-    [[ -e "$ORCH/$f" ]] && KEPT="$KEPT $f"
-  done
-  [[ -d "$ORCH/reapers" ]] && KEPT="$KEPT reapers/"
-  echo ""
-  if [[ -n "$KEPT" ]]; then
-    echo "Kept (yours):$KEPT"
-    echo "  Delete manually if you want them gone: rm -rf $ORCH"
-  else
-    rmdir "$ORCH" 2>/dev/null || true
-    echo "Nothing of yours was left behind."
-  fi
-  exit 0
-fi
-
 # --- one-time migration: pre-split roles.yaml → project_hints.yaml ---
-if [[ -f "$ORCH/roles.yaml" && ! -f "$ORCH/project_hints.yaml" ]]; then
+if [[ "$DRY_RUN" -eq 0 && -f "$ORCH/roles.yaml" && ! -f "$ORCH/project_hints.yaml" ]]; then
   python3 - "$ORCH/roles.yaml" "$ORCH/project_hints.yaml" "$TPL/project_hints.yaml" "$PROJECT_NAME" <<'PY'
 import pathlib
 import re
@@ -362,7 +374,7 @@ write_managed "$TPL/PLAYBOOK.md" "$ORCH/PLAYBOOK.md" "PLAYBOOK.md"
 write_managed "$TPL/SCRIPTS.md" "$ORCH/SCRIPTS.md" "SCRIPTS.md"
 write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.example.json"
 
-for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh; do
+for s in $MANAGED_SCRIPTS; do
   write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
 
@@ -370,7 +382,7 @@ done
 # Never touch the skill package's own scripts/ when installing into the skill repo itself.
 OLD_SCRIPTS_DIR="$ROOT/scripts"
 if [[ "$DRY_RUN" -eq 0 && "$ROOT" != "$SKILL_DIR" && -d "$OLD_SCRIPTS_DIR" && "$OLD_SCRIPTS_DIR" != "$SCRIPTS_DST" ]]; then
-  for s in orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh; do
+  for s in $MANAGED_SCRIPTS; do
     if [[ -f "$OLD_SCRIPTS_DIR/$s" ]]; then
       # Skip if this is the skill source file (same path as SCRIPTS_SRC)
       if [[ "$OLD_SCRIPTS_DIR/$s" -ef "$SCRIPTS_SRC/$s" ]]; then
@@ -387,7 +399,6 @@ fi
 # --- write install-manifest.json ---
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "(dry run — no files written)"
-  print_list_dry() { :; }
 else
 python3 - "$MANIFEST" "$VERSION" "$ORCH" <<'PY'
 import hashlib
@@ -422,28 +433,24 @@ data = {
 }
 pathlib.Path(manifest_path).write_text(json.dumps(data, indent=2) + "\n")
 PY
-
 fi   # end DRY_RUN guard for manifest
 
 # gitignore local runtime state
 if [[ "$DRY_RUN" -eq 0 ]]; then
 GI="$ROOT/.gitignore"
-# All local runtime state, not just handles.json — the ledger, its lock, and the
-# reaper pid/log files all churn on every dispatch and would otherwise leave the
-# consumer's `git status` permanently dirty.
-IGNORE_BLOCK='# Orca local runtime state (do not commit)
-.orca/orchestration/handles.json
-.orca/orchestration/dispatch-ledger.jsonl
-.orca/orchestration/*.lock
-.orca/orchestration/reapers/'
-if [[ -f "$GI" ]]; then
-  if ! grep -qF '.orca/orchestration/dispatch-ledger.jsonl' "$GI" 2>/dev/null; then
-    printf '\n%s\n' "$IGNORE_BLOCK" >> "$GI"
-    REPORT_REFRESHED+=(".gitignore")
+touch "$GI"
+gi_added=0
+for entry in '.orca/orchestration/handles.json' '.orca/orchestration/dispatch-ledger.jsonl' '.orca/orchestration/*.lock' '.orca/orchestration/reapers/' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/'; do
+  if ! grep -qF "$entry" "$GI" 2>/dev/null; then
+    if [[ "$gi_added" -eq 0 ]]; then
+      printf '\n# Orca local runtime state\n' >> "$GI"
+      gi_added=1
+    fi
+    printf '%s\n' "$entry" >> "$GI"
   fi
-else
-  printf '%s\n' "$IGNORE_BLOCK" > "$GI"
-  REPORT_INSTALLED+=(".gitignore")
+done
+if [[ "$gi_added" -eq 1 ]]; then
+  REPORT_REFRESHED+=(".gitignore")
 fi
 
 # Optional AGENTS.md snippet
@@ -456,21 +463,25 @@ $MARKER
 
 | Role | Model | CLI |
 |------|-------|-----|
-| architect | Claude Opus 4.8 | \`claude\` |
+| architect | Claude Opus 5 | \`claude\` |
 | executor | GPT-5.6 Sol | \`codex\` |
 | thrifty | Grok 4.5 | \`grok\` |
-| fallback | Gemini 3.5 Flash (Medium) | \`agy\` |
+| ui | Gemini 3.6 Flash (Medium) | \`agy\` |
+| reviewer | Claude Opus 5 | \`claude\` |
+| fallback | Gemini 3.6 Flash (Medium) | \`agy\` |
+| debater_* | one seat per provider | debate only, read-only |
 
 - Managed routing: \`.orca/orchestration/roles.yaml\`
 - Project hints (yours): \`.orca/orchestration/project_hints.yaml\`
 - Playbook: \`.orca/orchestration/PLAYBOOK.md\`
 - Bootstrap: \`.orca/orchestration/scripts/orca-bootstrap-roles.sh\`
 - Dispatch: \`.orca/orchestration/scripts/orca-dispatch-role.sh <role> --spec "…"\`
+- Idea debate: \`.orca/orchestration/scripts/orca-debate.sh --topic "…"\`
 - Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
+- Doctor: \`.orca/orchestration/scripts/orca-status.sh\`
 EOF
   REPORT_REFRESHED+=("AGENTS.md (section appended)")
 fi
-
 fi   # end DRY_RUN guard for gitignore/AGENTS.md
 
 # --- report ---
@@ -489,7 +500,11 @@ print_list "refreshed" "${REPORT_REFRESHED[@]+"${REPORT_REFRESHED[@]}"}"
 print_list "preserved" "${REPORT_PRESERVED[@]+"${REPORT_PRESERVED[@]}"}"
 print_list "migrated" "${REPORT_MIGRATED[@]+"${REPORT_MIGRATED[@]}"}"
 
-echo "Done."
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "Dry run — nothing written. Re-run without --dry-run to apply."
+else
+  echo "Done."
+fi
 echo "Next:"
 echo "  1) Customize .orca/orchestration/project_hints.yaml if needed"
 echo "  2) orca repo add --path $ROOT   # if not already in Orca"

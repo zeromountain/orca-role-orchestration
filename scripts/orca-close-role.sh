@@ -14,7 +14,7 @@ HANDLES_FILE="$ORCH/handles.json"
 usage() {
   cat <<'EOF'
 Usage:
-  orca-close-role.sh <architect|executor|thrifty|fallback|term_*>
+  orca-close-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}|term_*>
 
 Closes the role's Orca terminal (kills PTY). Safe to call twice.
 Does not edit handles.json — next dispatch recreates via ensure_terminal.
@@ -30,8 +30,9 @@ if [[ "$TARGET" == term_* ]]; then
   HANDLE="$TARGET"
 else
   case "$TARGET" in
-    architect|executor|thrifty|fallback) ;;
-    *) echo "role must be architect|executor|thrifty|fallback|term_*" >&2; exit 1 ;;
+    architect|executor|thrifty|ui|reviewer|fallback) ;;
+    debater_claude|debater_codex|debater_grok|debater_gemini) ;;
+    *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}|term_*" >&2; exit 1 ;;
   esac
   if [[ ! -f "$HANDLES_FILE" ]]; then
     echo "No $HANDLES_FILE — nothing to close (ok)"
@@ -45,14 +46,46 @@ if [[ -z "${HANDLE// }" ]]; then
   exit 0
 fi
 
+# terminal_is_live's 3-state contract: 0 live / 1 definitely dead / 2 could
+# not determine. Only a definite dead short-circuits here — an undetermined
+# result must NOT be treated as "already gone" (that's the same mistake that
+# used to let ensure_terminal spin up a duplicate terminal). Note this is a
+# different question from ensure_terminal's "leave it alone, don't recreate":
+# here the caller explicitly asked to close, and the close attempt below is
+# the same idempotent call already used for a confirmed-live handle — it
+# already tolerates a handle that turns out to be gone (see the trailing
+# else branch), so falling through on "undetermined" is safe either way.
+CLOSE_LIVE_RC=0
+terminal_is_live "$HANDLE" || CLOSE_LIVE_RC=$?
+if [[ "$CLOSE_LIVE_RC" -eq 1 ]]; then
+  echo "Handle $HANDLE already gone (ok)"
+  exit 0
+fi
+if [[ "$CLOSE_LIVE_RC" -eq 2 ]]; then
+  echo "Handle $HANDLE liveness undetermined (present but disconnected, or orca terminal list unavailable) — attempting close anyway" >&2
+fi
+
 echo "Closing $TARGET → $HANDLE (tab)"
-close_terminal "$HANDLE"
-case "$?" in
-  0) echo "Closed $HANDLE"; exit 0 ;;
-  1) echo "Handle $HANDLE already gone (ok)"; exit 0 ;;
-  *)
-    echo "Close FAILED for $HANDLE — Orca may be unreachable." >&2
-    echo "  Check: orca status --json" >&2
+# terminal_close_and_verify (orca-roles-lib.sh) does not just fire the close
+# call and trust its reported success — it re-checks terminal_is_live
+# afterward. A close that leaves the terminal still live is exactly the
+# defect this guards against (closes were previously reported as success
+# unconditionally), so that case is reported LOUDLY and this script exits
+# non-zero instead of silently swallowing it. Prefer --tab inside that
+# helper so the whole sub-session leaves the sidebar (not just the pane).
+VERIFY_RC=0
+terminal_close_and_verify "$HANDLE" || VERIFY_RC=$?
+case "$VERIFY_RC" in
+  0)
+    echo "Closed $HANDLE (confirmed gone)"
+    exit 0
+    ;;
+  1)
+    echo "ERROR: $HANDLE is STILL LIVE after a close attempt for $TARGET — close did not take effect" >&2
     exit 1
+    ;;
+  2)
+    echo "Closed $HANDLE (close attempted; could not confirm it is gone — liveness undetermined, orca terminal list unavailable)"
+    exit 0
     ;;
 esac

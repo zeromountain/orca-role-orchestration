@@ -10,3 +10,16 @@
 # Orca dispatch close ledger (local)
 # Orca local terminal handles
 # Superpowers SDD working scratch (ledger, briefs, review packages)
+
+# Orca local runtime state
+.orca/orchestration/debates/
+
+# Orca local runtime state
+.orca/orchestration/terminal-journal.jsonl
+
+# Orca local runtime state
+.orca/orchestration/debate-locks/
+
+# Orca local runtime state
+.orca/orchestration/debate-labels/
+.orca/orchestration/debate-manifests/

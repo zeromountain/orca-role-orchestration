@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Failover primary role → Antigravity Gemini 3.5 Flash (Medium).
+# Failover primary role → the fallback role's model. Model comes from
+# orca-roles-lib.sh (role_meta / role_launch_cmd) — never hardcode it here.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -9,6 +10,7 @@ ROOT="$(cd "$ORCH/../.." && pwd)"
 source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 DISPATCH="$HERE/orca-dispatch-role.sh"
+FALLBACK_MODEL="$(role_meta fallback | cut -f2)"
 FROM=""
 SPEC=""
 SPEC_FILE=""
@@ -78,11 +80,12 @@ if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
 if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
 
 # 0 = fallback handle present, 1 = genuinely absent, 2 = file unreadable.
-# Treating 2 as "absent" is what spawns a SECOND role-agy-fallback terminal
-# when a reader catches handles.json mid-write.
+# Treating 2 the same as 1 is what used to spawn a SECOND role-agy-fallback
+# terminal when a reader caught handles.json mid-write from a concurrent
+# bootstrap/dispatch — corrupt and absent look identical to a bare `!` check.
 fallback_state() {
   [[ -f "$HANDLES_FILE" ]] || return 1
-  python3 - "$HANDLES_FILE" <<'PY'
+  python3 -c '
 import json, sys
 try:
     with open(sys.argv[1]) as stream:
@@ -93,7 +96,7 @@ if not isinstance(d, dict):
     raise SystemExit(2)
 handle = (d.get("roles") or {}).get("fallback", {}).get("handle") or d.get("fallback")
 raise SystemExit(0 if handle else 1)
-PY
+' "$HANDLES_FILE"
 }
 
 fallback_state
@@ -114,14 +117,51 @@ with open(sys.argv[1]) as stream:
     print(json.load(stream).get("worktree", "active"))
 PY
 )"
-  WORKTREE="$WT"
-  FB="$(create_role "$(role_meta fallback | cut -f1)" "$(role_launch_cmd fallback)")"
-  handles_set "$HANDLES_FILE" fallback "$FB"
-  echo "fallback handle: $FB"
+  CREATE="$(orca terminal create --worktree "$WT" --title "role-agy-fallback" \
+    --command "$(role_launch_cmd fallback)" --json)"
+  FB="$(printf '%s' "$CREATE" | python3 -c '
+import json,sys
+d=json.load(sys.stdin); r=d.get("result") or d
+print(r.get("handle") or (r.get("terminal") or {}).get("handle") or "")
+')"
+  orca terminal rename --terminal "$FB" --title "role-agy-fallback" --json >/dev/null 2>&1 || true
+  # Locked + atomic: bootstrap or a dispatch-triggered ensure_terminal recreate
+  # can rewrite the same file concurrently with this fallback creation.
+  python3 - "$HANDLES_FILE" "$FB" "$FALLBACK_MODEL" <<'PY'
+import datetime, fcntl, json, os, sys
+path, fb, model = sys.argv[1:4]
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path + ".lock", "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        d = json.load(open(path)) if os.path.exists(path) else {}
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("roles", {})
+    d["fallback"] = fb
+    d["roles"]["fallback"] = {
+        "handle": fb, "title": "role-agy-fallback",
+        "model": model, "agent": "antigravity", "cli": "agy",
+    }
+    d["limit_failover"] = {
+        "enabled": True, "target_role": "fallback",
+        "model": model,
+        "script": ".orca/orchestration/scripts/orca-fallback-on-limit.sh",
+    }
+    d["updatedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+print("fallback handle:", fb)
+PY
 fi
 
 if preview_limited "$HANDLE"; then
-  echo "Detected limit on $HANDLE — failing over to agy Gemini 3.5 Flash (Medium)"
+  echo "Detected limit on $HANDLE — failing over to agy $FALLBACK_MODEL"
 else
   echo "No explicit limit pattern; failing over as requested"
 fi
@@ -129,7 +169,7 @@ fi
 FULL_SPEC="$(cat <<EOF
 [FAILOVER from $FROM / $HANDLE]
 Primary agent hit rate/session limit or was manually failed over.
-Continue with Gemini 3.5 Flash (Medium). Prefer finishing over redesign.
+Continue with $FALLBACK_MODEL. Prefer finishing over redesign.
 Follow project AGENTS.md / CLAUDE.md constraints if present.
 
 TASK:
@@ -139,4 +179,16 @@ EOF
 
 "$DISPATCH" fallback --spec "$FULL_SPEC"
 echo "Failover dispatched to ROLE=fallback."
-echo "Wait+auto-close: .orca/orchestration/scripts/orca-wait-done.sh --role fallback --timeout-ms 900000"
+# This script deliberately does NOT print (or parse out) its own wait-done
+# command. The dispatch above runs WITHOUT --wait, so orca-dispatch-role.sh
+# reaches its own trailing summary and has already streamed a complete,
+# copy-pasteable "optional block:" line pinned to this exact task id — its
+# stdout is not captured here, so the user saw it live. Re-printing it would
+# be pure duplication, and the earlier attempt at that duplicated it in a
+# STRICTLY WORSE form: a `--task <placeholder>` the user had to hand-edit,
+# plus `--timeout-ms 900000`, which is already orca-wait-done.sh's own
+# default. Harvesting the real id here would mean capturing the dispatcher's
+# stdout, which costs the live streaming this interactive failover tool wants
+# (terminal create + the readiness gate can block for tens of seconds) and
+# buys nothing the dispatcher has not already printed.
+echo "  (to block on completion: run the 'optional block' command printed above — it is already pinned to this task id, and its default timeout is 900000ms)"
