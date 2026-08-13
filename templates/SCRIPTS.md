@@ -3,12 +3,14 @@
 | Script | Purpose |
 |--------|---------|
 | `.orca/orchestration/scripts/orca-bootstrap-roles.sh` | Start 4 role workers + write `handles.json` |
-| `.orca/orchestration/scripts/orca-dispatch-role.sh` | Inject + **auto-reaper** (closes tab on complete); recreates dead tabs |
-| `.orca/orchestration/scripts/orca-reap-task.sh` | Background: poll dispatch status → `terminal close --tab`. Also detects a stalled worker (status stuck, screen unchanged, not busy) and closes on that too — `--idle-grace-ms`/`--idle-probe-ms`/`--idle-strikes`/`--no-close-on-idle` |
-| `.orca/orchestration/scripts/orca-wait-done.sh` | Optional blocking wait (+ close if reaper/worker missed); `--task ID` ignores any message for a different task instead of acting on it — pass it whenever you know the task id (`orca-dispatch-role.sh --wait` always does). Only one waiter at a time is supported: two concurrent `orca-wait-done.sh` processes race for the same `orca orchestration check` messages. |
+| `.orca/orchestration/scripts/orca-dispatch-role.sh` | Create a task + `worker-start` + **auto-reaper**; recreates dead tabs. `--after task_id[,…]` for a one-off dependency |
+| `.orca/orchestration/scripts/orca-dispatch-dag.sh` | Wire a role DAG pattern (`plan-exec-review`\|`ui`\|`explore`) in one shot — creates every step with `--deps`, dispatches only the first (ready) step |
+| `.orca/orchestration/scripts/orca-dispatch-existing.sh` | Attach a worker to an ALREADY-CREATED task — a later DAG wave, or `--retry-of <dispatch_id>` for same-role crash recovery (not cross-role failover — see `references/orca-contract-2026-08-13.md`) |
+| `.orca/orchestration/scripts/orca-reap-task.sh` | Background: poll worker/dispatch status → `worker-release` (falls back to this package's own close when Orca reports the tab retained). Also detects a stalled worker (status stuck, screen unchanged, not busy) and reports it in the ledger — never closes on idle alone (Orca's contract forbids that) — `--idle-grace-ms`/`--idle-probe-ms`/`--idle-strikes` |
+| `.orca/orchestration/scripts/orca-wait-done.sh` | Optional blocking wait (+ close if reaper/worker missed); acks every batch it fully processes. `--task ID` ignores any message for a different task instead of acting on it — pass it whenever you know the task id (`orca-dispatch-role.sh --wait` always does). Only one waiter at a time is supported: two concurrent `orca-wait-done.sh` processes race for the same `orca orchestration check` messages. |
 | `.orca/orchestration/scripts/orca-close-role.sh` | Manual close of role tab (`--tab`) |
-| `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / create / seed (sourced) |
-| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.6 Flash (Medium) |
+| `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / dag patterns / dispatch primitives / seed (sourced) |
+| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.6 Flash (Medium) — new task, `[FAILOVER from …]` wrapper spec |
 | `.orca/orchestration/scripts/orca-status.sh` | Doctor: preflight, role liveness, unclosed dispatches, reapers |
 | `.orca/orchestration/scripts/orca-debate.sh` | Drive a 3-round four-model idea debate |
 | `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
@@ -25,7 +27,9 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --roles architect,executor
 .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan: …"
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty --spec-file /tmp/task.md
-.orca/orchestration/scripts/orca-dispatch-role.sh executor --deps '["task_xxx"]' --spec "Implement…"
+.orca/orchestration/scripts/orca-dispatch-role.sh executor --after task_xxx --spec "Implement…"
+.orca/orchestration/scripts/orca-dispatch-dag.sh plan-exec-review "OAuth login"   # wires 3 tasks, dispatches step 1
+.orca/orchestration/scripts/orca-dispatch-existing.sh task_xxx executor          # dispatch a ready later step
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
 .orca/orchestration/scripts/orca-debate.sh --topic "…"   # 3-round idea debate
 # close is automatic after dispatch; optional block — always pass --task (the
@@ -38,19 +42,20 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 
 Roles: `architect` | `executor` | `thrifty` | `ui` | `reviewer` | `fallback` | `debater_*`
 
-Close is **automatic** on every `orca-dispatch-role.sh` (background reaper). Optional wait for the result body:
+Release is **automatic** on every `orca-dispatch-role.sh` (background reaper calls
+`worker-release`, falls back to its own close). Optional wait for the result body:
 
 ```bash
-orca orchestration check --wait --types worker_done,escalation,decision_gate --timeout-ms 900000 --json
+orca orchestration check --wait --types worker_done,escalation,decision_gate,question --timeout-ms 900000 --json
 ```
 
 When a dispatch misbehaves, run `orca-status.sh` first. It is the only place
-that surfaces `reap_failed` / `close_failed` rows (a worker tab that stayed
-open after its reaper gave up) and `stalled` / `closed_stalled` rows (the
-idle probe found no progress — the tab may already be closed, but the task
-never actually reported done). `awaiting_reply` rows are not a problem: the
-worker is correctly idle, waiting on your reply to a `decision_gate` or
-`escalation`. Exit code 1 means something needs attention.
+that surfaces `reap_failed` / `close_failed` / `release_unknown` rows (a worker
+tab that stayed open after its reaper gave up) and `stalled` rows (the idle
+probe found no progress — never closed on that alone, so it is always worth a
+look). `awaiting_reply` rows are not a problem: the worker is correctly idle,
+waiting on your reply to a `decision_gate`/`question` or `escalation`. Exit
+code 1 means something needs attention.
 
 `handles.json`, `dispatch-ledger.jsonl`, and `reapers/` are local-only; do not
 commit them. See `handles.example.json`.

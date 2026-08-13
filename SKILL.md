@@ -66,6 +66,12 @@ orca orchestration run-create --objective "…"  # bind one if null
 a role CLI missing from PATH, an unreadable `handles.json`, or a worker tab
 left open by a failed reap). Run it before diagnosing anything else.
 
+Orca's orchestration CLI verbs have changed contract before without warning
+(see the "2026-07-31" Run-scope note above, and `references/orca-contract-*.md`
+for the most recent measured snapshot). If a command in this file looks stale
+against what the coordinator actually sees, check the live guide rather than
+trusting a hardcoded example here: `orca skills get orchestration --full`.
+
 If the project is not in Orca: `orca repo add --path <abs-project-root>`.
 
 **Why the Run matters.** `task-create`, `dispatch`, and `check` are Run-scoped.
@@ -92,14 +98,17 @@ worker timeouts that look like a model problem. `orca-debate.sh` therefore
 refuses up front instead of burning a round.
 
 **Idle/stalled workers.** `orca-reap-task.sh` cannot tell "still working" from
-"crashed, rate-limited, or its `worker_done` was refused" from `dispatch-show`
-status alone — that's `dispatched` in every one of those cases. After a grace
-period it also re-reads the worker's own screen, and closes the tab (ledger
-status `closed_stalled`, or `stalled` with `--no-close-on-idle`) once it has
-sat unchanged, not busy, for several consecutive probes. A worker the
-coordinator is deliberately waiting to reply to (`decision_gate`, or an
-unclaimed `escalation` — `orca-wait-done.sh` marks the ledger row
-`awaiting_reply`) is exempt: idle detection never fires on it. See
+"crashed, rate-limited, or its `worker_done` was refused" from status alone —
+that's `dispatched`/`running` in every one of those cases. After a grace
+period it also re-reads the worker's own screen, and reports the ledger status
+`stalled` once it has sat unchanged, not busy, for several consecutive
+probes — it does **not** close the tab on that alone: Orca's contract forbids
+releasing a worker "because of a timeout, TUI idle state, heartbeat, status,
+question, escalation." The overall reaper timeout (`--timeout-ms`, ledger
+`reap_failed`) is the real backstop for a worker that never settles. A worker
+the coordinator is deliberately waiting to reply to (`decision_gate`,
+`question`, or an unclaimed `escalation` — `orca-wait-done.sh` marks the
+ledger row `awaiting_reply`) is exempt: idle detection never fires on it. See
 `orca-reap-task.sh --help` for the `--idle-*` knobs.
 
 ## Skill layout
@@ -115,7 +124,11 @@ orca-role-orchestration/
   .agents/plugins/
     marketplace.json           # Codex marketplace catalog (source url "./")
   commands/                    # Claude Code slash commands (auto-discovered)
-    install.md bootstrap.md dispatch.md wait.md fallback.md debate.md close.md status.md
+    orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
+    orca-fallback.md orca-debate.md orca-close.md orca-status.md
+    # same filenames as prompts/ below — a bare /orca-dispatch resolves
+    # without the plugin namespace prefix (Claude Code v2.1.216+) as long as
+    # no other installed plugin claims the same name
   prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
     orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
     orca-fallback.md orca-debate.md orca-close.md orca-status.md
@@ -160,17 +173,21 @@ Resolve the skill root from this file’s directory. A conventional installation
 /plugin install orca-role-orchestration@orca-role-orchestration
 ```
 
-Slash commands ship with the plugin (namespace `orca-role-orchestration`):
+Slash commands ship with the plugin (namespace `orca-role-orchestration`). Claude commands and
+Codex prompts share the same filename now (`commands/orca-dispatch.md` / `prompts/orca-dispatch.md`),
+so the bare form works on both hosts — the namespaced form is the fallback if another installed
+plugin claims the same bare name:
 
-| Claude Code | Codex | Script |
-|-------------|-------|--------|
-| `/orca-role-orchestration:install` | `/orca-install` | `install-to-project.sh` |
-| `/orca-role-orchestration:bootstrap` | `/orca-bootstrap` | `orca-bootstrap-roles.sh` |
-| `/orca-role-orchestration:dispatch <role> <task>` | `/orca-dispatch` | `orca-dispatch-role.sh` |
-| `/orca-role-orchestration:wait` | `/orca-wait` | `orca-wait-done.sh` |
-| `/orca-role-orchestration:fallback <role> <goal>` | `/orca-fallback` | `orca-fallback-on-limit.sh` |
-| `/orca-role-orchestration:debate <topic>` | `/orca-debate` | `orca-debate.sh` |
-| `/orca-role-orchestration:close <role>` | `/orca-close` | `orca-close-role.sh` (emergency) |
+| Bare (Claude Code v2.1.216+ / Codex) | Namespaced (Claude Code, always works) | Script |
+|---|---|---|
+| `/orca-install` | `/orca-role-orchestration:orca-install` | `install-to-project.sh` |
+| `/orca-bootstrap` | `/orca-role-orchestration:orca-bootstrap` | `orca-bootstrap-roles.sh` |
+| `/orca-dispatch <role> <task>` | `/orca-role-orchestration:orca-dispatch` | `orca-dispatch-role.sh` |
+| `/orca-wait` | `/orca-role-orchestration:orca-wait` | `orca-wait-done.sh` |
+| `/orca-fallback <role> <goal>` | `/orca-role-orchestration:orca-fallback` | `orca-fallback-on-limit.sh` |
+| `/orca-debate <topic>` | `/orca-role-orchestration:orca-debate` | `orca-debate.sh` |
+| `/orca-close <role>` | `/orca-role-orchestration:orca-close` | `orca-close-role.sh` (emergency) |
+| `/orca-status` | `/orca-role-orchestration:orca-status` | `orca-status.sh` |
 
 Claude Code auto-discovers `commands/` from the plugin root. Codex plugin manifests carry
 no prompt field, so `install-skill.sh` symlinks `prompts/*.md` into `$CODEX_HOME/prompts/`
@@ -243,7 +260,7 @@ Then customize **`project_hints.yaml`** (not `roles.yaml`) and bootstrap workers
 .orca/orchestration/scripts/orca-bootstrap-roles.sh --worktree path:$(pwd)
 ```
 
-Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral and auto-closed**: each `orca-dispatch-role.sh` starts a background reaper and injects AUTO-CLOSE into the worker. Next dispatch recreates a dead handle.
+Writes `.orca/orchestration/handles.json`. Supervised role tabs are **ephemeral and auto-released**: each `orca-dispatch-role.sh` starts a background reaper that calls native `worker-release` once the dispatch settles, falling back to this package's own close only when Orca reports the tab retained. Next dispatch recreates a dead handle.
 
 ### C) Route + supervised dispatch
 
@@ -257,6 +274,14 @@ Use **supervised** lifecycle only when the user wants coordinate / supervise / w
 .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec "Plan only: <goal>. Follow AGENTS.md."
 .orca/orchestration/scripts/orca-dispatch-role.sh executor  --spec "Implement approved plan: …"
 .orca/orchestration/scripts/orca-dispatch-role.sh thrifty   --spec "Read-only map: …"
+```
+
+Or, for one of the three fixed DAG patterns below, wire the whole chain in one call instead of
+one blocking dispatch per step — only the first (dependency-free) step gets a live worker now;
+dispatch each later step once ready (`task-list --ready`) via `orca-dispatch-existing.sh`:
+
+```bash
+.orca/orchestration/scripts/orca-dispatch-dag.sh plan-exec-review "<goal>"
 ```
 
 Image generation (only after the clarity gate below):
@@ -279,7 +304,7 @@ Done: final path(s) + mode (built-in|CLI)
 
 ```bash
 orca orchestration check --wait \
-  --types worker_done,escalation,decision_gate \
+  --types worker_done,escalation,decision_gate,question \
   --timeout-ms 900000 --json
 ```
 
@@ -290,6 +315,13 @@ Timeout / `count:0` = checkpoint, not failure. Tab close does not depend on this
 ```bash
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role|term_*> --spec "Continue: <goal + partial>"
 ```
+
+Creates a **new** task with a `[FAILOVER from …]` wrapper spec — deliberately not `--retry-of`
+on the same task, because a cross-role retry would hand the new (fallback) seat the OLD role's
+frozen spec text verbatim (measured live, `references/orca-contract-2026-08-13.md`). `--retry-of`
+is for **same-role** crash recovery only, via `orca-dispatch-existing.sh <task_id> <role>
+--retry-of <old_dispatch_id>` after `worker-stop`/`worker-abandon` confirms the old dispatch is
+no longer active.
 
 ### D) Full handoff (no lifecycle)
 
@@ -353,9 +385,10 @@ collision would also reset the live debate's tracked handles out from under it).
 | Idea research, brainstorm, find a niche | debate driver |
 | Primary hit session/rate/quota limit | fallback |
 
-Standard DAG: `architect(plan) → executor|thrifty(impl) → architect(review-only)`.
+Standard DAG: `orca-dispatch-dag.sh plan-exec-review "<goal>"` — architect(plan) → executor(impl) → reviewer(gate).
+Explore-then-build DAG: `orca-dispatch-dag.sh explore "<goal>"` — thrifty(map) → architect(plan) → executor(impl).
 Image DAG: clarity gate → `executor` (`$imagegen`) only.
-UI DAG: `ui(draft) → architect(approve) → ui(implement) → architect(review)`.
+UI DAG: `orca-dispatch-dag.sh ui "<goal>"` — ui(draft) → architect(approve) → ui(impl) → reviewer(review).
 Cost ladder: `thrifty → executor → architect`.
 
 ## Image generation (Codex `$imagegen`)
@@ -397,7 +430,7 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 2. Scaffold present (`roles.yaml` + `project_hints.yaml` + scripts) or re-run install
 3. Handles valid or bootstrap (dispatch also recreates dead tabs)
 4. Route by roles.yaml + project_hints.yaml (image intent → clarity gate → executor/`$imagegen`)
-5. Dispatch via `orca-dispatch-role.sh` (auto-reaper + worker AUTO-CLOSE — no manual close)
+5. Dispatch via `orca-dispatch-role.sh` (auto-reaper releases the worker on settle — no manual close)
 6. Limit → fallback script
 7. Synthesize worker_done bodies; re-dispatch fixes if needed
 
@@ -412,10 +445,10 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 
 ## Exit-on-done (automatic)
 
-Supervised workers must not linger after a task. Close is **automatic** on every `orca-dispatch-role.sh`:
+Supervised workers must not linger after a task. Release is **automatic** on every `orca-dispatch-role.sh`:
 
-1. **Background reaper** (`orca-reap-task.sh`) polls `dispatch-show` and runs `orca terminal close --tab` when status is `completed` or `failed`. Does not consume inbox messages. It also detects a **stalled** worker (status stuck, screen unchanged, not busy) after a grace period and closes on that too — see "Idle/stalled workers" above.
-2. **Worker AUTO-CLOSE block** is injected into every task spec: after `worker_done`, the worker runs the same close command on its handle.
+1. **Background reaper** (`orca-reap-task.sh`) polls `worker-show` and runs `worker-release` when the worker settles (`succeeded`/`failed`), falling back to this package's own close only when Orca reports the tab retained (the common case for a role's pre-created custom-argv terminal — see `references/orca-contract-2026-08-13.md`). Does not consume inbox messages. It also detects a **stalled** worker (status stuck, screen unchanged, not busy) after a grace period and reports it — never closes on that alone, see "Idle/stalled workers" above.
+2. The worker never closes its own tab — Orca's contract forbids it. It sends `worker_done` once, then idles.
 3. Next dispatch recreates a live terminal if the handle is dead/missing.
 
 Opt out only with `--no-reap`. Manual emergency: `orca-close-role.sh <role|term_*>`.

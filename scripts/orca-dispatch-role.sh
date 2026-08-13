@@ -4,8 +4,9 @@
 #   .orca/orchestration/scripts/orca-dispatch-role.sh <architect|executor|thrifty|fallback> --spec "..."
 #   .orca/orchestration/scripts/orca-dispatch-role.sh architect --spec-file path.md [--deps '["task_xxx"]']
 #
-# Role tabs are ephemeral. After inject, a background reaper watches dispatch
-# status and auto-closes the worker tab on completed|failed (no manual step).
+# Role tabs are ephemeral. After worker-start, a background reaper watches
+# worker/dispatch status and releases (or closes) the worker tab on
+# succeeded|failed (no manual step).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,7 +18,10 @@ HANDLES_FILE="$ORCH/handles.json"
 ROLE=""
 SPEC=""
 SPEC_FILE=""
+SCOPE=""
+DONE_DEF=""
 DEPS="[]"
+AFTER=""
 WAIT_DONE=0
 NO_REAP=0
 PERSIST=0
@@ -26,18 +30,24 @@ REAP_TIMEOUT_MS=3600000
 WORKTREE="active"
 PROJECT_NAME="$(basename "$ROOT")"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
-REAPER_DIR="$ORCH/reapers"
 
 usage() {
   cat <<'EOF'
 Usage:
-  orca-dispatch-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}> --spec "text"
+  orca-dispatch-role.sh <architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}> "text"
+  orca-dispatch-role.sh <role> --spec "text"
   orca-dispatch-role.sh <role> --spec-file file.md [--deps '["task_id"]']
+  orca-dispatch-role.sh <role> "…" [--scope path,path] [--done "verify cmd"]
   orca-dispatch-role.sh <role> --spec "…" [--wait] [--no-reap] [--persist] [--timeout-ms N]
 
 By default a background reaper auto-closes the worker tab when the dispatch
 completes or fails (no coordinator action required).
 
+  (positional)  The first argument after <role> that does not start with "-"
+              is absorbed as the spec body — an alternative to --spec for the
+              common case. --spec still wins if both are given.
+  --scope     Comma-separated path list appended to the spec as "Allowed scope: …"
+  --done      Verification command(s) appended to the spec as "Done: …"
   --wait      Also block on orca-wait-done.sh, pinned to THIS dispatch's own
               task id (--task) so it can only complete on this task's own
               message, never a leftover from an unrelated flow (optional;
@@ -46,6 +56,9 @@ completes or fails (no coordinator action required).
   --persist   Keep the worker tab open after worker_done (implies --no-reap).
               For multi-round flows (debate) where the caller closes tabs itself.
   --timeout-ms  Timeout for --wait only (default 900000). Reaper default lifetime 1h.
+  --after task_id[,task_id...]  This task becomes ready only once every listed
+              task completes (shorthand for --deps '["task_id",...]'; the two
+              are mutually exclusive).
 EOF
 }
 
@@ -56,13 +69,28 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --spec) SPEC="${2:?}"; shift 2 ;;
     --spec-file) SPEC_FILE="${2:?}"; shift 2 ;;
+    --scope) SCOPE="${2:?}"; shift 2 ;;
+    --done) DONE_DEF="${2:?}"; shift 2 ;;
     --deps) DEPS="${2:?}"; shift 2 ;;
+    --after) AFTER="${2:?}"; shift 2 ;;
     --wait) WAIT_DONE=1; shift ;;
     --no-reap) NO_REAP=1; shift ;;
     --persist) PERSIST=1; NO_REAP=1; shift ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown: $1" >&2; exit 1 ;;
+    -*) echo "Unknown: $1" >&2; exit 1 ;;
+    *)
+      # Positional spec absorption: only the FIRST such argument is taken
+      # (a second bare word is very likely a typo, not a second spec) — an
+      # explicit --spec always wins over it if both are somehow given.
+      if [[ -z "$SPEC" ]]; then
+        SPEC="$1"
+      else
+        echo "Unknown: $1 (spec already set — did you mean --spec?)" >&2
+        exit 1
+      fi
+      shift
+      ;;
   esac
 done
 
@@ -71,13 +99,25 @@ if [[ ! -f "$HANDLES_FILE" ]]; then
   exit 1
 fi
 
-case "$ROLE" in
-  architect|executor|thrifty|ui|reviewer|fallback) ;;
-  debater_claude|debater_codex|debater_grok|debater_gemini) ;;
-  *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}" >&2; exit 1 ;;
-esac
+validate_role "$ROLE" || exit 1
 if [[ -n "$SPEC_FILE" ]]; then SPEC="$(cat "$SPEC_FILE")"; fi
-if [[ -z "${SPEC// }" ]]; then echo "--spec or --spec-file required" >&2; exit 1; fi
+if [[ -z "${SPEC// }" ]]; then echo "--spec, --spec-file, or a positional spec is required" >&2; exit 1; fi
+
+if [[ -n "$SCOPE" ]]; then SPEC="$SPEC
+Allowed scope: $SCOPE"; fi
+if [[ -n "$DONE_DEF" ]]; then SPEC="$SPEC
+Done: $DONE_DEF"; fi
+
+if [[ -n "$AFTER" ]]; then
+  if [[ "$DEPS" != "[]" ]]; then
+    echo "--after and --deps are mutually exclusive" >&2
+    exit 1
+  fi
+  DEPS="$(python3 -c '
+import json, sys
+print(json.dumps([t.strip() for t in sys.argv[1].split(",") if t.strip()]))
+' "$AFTER")"
+fi
 
 # Project context for seed() if recreate path runs.
 # Read as a bare global by create_role in orca-roles-lib.sh.
@@ -154,13 +194,6 @@ if ! terminal_wait_ready "$HANDLE" "$AGENT_CLI"; then
   exit 1
 fi
 
-MODEL="$(role_meta "$ROLE" | cut -f2)"
-PERSONA_FILE="$ORCH/personas/$ROLE.md"
-STANCE=""
-if [[ -f "$PERSONA_FILE" ]]; then
-  STANCE="$(grep -m1 'STANCE:' "$PERSONA_FILE" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
-fi
-
 # Resolve the Run scope ONCE (see resolve_run_id in orca-roles-lib.sh): the
 # same value must reach the tail block, task-create AND dispatch, or a
 # rebinding mid-script would split one dispatch across two Runs — or worse,
@@ -190,36 +223,18 @@ else
   exit 1
 fi
 
-# Spec always carries a tail contract: auto-close (default) or stay-open
-# (--persist). It also carries the Run scope the worker needs for its OWN
-# worker_done — Orca's injected preamble omits --run, so without this the
-# worker's report is refused even when the task itself succeeded.
-if [[ "$PERSIST" -eq 1 ]]; then
-  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" persist "$RUN_ID")"
-else
-  TAIL_BLOCK="$(dispatch_tail_block "$HANDLE" close "$RUN_ID")"
-fi
-
-if [[ -n "${STANCE// }" ]]; then
-  FULL_SPEC="[ROLE=$ROLE | $MODEL]
-STANCE: $STANCE
-$SPEC
-$TAIL_BLOCK"
-else
-  FULL_SPEC="[ROLE=$ROLE | $MODEL]
-$SPEC
-$TAIL_BLOCK"
-fi
+# The spec no longer carries a tail contract (RUN SCOPE/AUTO-CLOSE/STAY-OPEN
+# are gone — see dispatch_tail_block's removal note in orca-roles-lib.sh):
+# `worker-start` below injects the worker's dispatch identity itself, and
+# self-close is now forbidden regardless of --persist. --persist's only
+# remaining effect is skipping the reaper (below), so the coordinator (or the
+# debate driver) decides close-vs-reuse instead of the worker's own spec text.
+FULL_SPEC="$(build_role_spec "$ROLE" "$SPEC" "$ORCH/personas")"
 
 echo "Creating task for ROLE=$ROLE → $HANDLE${RUN_ID:+ (run=$RUN_ID)}"
-CREATE_JSON="$(orca orchestration task-create ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --deps "$DEPS" --spec "$FULL_SPEC" --json)"
-TASK_ID="$(printf '%s' "$CREATE_JSON" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-r=d.get("result") or d
-t=r.get("task") or r
-print(t.get("id") or t.get("task_id") or r.get("id") or "")
-')"
+CREATE_JSON="$(orca orchestration task-create ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --deps "$DEPS" \
+  --task-title "$ROLE dispatch" --display-name "[$ROLE]" --spec "$FULL_SPEC" --json)"
+TASK_ID="$(parse_task_id "$CREATE_JSON")"
 if [[ -z "$TASK_ID" ]]; then
   echo "Failed to parse task id:" >&2
   echo "$CREATE_JSON" >&2
@@ -237,49 +252,30 @@ echo "task_id=$TASK_ID"
 # nothing touches the terminal between the gate above and this point except
 # the task-create call itself (an orchestration-side API call, not a
 # terminal write), so the terminal's readiness cannot regress in between.
-echo "Dispatching (inject)…"
-DISPATCH_JSON="$(orca orchestration dispatch ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --task "$TASK_ID" --to "$HANDLE" --inject --json)"
-printf '%s\n' "$DISPATCH_JSON"
-warn_if_legacy_read_only "$DISPATCH_JSON" "dispatch for ROLE=$ROLE"
-DISPATCH_ID="$(printf '%s' "$DISPATCH_JSON" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-r=d.get("result") or d
-disp=r.get("dispatch") or r
-print(disp.get("id") or disp.get("dispatch_id") or "")
-' 2>/dev/null || true)"
+# dispatch_task_to_role (orca-roles-lib.sh) runs its own gate too — cheap and
+# necessary for its OTHER callers (orca-dispatch-dag.sh,
+# orca-dispatch-existing.sh) that have no pre-task-create gate of their own.
+#
+# worker-start replaces the old `dispatch --to --inject` (see
+# references/orca-contract-2026-08-13.md S1-b/S1-c): it attaches our
+# pre-created, custom-argv role terminal to the task and injects the
+# worker's own dispatch identity — measured live, the worker's eventual
+# worker_done needs no RUN SCOPE reminder to land correctly.
+echo "Starting worker…"
+WD_OUT="$(dispatch_task_to_role "$ROLE" "$TASK_ID" "$RUN_ID")" || {
+  echo "orca-dispatch-role.sh: worker-start failed for ROLE=$ROLE task=$TASK_ID — not guessing or retrying." >&2
+  exit 1
+}
+# dispatch_task_to_role calls ensure_terminal internally too and can return a
+# DIFFERENT handle than the one resolved above (the terminal died between
+# then and now and was transparently recreated) — re-sync HANDLE from its
+# output, exactly like orca-dispatch-dag.sh / orca-dispatch-existing.sh
+# already do. Registering the reaper against the stale handle would poll a
+# terminal that's already gone while the real, live worker leaks untracked.
+HANDLE="${WD_OUT%%$'\t'*}"
+DISPATCH_ID="${WD_OUT#*$'\t'}"
 
-# Ledger for reaper / wait-done. Locked append: concurrent reapers rewrite this
-# file, and an unlocked append lands on the pre-rewrite copy and is lost.
-ledger_append "$LEDGER_FILE" \
-  "taskId=$TASK_ID" \
-  "dispatchId=$DISPATCH_ID" \
-  "role=$ROLE" \
-  "handle=$HANDLE" \
-  "status=dispatched"
-echo "ledger += $ROLE $TASK_ID → $HANDLE" >&2
-
-# Background reaper: auto-close on completed|failed (default ON)
-if [[ "$NO_REAP" -eq 0 ]]; then
-  mkdir -p "$REAPER_DIR"
-  # Keep the last 50 reaper logs; this directory otherwise grows forever.
-  ls -1t "$REAPER_DIR"/*.log 2>/dev/null | tail -n +51 | while read -r old; do
-    rm -f "$old" "${old%.log}.pid"
-  done
-  LOG="$REAPER_DIR/${TASK_ID}.log"
-  PID_FILE="$REAPER_DIR/${TASK_ID}.pid"
-  nohup "$HERE/orca-reap-task.sh" \
-    --task "$TASK_ID" \
-    --handle "$HANDLE" \
-    --role "$ROLE" \
-    --timeout-ms "$REAP_TIMEOUT_MS" \
-    >>"$LOG" 2>&1 &
-  echo $! >"$PID_FILE"
-  echo "Auto-reaper started pid=$(cat "$PID_FILE") log=$LOG"
-  echo "Worker tab will close automatically when dispatch completes."
-else
-  echo "Reaper disabled (--no-reap). Tab will linger unless closed elsewhere."
-fi
+register_dispatch_and_reap "$LEDGER_FILE" "$TASK_ID" "$DISPATCH_ID" "$ROLE" "$HANDLE" "$NO_REAP" "$REAP_TIMEOUT_MS"
 
 if [[ "$WAIT_DONE" -eq 1 ]]; then
   # --task pins this wait to the dispatch we just created (Task 4): without

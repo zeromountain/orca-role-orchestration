@@ -164,7 +164,7 @@ for i in "${!NAMES[@]}"; do
   # Fix round (whole-branch review, item 5): the old code piped the
   # dispatcher directly into `awk '{...; exit}'` — awk's own `exit` on the
   # FIRST match closes its end of the pipe, and orca-dispatch-role.sh prints
-  # "task_id=..." (line ~192) well BEFORE its slower --inject call (line
+  # "task_id=..." (line ~192) well BEFORE its slower worker-start call (line
   # ~201), so the dispatcher's next stdout write after that point gets
   # SIGPIPE, silently, under the trailing `|| true` below — a script dying
   # on a signal, exactly the class of bug this branch spent two prior plans

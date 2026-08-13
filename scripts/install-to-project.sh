@@ -95,7 +95,7 @@ skill_version() {
 VERSION="$(skill_version)"
 echo "orca-role-orchestration ${VERSION} → ${ROOT} (project=${PROJECT_NAME})"
 
-MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh"
+MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-dispatch-dag.sh orca-dispatch-existing.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh"
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   echo "Removing managed scaffold from $ORCH"
@@ -104,6 +104,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     [[ -f "$SCRIPTS_DST/$s" ]] && rm -f "$SCRIPTS_DST/$s" && echo "  removed scripts/$s"
   done
   rmdir "$SCRIPTS_DST" 2>/dev/null || true
+  [[ -f "$ORCH/or" ]] && rm -f "$ORCH/or" && echo "  removed or"
   for f in roles.yaml PLAYBOOK.md SCRIPTS.md handles.example.json install-manifest.json; do
     [[ -f "$ORCH/$f" ]] && rm -f "$ORCH/$f" && echo "  removed $f"
   done
@@ -377,6 +378,14 @@ write_managed "$TPL/handles.example.json" "$ORCH/handles.example.json" "handles.
 for s in $MANAGED_SCRIPTS; do
   write_managed "$SCRIPTS_SRC/$s" "$SCRIPTS_DST/$s" "scripts/$s"
 done
+
+# `or` is the one file that installs OUTSIDE scripts/ and WITHOUT its source
+# .sh extension (a short top-level alias: `.orca/orchestration/or d ...`) —
+# it deliberately is NOT in MANAGED_SCRIPTS, whose loop assumes a same-name
+# copy into scripts/. write_managed's own chmod-on-*.sh-suffix shortcut does
+# not fire for a dest with no extension, so chmod it explicitly.
+write_managed "$SCRIPTS_SRC/orca-or.sh" "$ORCH/or" "or"
+[[ "$DRY_RUN" -eq 0 && -f "$ORCH/or" ]] && chmod +x "$ORCH/or"
 
 # Relocate legacy project/scripts/orca-*.sh if present.
 # Never touch the skill package's own scripts/ when installing into the skill repo itself.

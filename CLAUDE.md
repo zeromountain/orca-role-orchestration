@@ -91,7 +91,7 @@ would need a YAML parser this package deliberately does not have).
 - `orca-roles-lib.sh:persona_body()` — strips the `# ` H1 and the `<!-- STANCE: … -->` comment, sends the rest as the bootstrap seed. Missing file → hardcoded one-liner from `role_fallback_body()`.
 - `orca-dispatch-role.sh` — greps only the `STANCE:` line and prepends it to each task spec. Missing file → no stance line.
 
-`check-personas.sh` enforces the H1, a non-empty STANCE, and nine literal `**Section.**` headings across all five roles (including `coordinator`, which has no worker terminal). Adding a section to one persona means adding it to all five plus the `SECTIONS` array.
+`check-personas.sh` enforces the H1, a non-empty STANCE, and ten literal `**Section.**` headings across all nine skeleton roles (`architect`, `executor`, `thrifty`, `fallback`, `coordinator` — which has no worker terminal — and the four `debater_*` seats; `ui`/`reviewer` use a different, later structure by design). Adding a section to one persona means adding it to all nine plus the `SECTIONS` array.
 
 ## Installer file policy (what `tests/install.sh` protects)
 
@@ -116,23 +116,23 @@ Regression coverage worth preserving: T2 (re-run produces zero `.bak`), T3 (hint
 `orca-dispatch-role.sh` is the entry point for all supervised work; `orca-bootstrap-roles.sh` only pre-warms tabs. Role tabs are **ephemeral**:
 
 1. `ensure_terminal()` reuses the handle from `handles.json` when the role's terminal is live; otherwise it recreates + re-seeds the tab. Bootstrap uses the same function, which is what makes it idempotent and resumable. Dispatch therefore works without a prior bootstrap run (except the `handles.json`-exists guard at the top).
-2. Every spec gets a `[ROLE=… | model]` prefix, the STANCE line, and an injected `AUTO-CLOSE` block telling the worker to `orca terminal close --terminal <handle> --tab` after `worker_done`.
-3. A background `orca-reap-task.sh` polls `dispatch-show` (never `orchestration check`, so it does not consume inbox messages) and closes the tab on `completed|failed`. Belt-and-suspenders with step 2.
+2. Every spec gets a `[ROLE=… | model]` prefix and the STANCE line — no more than that. The worker never closes its own tab (Orca's contract forbids it, see `references/orca-contract-2026-08-13.md`); `orca orchestration worker-start` injects the worker's dispatch identity itself, so no RUN SCOPE reminder text is needed either.
+3. `worker-start` attaches the task to our pre-created terminal (`orca-dispatch-role.sh`). A background `orca-reap-task.sh` polls `worker-show` (never `orchestration check`, so it does not consume inbox messages) and calls `worker_release_or_close()` (orca-roles-lib.sh) once the worker settles: native `worker-release` first, falling back to this package's own `terminal_close_and_verify` when Orca reports the tab retained — the common case for a role's pre-created custom-argv terminal, not an edge case (measured live, see the reference doc's S1-a).
 4. `dispatch-ledger.jsonl` records `taskId/dispatchId/role/handle` for the reaper and `orca-wait-done.sh`.
 
 **Failure semantics — do not soften these.** They are the whole point of R3–R6:
 
 - `terminal_is_live` is tri-state: `0` live, `1` confirmed gone, `2` unknown. Collapsing 1 and 2 leaks a tab in the reaper and creates a duplicate in `ensure_terminal`.
-- `close_terminal()` always attempts a close on unknown liveness. A redundant close is free; a skipped one costs a billable session.
-- Anything that could not close, or could not read a status, must exit **non-zero** and write `reap_failed` / `close_failed` to the ledger. `orca-status.sh` is the only surface that shows those rows.
-- The reaper never force-closes on timeout or parse failure: the task may still be running, so it reports rather than kills.
+- `terminal_close_and_verify()` always attempts a close on unknown liveness. A redundant close is free; a skipped one costs a billable session.
+- Anything that could not close, or could not read a status, must exit **non-zero** and write `reap_failed` / `close_failed` / `release_unknown` to the ledger. `orca-status.sh` is the only surface that shows those rows.
+- The reaper never force-closes on timeout, parse failure, **or idle/stall detection** — Orca's contract explicitly forbids releasing a worker "because of a timeout, TUI idle state, heartbeat, status, question, escalation." An idle stall is reported (`stalled`) and polling continues; only the overall `--timeout-ms` backstop escalates (`reap_failed`).
 
-`orca-wait-done.sh` is *optional* blocking only — closing does not depend on it. `--no-reap` is the only way to make tabs linger.
+`orca-wait-done.sh` is *optional* blocking only — closing does not depend on it. `--no-reap` is the only way to make tabs linger. `orca-wait-done.sh` also now acks every batch it fully processes (`check --ack <delivery_id>`) — without this, `orchestration check` replays the same FIFO batch forever, which was the root cause of two known defects (a leftover message closing the wrong tab; only one waiter supported at a time).
 
 ## Conventions
 
 - **No `jq`.** All JSON parsing/writing is `python3` heredocs inside Bash. Keep it that way — `python3` is the only declared dependency.
-- **Every state write is locked and atomic.** `handles.json` and `dispatch-ledger.jsonl` are mutated concurrently (one background reaper per in-flight dispatch, plus a possible `orca-wait-done.sh`). Use `handles_set` / `handles_set_meta` / `ledger_append` / `ledger_update` in the lib — all take an `fcntl.flock` on a sidecar `.lock` and land via temp + `os.replace`. Never add a bare `open(path, "w")` on these files.
+- **Every state write is locked and atomic.** `handles.json` and `dispatch-ledger.jsonl` are mutated concurrently (one background reaper per in-flight dispatch, plus a possible `orca-wait-done.sh`). Use `handles_set` / `ledger_append` (both in the lib) for the first write to a row; every later status update inlines its own locked read-modify-write (`orca-reap-task.sh`'s `mark_ledger`, `orca-wait-done.sh`'s `mark_ledger_status` and its own inline close-status block — there is no shared `ledger_update`). All of these take an `fcntl.flock` on a sidecar `.lock` and land via temp + `os.replace`. Never add a bare `open(path, "w")` on these files.
 - **Bash 3.2 (macOS default).** No `mapfile`, no associative arrays. Array expansion uses the `"${ARR[@]+"${ARR[@]}"}"` guard for the `set -u` empty-array case.
 - `orca-roles-lib.sh` is sourced only and intentionally sets no shell options — callers own `set -euo pipefail`.
 - Never commit `.orca/orchestration/handles.json`, `dispatch-ledger.jsonl`, or `reapers/` (the whole `.orca/` tree is gitignored here).
@@ -140,13 +140,19 @@ Regression coverage worth preserving: T2 (re-run produces zero `.bak`), T3 (hint
 
 ## Slash command duplication
 
-`commands/*.md` (Claude) and `prompts/orca-*.md` (Codex) are near-identical pairs — same body, but the Claude version carries an `allowed-tools:` frontmatter line and says "SKILL.md" where the Codex one says "the skill". Edit both, or the two hosts drift:
+`commands/*.md` (Claude) and `prompts/*.md` (Codex) are near-identical pairs — same filename in
+both directories now (Claude commands were renamed to match Codex's `orca-*.md` prompts, so a
+bare `/orca-dispatch` is unambiguous in Claude Code v2.1.216+ even alongside other installed
+plugins), same body, but the Claude version carries an `allowed-tools:` frontmatter line and says
+"SKILL.md" where the Codex one says "the skill". Edit both, or the two hosts drift:
 
 | Claude | Codex |
 |---|---|
-| `commands/install.md` | `prompts/orca-install.md` |
-| `commands/bootstrap.md` | `prompts/orca-bootstrap.md` |
-| `commands/dispatch.md` | `prompts/orca-dispatch.md` |
-| `commands/wait.md` | `prompts/orca-wait.md` |
-| `commands/fallback.md` | `prompts/orca-fallback.md` |
-| `commands/close.md` | `prompts/orca-close.md` |
+| `commands/orca-install.md` | `prompts/orca-install.md` |
+| `commands/orca-bootstrap.md` | `prompts/orca-bootstrap.md` |
+| `commands/orca-dispatch.md` | `prompts/orca-dispatch.md` |
+| `commands/orca-wait.md` | `prompts/orca-wait.md` |
+| `commands/orca-fallback.md` | `prompts/orca-fallback.md` |
+| `commands/orca-close.md` | `prompts/orca-close.md` |
+| `commands/orca-debate.md` | `prompts/orca-debate.md` |
+| `commands/orca-status.md` | `prompts/orca-status.md` |

@@ -98,6 +98,38 @@ role_launch_cmd() {
   printf '%s\n' "$cmd"
 }
 
+validate_role() {
+  # $1=role → 0 and prints nothing if valid, 1 and an error message on
+  # stderr otherwise. Single source for the "role must be one of…" check —
+  # previously hand-copied in orca-dispatch-role.sh, orca-close-role.sh, and
+  # orca-dispatch-existing.sh; a future role addition/rename that updated
+  # two of the three copies but missed the third would accept/reject the
+  # same role name inconsistently between scripts.
+  case "$1" in
+    architect|executor|thrifty|ui|reviewer|fallback) return 0 ;;
+    debater_claude|debater_codex|debater_grok|debater_gemini) return 0 ;;
+    *)
+      echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}" >&2
+      return 1
+      ;;
+  esac
+}
+
+parse_task_id() {
+  # $1=task-create response JSON → task id on stdout, empty on failure.
+  # Single source for this parse — previously hand-copied identically in
+  # orca-dispatch-role.sh and orca-dispatch-dag.sh; a future task-create
+  # response shape change fixed in only one copy would leave the other
+  # silently extracting empty/wrong task ids.
+  printf '%s' "$1" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+r=d.get("result") or d
+t=r.get("task") or r
+print(t.get("id") or t.get("task_id") or r.get("id") or "")
+'
+}
+
 role_cli() {
   # $1=role → the executable that must be on PATH for that role to start.
   # Not the same as role_meta's agent field: a "ui"/"fallback"/debater_gemini
@@ -117,6 +149,133 @@ role_cli() {
     ui|fallback|debater_gemini)        printf 'agy\n' ;;
     *) return 1 ;;
   esac
+}
+
+dag_pattern() {
+  # $1=pattern name → one "role<TAB>spec_template" line per step, in order.
+  # {goal} in a template is the caller's placeholder to substitute. Only
+  # statically-wireable patterns live here — a step whose role depends on a
+  # PRIOR step's actual output (not just "prior step done") cannot be
+  # pre-wired and belongs to a later, coordinator-driven `task-list --ready`
+  # wave instead (see orca-dispatch-dag.sh's own comment).
+  #
+  # Single source for these three chains — templates/roles.yaml's `dags:`
+  # block restates them as prose for a human reader; nothing parses it (no
+  # YAML parser in this package, by design). Keep both in sync by hand.
+  case "$1" in
+    plan-exec-review)
+      printf 'architect\tPlan only: {goal}. Produce an approved plan; do not implement.\n'
+      printf 'executor\tImplement the approved plan for: {goal}\n'
+      printf 'reviewer\tAPPROVE or BLOCK with file:line evidence for: {goal}\n'
+      ;;
+    ui)
+      printf 'ui\tDraft only: {goal}. Visual direction, not final implementation.\n'
+      printf 'architect\tApprove or redirect the ui draft for: {goal}\n'
+      printf 'ui\tImplement the approved draft for: {goal}\n'
+      printf 'reviewer\tAPPROVE or BLOCK with file:line evidence for: {goal}\n'
+      ;;
+    explore)
+      printf 'thrifty\tRead-only map: {goal}. Do not edit any file.\n'
+      printf 'architect\tPlan only, based on the map above: {goal}. Do not implement.\n'
+      printf 'executor\tImplement the approved plan for: {goal}\n'
+      ;;
+    *)
+      echo "unknown dag pattern: $1 (known: plan-exec-review, ui, explore)" >&2
+      return 1
+      ;;
+  esac
+}
+
+build_role_spec() {
+  # $1=role $2=spec_body $3=personas_dir → full "[ROLE=...]\nSTANCE: ...\n<body>"
+  # spec on stdout. Single source for the STANCE-extraction + prefix
+  # assembly every dispatch path needs (orca-dispatch-role.sh,
+  # orca-dispatch-dag.sh) — factored out so a future change to the prefix
+  # shape only has one call site to fix, not N duplicated copies.
+  local role="$1" body="$2" personas_dir="$3" model persona_file stance
+  model="$(role_meta "$role" | cut -f2)"
+  persona_file="$personas_dir/$role.md"
+  stance=""
+  if [[ -f "$persona_file" ]]; then
+    stance="$(grep -m1 'STANCE:' "$persona_file" | sed -E 's/.*STANCE:[[:space:]]*//; s/[[:space:]]*-->.*//')"
+  fi
+  if [[ -n "${stance// }" ]]; then
+    printf '[ROLE=%s | %s]\nSTANCE: %s\n%s' "$role" "$model" "$stance" "$body"
+  else
+    printf '[ROLE=%s | %s]\n%s' "$role" "$model" "$body"
+  fi
+}
+
+dispatch_task_to_role() {
+  # $1=role $2=task_id $3=run_id (may be empty) $4=retry_of dispatch_id
+  # (optional) → on success prints "handle<TAB>dispatch_id" on stdout and
+  # returns 0; on failure returns 1 with nothing on stdout. Attaches a
+  # worker to an ALREADY-CREATED task (worker-start only — no task-create).
+  # Shared by: orca-dispatch-role.sh (its own freshly-created task),
+  # orca-dispatch-dag.sh (a DAG pattern's first ready step),
+  # orca-dispatch-existing.sh (a later DAG wave, or a --retry-of failover).
+  local role="$1" task_id="$2" run_id="$3" retry_of="${4:-}"
+  local handle agent_cli run_args=() retry_args=() worker_json dispatch_id
+  handle="$(ensure_terminal "$role")" || return 1
+  agent_cli="$(role_meta "$role" | cut -f3)"
+  orca terminal wait --terminal "$handle" --for tui-idle --timeout-ms 90000 --json >/dev/null || true
+  if ! terminal_wait_ready "$handle" "$agent_cli"; then
+    echo "dispatch_task_to_role: $handle for role=$role never showed a ready screen — refusing to dispatch." >&2
+    return 1
+  fi
+  [[ -n "$run_id" ]] && run_args=(--run "$run_id")
+  [[ -n "$retry_of" ]] && retry_args=(--retry-of "$retry_of")
+  worker_json="$(orca orchestration worker-start ${run_args[@]+"${run_args[@]}"} ${retry_args[@]+"${retry_args[@]}"} --task "$task_id" --terminal "$handle" --json)" || return 1
+  printf '%s\n' "$worker_json" >&2
+  warn_if_legacy_read_only "$worker_json" "worker-start for ROLE=$role task=$task_id"
+  dispatch_id="$(printf '%s' "$worker_json" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+r=d.get("result") or d
+print(r.get("dispatchId") or (r.get("dispatch") or {}).get("id") or "")
+' 2>/dev/null || true)"
+  if [[ -z "$dispatch_id" ]]; then
+    echo "dispatch_task_to_role: worker-start did not return a dispatch id for ROLE=$role task=$task_id — not guessing or retrying." >&2
+    return 1
+  fi
+  printf '%s\t%s\n' "$handle" "$dispatch_id"
+}
+
+register_dispatch_and_reap() {
+  # $1=ledger_file $2=task_id $3=dispatch_id $4=role $5=handle $6=no_reap(0/1)
+  # $7=reap_timeout_ms (default 3600000) — locked ledger append + optional
+  # background reaper spawn. Shared tail for every dispatch path; see
+  # dispatch_task_to_role's own comment for the callers.
+  local ledger_file="$1" task_id="$2" dispatch_id="$3" role="$4" handle="$5"
+  local no_reap="${6:-0}" reap_timeout_ms="${7:-3600000}"
+  local lib_dir orch reaper_dir log pid_file
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  orch="$(cd "$lib_dir/.." && pwd)"
+  ledger_append "$ledger_file" \
+    "taskId=$task_id" "dispatchId=$dispatch_id" "role=$role" "handle=$handle" "status=dispatched"
+  echo "ledger += $role $task_id → $handle" >&2
+  if [[ "$no_reap" -eq 0 ]]; then
+    reaper_dir="$orch/reapers"
+    mkdir -p "$reaper_dir"
+    # Keep the last 50 reaper logs; this directory otherwise grows forever.
+    # `|| true`: an empty dir makes the glob match nothing, and under
+    # set -e/pipefail that would otherwise kill the whole dispatch (see
+    # orca-dispatch-role.sh's own regression note on this exact bug).
+    ls -1t "$reaper_dir"/*.log 2>/dev/null | tail -n +51 | while read -r old; do
+      rm -f "$old" "${old%.log}.pid"
+    done || true
+    log="$reaper_dir/${task_id}.log"
+    pid_file="$reaper_dir/${task_id}.pid"
+    nohup "$lib_dir/orca-reap-task.sh" \
+      --task "$task_id" --handle "$handle" --role "$role" \
+      --dispatch "$dispatch_id" --timeout-ms "$reap_timeout_ms" \
+      >>"$log" 2>&1 &
+    echo $! >"$pid_file"
+    echo "Auto-reaper started pid=$(cat "$pid_file") log=$log" >&2
+    echo "Worker tab will release automatically when the dispatch settles." >&2
+  else
+    echo "Reaper disabled. Tab will linger unless closed elsewhere." >&2
+  fi
 }
 
 ledger_append() {
@@ -191,60 +350,17 @@ is_debater() {
   esac
 }
 
-dispatch_tail_block() {
-  # $1=handle  $2=close|persist  $3=run_id (optional)
-  local handle="$1" mode="${2:-close}" run_id="${3:-}"
-
-  # Run scope for the WORKER's own outbound calls.
-  #
-  # Orca generates the dispatch preamble, and its `orca orchestration send`
-  # example carries no --run. A worker that copies it verbatim — exactly what
-  # the preamble instructs — has worker_done refused with legacy_read_only,
-  # because the worker's terminal is not bound to a Run either.
-  #
-  # Measured live: a probe worker completed its task and reported
-  # "outcome=succeeded ... Note: orchestration send worker_done blocked by
-  # legacy_read_only process identity from this terminal."
-  #
-  # The coordinator-side fix (resolve_run_id + --run on task-create/dispatch)
-  # does NOT cover this — the send originates in the worker's terminal, so the
-  # flag has to reach it as an instruction. Without this block every --wait
-  # dispatch times out, and every debate round forfeits workers that did the
-  # work and had no way to say so.
-  local run_scope=""
-  if [[ -n "$run_id" ]]; then
-    run_scope="
-RUN SCOPE (required — the command block above is incomplete without it):
-Add --run ${run_id} to EVERY 'orca orchestration' command you run, including
-worker_done and heartbeats. The preamble's examples omit it; sent without it,
-your messages are refused (legacy_read_only) and the coordinator never sees
-them, no matter how well the task itself went. For example:
-  orca orchestration send --run ${run_id} --from ${handle} \\
-    --type worker_done --subject \"…\" --body \"…\" --outcome succeeded
-"
-  fi
-
-  if [[ "$mode" == "persist" ]]; then
-    cat <<EOF
-${run_scope}
-STAY-OPEN (required):
-After you send worker_done exactly once, do NOT close this terminal and do NOT
-run any close command. Stay idle and wait for the next dispatch in this debate.
-Do not poll orchestration.
-Your Orca terminal handle for this session is: ${handle}
-The debate driver closes this tab when the debate ends.
-EOF
-  else
-    cat <<EOF
-${run_scope}
-AUTO-CLOSE (required, automatic):
-After you send worker_done exactly once, immediately run this shell command (do not skip):
-  orca terminal close --terminal ${handle} --tab --json
-Your Orca terminal handle for this session is: ${handle}
-Then stop. Do not poll orchestration. A background reaper also closes this tab if needed.
-EOF
-  fi
-}
+# dispatch_tail_block (RUN SCOPE + AUTO-CLOSE/STAY-OPEN) was removed after
+# references/orca-contract-2026-08-13.md S1-a/S1-c: dispatching now goes
+# through `orca orchestration worker-start --terminal`, whose own injected
+# preamble already carries the worker's dispatch capability (measured live:
+# a worker_done arrived with correct taskId/dispatchId with NO --run text in
+# its spec at all — see the spike's worker-read transcript). And Orca's
+# contract now explicitly FORBIDS what AUTO-CLOSE told every worker to do:
+# "After sending worker_done, end your turn and idle at the agent prompt...
+# do not attempt to close the terminal yourself." The coordinator (reaper)
+# decides close vs. reuse now, via worker_release_or_close below — never the
+# worker's own spec text.
 
 dispatch_status() {
   # $1=task_id → dispatch status word (never fails)
@@ -1231,17 +1347,22 @@ persona_body() {
 seed_text() {
   # $1=role $2=model $3=body → full seed message on stdout
   local role="$1" model="$2" body="$3" ending
+  # Both branches now end the same way: send worker_done once, then idle —
+  # never self-close. Orca's contract forbids a worker closing its own
+  # terminal ("do not attempt to close the terminal yourself"); the
+  # coordinator decides close vs. reuse afterward (see
+  # worker_release_or_close). This used to differ per role (debaters stayed
+  # open, the six primaries ran a self-close command) — that distinction is
+  # gone because self-close was never valid for either group, and staying
+  # idle after worker_done is now simply the correct behavior for everyone.
   if is_debater "$role"; then
     ending="When you receive an Orca orchestration dispatch preamble, follow it exactly and send worker_done once with taskId+dispatchId.
-This terminal is one seat in a multi-round debate: after worker_done, stay open and idle until the next round's dispatch arrives. Never close this terminal yourself.
+This terminal is one seat in a multi-round debate: after worker_done, stay idle and wait for the next round's dispatch. Never close this terminal yourself — the debate driver manages it.
 Write only to the output file named in your dispatch spec. Never edit any other file. Never run git commit or git add.
 Until a dispatch arrives, acknowledge role and wait."
   else
     ending="When you receive an Orca orchestration dispatch preamble, follow it exactly and send worker_done once with taskId+dispatchId.
-End of task (automatic close): after worker_done, immediately run
-  orca terminal close --terminal <YOUR_HANDLE> --tab --json
-using the handle given in the dispatch AUTO-CLOSE block. Then stop — no polling, no check loop.
-A background reaper also closes the tab; self-close is belt-and-suspenders.
+End of task: after worker_done, stop and idle at your prompt. Do not close this terminal yourself and do not poll orchestration — the coordinator releases or reuses it.
 Until a dispatch arrives, acknowledge role and wait."
   fi
   cat <<EOF
@@ -1569,6 +1690,90 @@ terminal_close_and_verify() {
     2)
       echo "terminal_close_and_verify: could not confirm $handle is gone after the close attempt (liveness undetermined — present but disconnected, or orca terminal list unavailable)" >&2
       return 2
+      ;;
+  esac
+}
+
+worker_show_state() {
+  # $1=dispatch_id → "worker_state<TAB>dispatch_status" on stdout, never
+  # fails. Mirrors dispatch_status()'s __parse_error__ sentinel in BOTH
+  # fields on any read/parse failure, so a `worker-show` JSON-shape change is
+  # caught the same way a `dispatch-show` one already is (see
+  # orca-reap-task.sh's own shadowed dispatch_status), instead of silently
+  # reading as "still pending" forever.
+  local out
+  out="$(orca orchestration worker-show --dispatch "$1" --json 2>/dev/null)" \
+    || { printf '__parse_error__\t__parse_error__'; return 0; }
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("__parse_error__\t__parse_error__")
+    raise SystemExit(0)
+r = d.get("result") or d
+worker = r.get("worker") or {}
+disp = r.get("dispatch") or {}
+ws = worker.get("state") or "__parse_error__"
+ds = disp.get("status") or "__parse_error__"
+print(f"{ws}\t{ds}")
+' 2>/dev/null || printf '__parse_error__\t__parse_error__'
+}
+
+worker_release_or_close() {
+  # $1=dispatch_id $2=handle → tries the native release first (it preserves
+  # an inspectable output archive before closing — see `worker-read`), and
+  # falls back to this package's own terminal_close_and_verify only when
+  # Orca itself did not close our tab. That fallback is NOT an edge case:
+  # references/orca-contract-2026-08-13.md S1-a measured that ANY terminal
+  # this package pre-creates via `terminal create --command <custom argv>`
+  # (required for grok/agy, and for the permission-bypass flags on all four
+  # roles) comes back `state:"retained" reason:"external_terminal"
+  # archive:null` — Orca will never own-and-close a tab it did not create
+  # itself. `worker-release` is still called every time regardless, because
+  # a future Orca version or a `--terminal`-less path could report
+  # "released", and skipping the call would silently forfeit that.
+  #
+  # Prints one of: released / closed / close_failed / close_undetermined /
+  # release_unknown on stdout (the ledger status word). Return code mirrors
+  # terminal_close_and_verify's 0/1/2 contract; release_unknown returns 1
+  # (per Orca's own contract: "Only release_unknown exits 1").
+  local dispatch_id="$1" handle="$2" release_json="" state=""
+  if [[ -n "$dispatch_id" ]]; then
+    release_json="$(orca orchestration worker-release --dispatch "$dispatch_id" --json 2>/dev/null)" || release_json=""
+  fi
+  if [[ -n "${release_json// }" ]]; then
+    state="$(printf '%s' "$release_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
+r = d.get("result") or d
+print(r.get("state") or "")
+' 2>/dev/null || true)"
+  fi
+  case "$state" in
+    released|already_released)
+      printf 'released'
+      return 0
+      ;;
+    release_unknown)
+      echo "worker_release_or_close: worker-release returned release_unknown for dispatch=$dispatch_id — Orca cannot prove the worker settled; not attempting a close" >&2
+      printf 'release_unknown'
+      return 1
+      ;;
+    *)
+      # retained / release_pending / empty (call failed, or no dispatch_id) —
+      # Orca did not take ownership of closing this tab. Fall back.
+      local close_rc=0
+      terminal_close_and_verify "$handle" || close_rc=$?
+      case "$close_rc" in
+        0) printf 'closed'; return 0 ;;
+        1) printf 'close_failed'; return 1 ;;
+        *) printf 'close_undetermined'; return 2 ;;
+      esac
       ;;
   esac
 }

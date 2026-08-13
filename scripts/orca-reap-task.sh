@@ -1,28 +1,39 @@
 #!/usr/bin/env bash
-# Automatically close a worker terminal when its dispatch finishes.
+# Automatically release/close a worker terminal when its dispatch finishes.
 #
-# Polls `orca orchestration dispatch-show` (does NOT consume inbox messages).
-# On status completed|failed → `orca terminal close --tab`.
+# With --dispatch (the normal path — orca-dispatch-role.sh always passes it):
+# polls `orca orchestration worker-show` (does NOT consume inbox messages).
+# On worker state succeeded|failed → worker_release_or_close (orca-roles-lib.sh):
+# tries the native `worker-release` first, falls back to this package's own
+# close for any pre-created custom-argv terminal Orca reports as retained
+# (see references/orca-contract-2026-08-13.md S1-a — this is the common case
+# for every role tab this package creates, not an edge case).
 #
-# Also watches for a STALLED worker (Task: deadlock fix): dispatch-show alone
-# cannot tell a genuinely working worker from one that crashed, hit a rate
-# limit, or had its own worker_done refused (see dispatch_tail_block's RUN
-# SCOPE comment in orca-roles-lib.sh) — every one of those leaves status
-# stuck exactly where it was, and this reaper used to poll all the way to
+# Without --dispatch (back-compat: direct callers / older ledger rows), polls
+# `orca orchestration dispatch-show --task` and closes via
+# terminal_close_and_verify directly, unchanged from before.
+#
+# Also watches for a STALLED worker (Task: deadlock fix): status alone cannot
+# tell a genuinely working worker from one that crashed, hit a rate limit, or
+# had its own worker_done refused — every one of those leaves status stuck
+# exactly where it was, and this reaper used to poll all the way to
 # TIMEOUT_MS (1h) believing "may still be running" regardless. After
 # --idle-grace-ms, it periodically re-reads the worker's own screen
 # (_terminal_ready_check / _terminal_stability_key, orca-roles-lib.sh) and
 # treats an UNCHANGED, non-busy screen across --idle-strikes consecutive
-# probes as stalled: reports it, closes the tab, and marks the ledger
-# "closed_stalled" (or "stalled" with --no-close-on-idle). A BUSY verdict, or
-# any change in the normalized screen content, resets the streak — this must
+# probes as stalled: reports it and marks the ledger "stalled", but does NOT
+# close the tab — Orca's contract forbids releasing/closing a worker "because
+# of a timeout, TUI idle state, heartbeat, status, question, escalation".
+# Polling continues; the overall --timeout-ms backstop (reap_fail, exit 1)
+# is what still escalates a worker that never settles. A BUSY verdict, or any
+# change in the normalized screen content, resets the streak — this must
 # never fire on a model that is still actually generating.
 #
 # Intended to be started in the background by orca-dispatch-role.sh so close
 # is automatic without the coordinator running wait-done or close-role.
 #
 # Usage:
-#   orca-reap-task.sh --task task_xxx --handle term_yyy [--role thrifty] [--timeout-ms N]
+#   orca-reap-task.sh --task task_xxx --handle term_yyy [--dispatch ctx_zzz] [--role thrifty] [--timeout-ms N]
 #                      [--idle-grace-ms N] [--idle-probe-ms N] [--idle-strikes N]
 #                      [--no-close-on-idle]
 set -euo pipefail
@@ -39,19 +50,27 @@ LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
 TASK_ID=""
 HANDLE=""
 ROLE=""
+DISPATCH_ID=""
 TIMEOUT_MS=3600000   # 1h default reaper lifetime
 POLL_MS=5000
 IDLE_GRACE_MS=120000  # no idle probe before this much elapsed time
 IDLE_PROBE_MS=30000   # min gap between idle probes (a screen read, not free)
 IDLE_STRIKES=6        # consecutive unchanged probes before "stalled"
-CLOSE_ON_IDLE=1
 
 usage() {
   cat <<'EOF'
 Usage:
-  orca-reap-task.sh --task <task_id> --handle <term_*> [--role ROLE] [--timeout-ms N] [--poll-ms N]
+  orca-reap-task.sh --task <task_id> --handle <term_*> [--dispatch <dispatch_id>] [--role ROLE] [--timeout-ms N] [--poll-ms N]
                      [--idle-grace-ms N] [--idle-probe-ms N] [--idle-strikes N]
                      [--no-close-on-idle]
+
+--dispatch selects the worker-show/worker-release polling+close path (see
+file header). Omit it only for back-compat with pre-migration ledger rows;
+new dispatches always get one from orca-dispatch-role.sh.
+
+--no-close-on-idle is now a no-op kept for CLI compatibility: idle detection
+never closes anymore (Orca's contract forbids it) — it only reports
+"stalled" in the ledger. See --idle-* to tune detection sensitivity.
 EOF
 }
 
@@ -60,12 +79,13 @@ while [[ $# -gt 0 ]]; do
     --task) TASK_ID="${2:?}"; shift 2 ;;
     --handle) HANDLE="${2:?}"; shift 2 ;;
     --role) ROLE="${2:?}"; shift 2 ;;
+    --dispatch) DISPATCH_ID="${2:?}"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="${2:?}"; shift 2 ;;
     --poll-ms) POLL_MS="${2:?}"; shift 2 ;;
     --idle-grace-ms) IDLE_GRACE_MS="${2:?}"; shift 2 ;;
     --idle-probe-ms) IDLE_PROBE_MS="${2:?}"; shift 2 ;;
     --idle-strikes) IDLE_STRIKES="${2:?}"; shift 2 ;;
-    --no-close-on-idle) CLOSE_ON_IDLE=0; shift ;;
+    --no-close-on-idle) shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown: $1" >&2; usage; exit 1 ;;
   esac
@@ -138,6 +158,18 @@ close_handle() {
   # output. Returning $verify_rc here is what lets the caller pick a ledger
   # status that matches reality instead of always writing "closed".
   return "$verify_rc"
+}
+
+release_handle() {
+  # $1=handle → the --dispatch path's settle action: worker_release_or_close
+  # (orca-roles-lib.sh) tries the native worker-release, falls back to this
+  # package's own close. Same 0/1/2 return contract as close_handle; prints
+  # the ledger status word this call actually earned to stdout instead of
+  # close_handle's fixed close/close_failed/close_undetermined vocabulary.
+  local h="$1" status rc=0
+  status="$(worker_release_or_close "$DISPATCH_ID" "$h")" || rc=$?
+  printf '%s' "$status"
+  return "$rc"
 }
 
 mark_ledger() {
@@ -237,21 +269,25 @@ PY
 
 IDLE_STRIKE_COUNT=0
 IDLE_PREV_KEY=""
+IDLE_REPORTED=0
 
 # Idle/liveness probe, called at most once per IDLE_PROBE_MS from the main
-# loop below. Exits the whole script directly on a positive finding (gone, or
-# confirmed stalled); otherwise returns, having only updated the streak
-# counters above for next time.
+# loop below. Exits the whole script directly on a positive finding (the
+# terminal is already gone); otherwise returns, having only updated the
+# streak counters above for next time (a confirmed stall no longer exits —
+# see below).
 idle_probe() {
-  # Case 1: the terminal is already gone. This is the single most common
-  # real-world shape of the deadlock this reaper exists to catch — the
-  # worker's own AUTO-CLOSE instruction (dispatch_tail_block) says "after you
-  # send worker_done, immediately close", and a worker follows that even when
-  # the send itself was refused (legacy_read_only). dispatch-show then never
-  # moves off its prior status, and without this check the reaper would poll
-  # a dead terminal all the way to TIMEOUT_MS. terminal_is_live's contract:
-  # only rc 1 (definitely absent) is actioned; rc 2 (undetermined) falls
-  # through to the screen probe below, same as everywhere else in this repo.
+  # Case 1: the terminal is already gone despite status never having moved.
+  # Historically this was the single most common shape of the deadlock this
+  # reaper exists to catch — the worker's own inject-time text used to tell
+  # it to self-close after worker_done, which it did even when the send
+  # itself was refused (legacy_read_only). That self-close instruction is
+  # gone now (workers never close their own tab — see orca-roles-lib.sh's
+  # seed_text), but a terminal can still vanish for other reasons (crash,
+  # session end), and without this check the reaper would poll a dead
+  # terminal all the way to TIMEOUT_MS. terminal_is_live's contract: only
+  # rc 1 (definitely absent) is actioned; rc 2 (undetermined) falls through
+  # to the screen probe below, same as everywhere else in this repo.
   local live_rc=0
   terminal_is_live "$HANDLE" 2>/dev/null || live_rc=$?
   if [[ "$live_rc" -eq 1 ]]; then
@@ -300,27 +336,22 @@ idle_probe() {
     return 0
   fi
 
-  echo "reap: $HANDLE screen unchanged for $IDLE_STRIKE_COUNT probe(s) while task $TASK_ID stayed status=$STATUS — treating as stalled" >&2
+  # Orca's contract: "Do not release a worker because of a timeout, TUI idle
+  # state, heartbeat, status, question, escalation." This used to close the
+  # tab and exit 1 here (ledger "closed_stalled") — that violated exactly
+  # this rule. Now it only reports: mark the ledger once (not every probe —
+  # IDLE_REPORTED guards that), keep polling toward the real backstop
+  # (reap_fail at TIMEOUT_MS), and let a genuinely-gone terminal still be
+  # caught by Case 1 above on a later probe.
+  echo "reap: $HANDLE screen unchanged for $IDLE_STRIKE_COUNT probe(s) while task $TASK_ID stayed status=$STATUS — reporting stalled, not closing (Orca contract forbids releasing on idle state)" >&2
   printf '%s\n' "$screen" | tail -n 5 >&2
-
-  if [[ "$CLOSE_ON_IDLE" -eq 0 ]]; then
+  if [[ "$IDLE_REPORTED" -eq 0 ]]; then
     mark_ledger "stalled" "reason=idle_screen_unchanged"
-    echo "reap: --no-close-on-idle set — leaving $HANDLE open, not closing" >&2
-    IDLE_STRIKE_COUNT=0
-    IDLE_PREV_KEY=""
-    return 0
+    IDLE_REPORTED=1
   fi
-
-  local close_rc=0
-  close_handle "$HANDLE" || close_rc=$?
-  case "$close_rc" in
-    0) mark_ledger "closed_stalled" "reason=idle_screen_unchanged" ;;
-    1) mark_ledger "close_failed" "reason=idle_screen_unchanged" ;;
-    2) mark_ledger "close_undetermined" "reason=idle_screen_unchanged" ;;
-    *) mark_ledger "close_undetermined" "reason=idle_screen_unchanged" ;;
-  esac
-  echo "reap: FAILED — task $TASK_ID stalled (worker idle, dispatch-show never left status=$STATUS) — check orca-status.sh" >&2
-  exit 1
+  IDLE_STRIKE_COUNT=0
+  IDLE_PREV_KEY=""
+  return 0
 }
 
 # Give up loudly. Deliberately does NOT close: when the status could not be
@@ -361,7 +392,35 @@ print(status or "__parse_error__")
 ' 2>/dev/null || printf '__parse_error__'
 }
 
-echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} timeout-ms=$TIMEOUT_MS idle-grace-ms=$IDLE_GRACE_MS idle-probe-ms=$IDLE_PROBE_MS idle-strikes=$IDLE_STRIKES"
+# poll_status → one of: settled / __parse_error__ / (any pending word). With
+# --dispatch, "settled" means worker-show reported the worker itself
+# succeeded/failed OR the dispatch status is completed/failed — either
+# signal is trusted, since they can arrive in either order. Without
+# --dispatch (back-compat), this is exactly the old dispatch_status(TASK_ID)
+# shadow below, unchanged.
+poll_status() {
+  if [[ -n "$DISPATCH_ID" ]]; then
+    local out worker_state disp_status
+    out="$(worker_show_state "$DISPATCH_ID")"
+    worker_state="${out%%$'\t'*}"
+    disp_status="${out#*$'\t'}"
+    case "$worker_state" in
+      succeeded|failed) printf 'settled'; return 0 ;;
+    esac
+    case "$disp_status" in
+      completed|failed) printf 'settled'; return 0 ;;
+    esac
+    if [[ "$worker_state" == "__parse_error__" && "$disp_status" == "__parse_error__" ]]; then
+      printf '__parse_error__'
+      return 0
+    fi
+    printf '%s' "${worker_state:-unknown}"
+    return 0
+  fi
+  dispatch_status "$TASK_ID"
+}
+
+echo "reap: watching task=$TASK_ID handle=$HANDLE role=${ROLE:-} dispatch=${DISPATCH_ID:-none} timeout-ms=$TIMEOUT_MS idle-grace-ms=$IDLE_GRACE_MS idle-probe-ms=$IDLE_PROBE_MS idle-strikes=$IDLE_STRIKES"
 START_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 POLL_S="$(python3 -c 'import sys; print(max(0.1, int(sys.argv[1])/1000))' "$POLL_MS")"
 PARSE_ERRORS=0
@@ -375,30 +434,42 @@ while true; do
     reap_fail "timeout after ${ELAPSED}ms without a terminal status"
   fi
 
-  STATUS="$(dispatch_status "$TASK_ID")"
+  STATUS="$(poll_status)"
   case "$STATUS" in
-    completed|failed)
-      echo "reap: task $TASK_ID status=$STATUS — closing worker"
-      # Fix round 1 (Finding 1): close_handle can now legitimately return
-      # 1 (still live) or 2 (undetermined), not just 0 — never call it
-      # bare under this script's `set -euo pipefail`, or a real close
-      # failure would kill the reaper mid-cycle instead of reaching
-      # mark_ledger at all. The `*)` arm is defensive only: close_handle's
-      # own contract is 0/1/2, matching terminal_close_and_verify.
-      close_rc=0
-      close_handle "$HANDLE" || close_rc=$?
-      case "$close_rc" in
-        0) mark_ledger "closed" ;;
-        1) mark_ledger "close_failed" ;;
-        2) mark_ledger "close_undetermined" ;;
-        *) mark_ledger "close_undetermined" ;;
-      esac
+    completed|failed|settled)
+      echo "reap: task $TASK_ID status=$STATUS — releasing worker"
+      if [[ -n "$DISPATCH_ID" ]]; then
+        # release_handle prints the ledger status it earned (released /
+        # closed / close_failed / close_undetermined / release_unknown) —
+        # see worker_release_or_close's own comment for why the fallback
+        # close path is the common case, not an edge case.
+        rel_status="released"
+        rel_rc=0
+        rel_status="$(release_handle "$HANDLE")" || rel_rc=$?
+        mark_ledger "$rel_status"
+        [[ "$rel_rc" -eq 1 && "$rel_status" == "release_unknown" ]] && exit 1
+      else
+        # Fix round 1 (Finding 1): close_handle can now legitimately return
+        # 1 (still live) or 2 (undetermined), not just 0 — never call it
+        # bare under this script's `set -euo pipefail`, or a real close
+        # failure would kill the reaper mid-cycle instead of reaching
+        # mark_ledger at all. The `*)` arm is defensive only: close_handle's
+        # own contract is 0/1/2, matching terminal_close_and_verify.
+        close_rc=0
+        close_handle "$HANDLE" || close_rc=$?
+        case "$close_rc" in
+          0) mark_ledger "closed" ;;
+          1) mark_ledger "close_failed" ;;
+          2) mark_ledger "close_undetermined" ;;
+          *) mark_ledger "close_undetermined" ;;
+        esac
+      fi
       exit 0
       ;;
     __parse_error__)
       PARSE_ERRORS=$((PARSE_ERRORS + 1))
       if [[ "$PARSE_ERRORS" -ge "$MAX_PARSE_ERRORS" ]]; then
-        reap_fail "dispatch-show unreadable ${PARSE_ERRORS}x (output shape changed?)"
+        reap_fail "status unreadable ${PARSE_ERRORS}x (output shape changed?)"
       fi
       sleep "$POLL_S"
       ;;

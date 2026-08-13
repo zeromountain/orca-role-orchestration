@@ -625,7 +625,7 @@ trap 'exit 143' TERM
 # comment) — this preflight therefore guarantees "created + seeded at least
 # once + currently live" for a reused seat, not "ready at this exact
 # instant". Real-time readiness right before injection remains the job of
-# orca-dispatch-role.sh's own terminal_wait_ready gate before --inject,
+# orca-dispatch-role.sh's own terminal_wait_ready gate before worker-start,
 # which still runs on every dispatch regardless of this preflight.
 if [[ "$DRY_RUN" -eq 0 ]]; then
   # Run scope gate — cheapest possible failure, and it must come BEFORE any

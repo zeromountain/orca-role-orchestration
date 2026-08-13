@@ -125,7 +125,11 @@ with open(sys.argv[1]) as stream:
             row = json.loads(line)
         except Exception:
             continue
-        if row.get("status") != "closed":
+        # "released" (native worker-release succeeded) is as terminal as
+        # "closed" (our own fallback close succeeded) — both are the
+        # settled-and-cleaned-up outcome. See worker_release_or_close in
+        # orca-roles-lib.sh for the full status vocabulary.
+        if row.get("status") not in ("closed", "released"):
             rows.append(row)
 for row in rows:
     print("  {status:<13} {role:<10} {task}  {handle}".format(
@@ -140,12 +144,13 @@ PY
   count="$(printf '%s' "$OPEN_ROWS" | sed -n 's/^__COUNT__//p')"
   printf '%s\n' "$OPEN_ROWS" | grep -v '^__COUNT__' | grep -v '^$' || true
   if [[ "${count:-0}" -gt 0 ]]; then
-    # reap_failed/close_failed: the reaper gave up with the tab possibly
-    # still open. stalled/closed_stalled: the idle probe found a worker that
-    # stopped making progress (see orca-reap-task.sh) — the tab itself may
-    # already be closed, but the underlying task never actually reported
-    # done and is worth a human look either way.
-    if printf '%s' "$OPEN_ROWS" | grep -q 'reap_failed\|close_failed\|stalled'; then
+    # reap_failed/close_failed/release_unknown: the reaper gave up with the
+    # tab possibly still open (release_unknown is the native-release
+    # equivalent — Orca itself could not prove the worker settled, see
+    # worker_release_or_close). stalled: the idle probe found a worker that
+    # stopped making progress (see orca-reap-task.sh) — it is deliberately
+    # NOT closed on that alone, so it is always worth a human look.
+    if printf '%s' "$OPEN_ROWS" | grep -q 'reap_failed\|close_failed\|release_unknown\|stalled'; then
       problem "  ${count} open row(s), including FAILED or STALLED dispatches — worker tabs may still be burning sessions, or finished without reporting."
       problem "    close manually: orca-close-role.sh <role|term_*>"
     else

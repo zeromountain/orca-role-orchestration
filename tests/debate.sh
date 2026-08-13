@@ -86,16 +86,20 @@ assert R1_body_codex    "role_fallback_body debater_codex | grep -qi 'feasibilit
 assert R2_yes "is_debater debater_claude"
 assert R2_no  "! is_debater architect"
 
-# --- R3 dispatch_tail_block ---
-assert R3_close_has_close   "dispatch_tail_block term_x close   | grep -q 'orca terminal close'"
-assert R3_persist_no_close  "! dispatch_tail_block term_x persist | grep -q 'orca terminal close'"
-assert R3_persist_says_stay "dispatch_tail_block term_x persist | grep -q 'STAY-OPEN'"
-assert R3_persist_handle    "dispatch_tail_block term_x persist | grep -q 'term_x'"
+# --- R3: dispatch_tail_block was removed entirely after
+# references/orca-contract-2026-08-13.md S1-c (worker-start injects the
+# worker's dispatch identity itself; self-close is forbidden regardless of
+# --persist — see orca-roles-lib.sh's removal comment). Nothing to unit-test
+# at the function level anymore; the P-series below covers the end-to-end
+# absence through the real orca-dispatch-role.sh.
 
-# --- R4 seed_text ---
-assert R4_debater_no_close "! seed_text debater_grok grok-4.5 'body' | grep -q 'terminal close'"
-assert R4_debater_stays    "seed_text debater_grok grok-4.5 'body' | grep -q 'stay open'"
-assert R4_normal_closes    "seed_text architect claude-opus-5 'body' | grep -q 'terminal close'"
+# --- R4 seed_text: neither role type gets a self-close COMMAND anymore —
+# only a "never close it yourself" instruction, since Orca's contract
+# forbids a worker closing its own terminal either way.
+assert R4_debater_no_close_cmd "! seed_text debater_grok grok-4.5 'body' | grep -q 'orca terminal close'"
+assert R4_debater_never_self_close "seed_text debater_grok grok-4.5 'body' | grep -q 'Never close this terminal yourself'"
+assert R4_normal_no_close_cmd "! seed_text architect claude-opus-5 'body' | grep -q 'orca terminal close'"
+assert R4_normal_never_self_close "seed_text architect claude-opus-5 'body' | grep -q 'Do not close this terminal yourself'"
 assert R4_body_included    "seed_text architect claude-opus-5 'MARKER_BODY' | grep -q 'MARKER_BODY'"
 
 # --- R5 dispatch/close role whitelists ---
@@ -652,7 +656,7 @@ assert F5_sigterm_stops    "! grep -q '=== ROUND 3' \"$F5_LOG\""
 # (verified: no file below mentions the debate driver or the debate mode before
 # Task 8's docs land), so each one only goes green once the real documentation
 # is written — not merely because the file exists.
-assert G1_cmd "[[ -f \"$ROOT/commands/debate.md\" ]]"
+assert G1_cmd "[[ -f \"$ROOT/commands/orca-debate.md\" ]]"
 assert G1_prompt "[[ -f \"$ROOT/prompts/orca-debate.md\" ]]"
 assert G1_skill_mode "grep -q 'orca-debate.sh' \"$ROOT/SKILL.md\""
 assert G1_skill_keywords "grep -q '아이디어 토론' \"$ROOT/SKILL.md\""
@@ -670,14 +674,14 @@ assert G1_playbook_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/templates
 assert G1_skill_fresh "! grep -qE 'Opus 4\\.8|Gemini 3\\.5' \"$ROOT/SKILL.md\""
 
 # --- G2 (whole-branch review, item 6): both templates' "optional block"
-# example, and commands/wait.md's argument-hint, must teach the SAFE
+# example, and commands/orca-wait.md's argument-hint, must teach the SAFE
 # orca-wait-done.sh invocation (--task pinned) rather than the bare --role
 # form — orca-wait-done.sh's own header explains at length why the bare form
 # closes the wrong tab once a debate has left worker_done messages queued
 # (the debate path deliberately never drains its inbox). ---
 assert G2_playbook_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty --task' \"$ROOT/templates/PLAYBOOK.md\""
 assert G2_scripts_wait_shows_task "grep -q -- 'orca-wait-done.sh --role thrifty --task' \"$ROOT/templates/SCRIPTS.md\""
-assert G2_wait_cmd_hint_has_task "grep -q -- '--task ID' \"$ROOT/commands/wait.md\""
+assert G2_wait_cmd_hint_has_task "grep -q -- '--task ID' \"$ROOT/commands/orca-wait.md\""
 
 # --- G3 (item 6 remainder): the three assertions above pin the DOCS, but the
 # same unsafe form was still being EMITTED AT RUNTIME by two scripts —
@@ -1194,8 +1198,8 @@ assert H9_gitignore_no_dup "[[ \"$h9_count\" -eq 1 ]]"
 # ============================================================================
 # Task 2 (orphan sweeper + dead-man watchdog for --persist): L-series (lock
 # primitives, pure — no orca, no processes), O-series (sweep mode against a
-# stubbed orca), P-series (--persist end-to-end selects STAY-OPEN, via a
-# stubbed orca, matching the H-series pattern), W-series (the watchdog
+# stubbed orca), P-series (--persist end-to-end skips the reaper and never
+# emits a tail-block, via a stubbed orca, matching the H-series pattern), W-series (the watchdog
 # daemon itself — real background processes against a stubbed orca, never
 # the real runtime; every backgrounded pid is appended to CLEANUP_PIDS so
 # the file-level EXIT trap force-kills anything still alive no matter how
@@ -1946,11 +1950,16 @@ assert O10_role_null_skip_reason_not_swallowed \
   "grep -q 'term_role_null_too_young.*too young, guard against mid-creation race' \"$o10_dir/sweep.out\""
 
 # ----------------------------------------------------------------------------
-# P-series: --persist actually selects the STAY-OPEN tail (not AUTO-CLOSE),
-# end-to-end through the real orca-dispatch-role.sh against a stubbed orca —
-# not just at the dispatch_tail_block()/seed_text() function level (R3/R4
-# above already cover those). Captures the exact --spec bytes handed to
-# `orca orchestration task-create --json`.
+# P-series: dispatch_tail_block (STAY-OPEN / AUTO-CLOSE) was removed after
+# references/orca-contract-2026-08-13.md S1-c — worker-start injects the
+# worker's dispatch identity itself, and self-close is forbidden regardless
+# of --persist now (see orca-roles-lib.sh's removal comment). --persist's
+# only remaining effect is skipping the reaper spawn; the --spec bytes are
+# now IDENTICAL whether or not --persist is passed. This end-to-end check
+# (through the real orca-dispatch-role.sh against a stubbed orca) proves
+# that absence, instead of the old presence check for text that no longer
+# exists. Captures the exact --spec bytes handed to `orca orchestration
+# task-create --json`.
 # ----------------------------------------------------------------------------
 persist_sandbox="$tmpdir/persist-sandbox/scripts"
 mkdir -p "$persist_sandbox"
@@ -1990,6 +1999,7 @@ case "$1 $2" in
     echo '{"ok":true,"result":{"task":{"id":"task_persisttest"}}}'
     ;;
   "orchestration dispatch") echo '{"ok":true,"result":{"dispatch":{"id":"disp_persisttest"}}}' ;;
+  "orchestration worker-start") echo '{"ok":true,"result":{"dispatchId":"ctx_persisttest","taskId":"task_persisttest","state":"ready"}}' ;;
   *) echo '{"ok":true}' ;;
 esac
 exit 0
@@ -2005,7 +2015,8 @@ p1_rc=0
   "$PERSIST_DISPATCH" debater_claude --persist --spec "irrelevant body one"
 ) >"$p_marker_1/persist.out" 2>"$p_marker_1/persist.err" || p1_rc=$?
 assert P1_persist_dispatch_ok "[[ \"$p1_rc\" -eq 0 ]]"
-assert P1_spec_has_stayopen "grep -q 'STAY-OPEN' \"$p_marker_1/spec.txt\""
+assert P1_spec_no_stayopen "! grep -q 'STAY-OPEN' \"$p_marker_1/spec.txt\""
+assert P1_spec_no_autoclose "! grep -q 'AUTO-CLOSE' \"$p_marker_1/spec.txt\""
 assert P1_spec_no_close_cmd "! grep -q 'orca terminal close' \"$p_marker_1/spec.txt\""
 
 p_marker_2="$tmpdir/persist-marker-2"
@@ -2016,9 +2027,11 @@ p2_rc=0
   export P_MARKER_DIR="$p_marker_2"
   "$PERSIST_DISPATCH" debater_claude --no-reap --spec "irrelevant body two"
 ) >"$p_marker_2/persist.out" 2>"$p_marker_2/persist.err" || p2_rc=$?
-assert P2_autoclose_dispatch_ok "[[ \"$p2_rc\" -eq 0 ]]"
-assert P2_spec_has_autoclose "grep -q 'AUTO-CLOSE' \"$p_marker_2/spec.txt\""
-assert P2_spec_has_close_cmd "grep -q 'orca terminal close' \"$p_marker_2/spec.txt\""
+assert P2_noreap_dispatch_ok "[[ \"$p2_rc\" -eq 0 ]]"
+# --persist no longer changes the spec text at all (see the P-series header
+# comment) — a plain --no-reap dispatch must show the identical absence.
+assert P2_spec_no_close_cmd "! grep -q 'orca terminal close' \"$p_marker_2/spec.txt\""
+assert P2_spec_no_autoclose "! grep -q 'AUTO-CLOSE' \"$p_marker_2/spec.txt\""
 assert P2_spec_no_stayopen "! grep -q 'STAY-OPEN' \"$p_marker_2/spec.txt\""
 
 # --- P3: a --persist dispatch with an active lock context registers its
@@ -3689,7 +3702,7 @@ assert WD3_exits_zero "[[ \"$wd3_rc\" -eq 0 ]]"
 assert WD3_closes_from_handle "grep -qx term_debaterX \"$wd3_dir/closed.log\""
 assert WD3_single_poll "[[ \"${wd3_calls:-0}\" -eq 1 ]]"
 assert WD3_original_waiting_message \
-  "grep -qF 'Waiting (types=worker_done,escalation,decision_gate timeout-ms=1234)…' \"$wd3_dir/stderr.log\""
+  "grep -qF 'Waiting (types=worker_done,escalation,decision_gate,question timeout-ms=1234)…' \"$wd3_dir/stderr.log\""
 assert WD3_original_received_message \
   "grep -qF 'Received type=worker_done subject=debate leftover from=term_debaterX task=task_X' \"$wd3_dir/stderr.log\""
 assert WD3_no_task_filter_language "! grep -q 'timeout-ms=1234 task=' \"$wd3_dir/stderr.log\""
@@ -3823,6 +3836,7 @@ case "$1 $2" in
   "terminal list") echo '{"ok":true,"result":{"terminals":[{"handle":"term_wd6role","connected":true}]}}' ;;
   "orchestration task-create") echo '{"ok":true,"result":{"task":{"id":"task_wd6_target"}}}' ;;
   "orchestration dispatch") echo '{"ok":true,"result":{"dispatch":{"id":"disp_wd6"}}}' ;;
+  "orchestration worker-start") echo '{"ok":true,"result":{"dispatchId":"ctx_wd6","taskId":"task_wd6_target","state":"ready"}}' ;;
   "orchestration check")
     n=0
     [[ -f "$ORCA_WD6_DIR/check-calls.log" ]] && n=$(wc -l < "$ORCA_WD6_DIR/check-calls.log" | tr -d ' ')
@@ -3873,9 +3887,9 @@ assert WD7_singlewaiter_documented_in_script \
   "grep -qi 'single-waiter' \"$ROOT/scripts/orca-wait-done.sh\""
 assert WD7_singlewaiter_documented_in_docs \
   "grep -qi 'one waiter at a time' \"$ROOT/templates/SCRIPTS.md\""
-assert WD7_dispatch_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/dispatch.md\""
-assert WD7_close_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/close.md\""
-assert WD7_fallback_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/fallback.md\""
+assert WD7_dispatch_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/orca-dispatch.md\""
+assert WD7_close_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/orca-close.md\""
+assert WD7_fallback_md_hint_has_ui_reviewer "grep -q 'ui|reviewer' \"$ROOT/commands/orca-fallback.md\""
 
 # --- WD8: the ORIGINAL bug scenario verbatim, exercised directly on
 # orca-wait-done.sh (not through orca-dispatch-role.sh, so a --role handle

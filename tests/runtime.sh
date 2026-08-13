@@ -57,6 +57,7 @@ new_project() {
   mkdir -p "$PROJ"
   "$INSTALL" --project-root "$PROJ" --project-name "$1" >"$tmproot/$1.install.log" 2>&1
   SCRIPTS="$PROJ/.orca/orchestration/scripts"
+  OR="$PROJ/.orca/orchestration/or"
   STATE="$tmproot/$1.state"
   # Same layout the fake creates on first call — tests write here beforehand.
   mkdir -p "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/screen"
@@ -284,6 +285,31 @@ r7_leak=$?
 assert R7_leak_exit1 "[[ $r7_leak -ne 0 ]]"
 assert R7_leak_named "grep -q reap_failed \"$tmproot/r7.leak.log\""
 
+# Regression: a "released" row (native worker-release succeeded) must be
+# treated as settled, same as "closed" — not flagged as a leak forever.
+# Caught by hand while wiring worker-release in: the old filter only
+# excluded the literal string "closed".
+seed_ledger_row task_r7_released term_2 thrifty
+python3 - "$ledger_file" <<PY
+import json
+path = "$ledger_file"
+rows = []
+with open(path) as stream:
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if row.get("taskId") == "task_r7_released":
+            row["status"] = "released"
+        rows.append(row)
+with open(path, "w") as stream:
+    for row in rows:
+        stream.write(json.dumps(row) + "\n")
+PY
+"$SCRIPTS/orca-status.sh" >"$tmproot/r7.released.log" 2>&1
+assert R7_released_not_leak "! grep -q task_r7_released \"$tmproot/r7.released.log\""
+
 # --- R8 roles.local.json overrides a role's binding ---
 # The common first-install failure: no Grok subscription. Repointing `thrifty`
 # must change the launch command, the recorded model, and which binary the
@@ -312,25 +338,29 @@ assert R8_survives_upgrade "grep -q claude-sonnet-5 \"$PROJ/.orca/orchestration/
 "$INSTALL" --project-root "$PROJ" --project-name r8 --reset >"$tmproot/r8.reset.log" 2>&1
 assert R8_survives_reset "grep -q claude-sonnet-5 \"$PROJ/.orca/orchestration/roles.local.json\""
 
-# --- R9 reaper detects a stalled worker (frozen screen) and closes it -------
-# The deadlock this whole fix exists for: dispatch-show never leaves
-# "dispatched" (worker_done was refused, or the worker crashed), but the
-# worker's OWN screen shows it sitting at an unchanging ready prompt. Tight
-# idle knobs so the test runs in ~1s instead of the 2-minute production grace.
-echo "R9 reaper detects a stalled worker (frozen screen)"
+# --- R9 reaper detects a stalled worker (frozen screen) but never closes ----
+# it — Orca's contract forbids releasing a worker on idle/timeout state
+# alone (see references/orca-contract-2026-08-13.md). The reaper now only
+# REPORTS "stalled" and keeps polling; the overall --timeout-ms backstop is
+# what still escalates (reap_failed) a worker that genuinely never settles.
+# Tight idle knobs + a short overall timeout so the test still runs in ~1s.
+echo "R9 reaper detects a stalled worker but does not close it (contract fix)"
 new_project r9
 printf 'term_r9\trole-grok-thrifty\n' >>"$STATE/terminals"
 seed_ledger_row task_r9 term_r9 thrifty
 printf '%s\n' "❯ " >"$STATE/screen/term_r9"
 "$SCRIPTS/orca-reap-task.sh" --task task_r9 --handle term_r9 --role thrifty \
-  --poll-ms 50 --timeout-ms 10000 \
-  --idle-grace-ms 0 --idle-probe-ms 100 --idle-strikes 3 \
+  --poll-ms 50 --timeout-ms 3000 \
+  --idle-grace-ms 0 --idle-probe-ms 50 --idle-strikes 3 \
   >"$tmproot/r9.log" 2>&1
 r9_rc=$?
 assert R9_nonzero_exit "[[ $r9_rc -ne 0 ]]"
-assert R9_ledger_closed_stalled "[[ \"\$(ledger_status task_r9)\" == closed_stalled ]]"
-assert R9_terminal_gone "[[ \"\$(live_titled term_r9)\" -eq 0 ]]"
+assert R9_ledger_reap_failed "[[ \"\$(ledger_status task_r9)\" == reap_failed ]]"
+assert R9_never_closed_stalled "[[ \"\$(ledger_status task_r9)\" != closed_stalled ]]"
+assert R9_terminal_still_live "[[ \"\$(live_titled term_r9)\" -eq 1 ]]"
+assert R9_no_close_call "[[ \"\$(calls_matching 'terminal close')\" -eq 0 ]]"
 assert R9_log_says_stalled "grep -q stalled \"$tmproot/r9.log\""
+assert R9_log_says_not_closing "grep -q 'not closing' \"$tmproot/r9.log\""
 
 # --- R10 reaper notices a self-closed terminal without waiting out the ------
 # --- full reap timeout (the worker followed AUTO-CLOSE after a refused -----
@@ -434,6 +464,161 @@ printf '{"result":{"count":0,"messages":[]}}\n' >"$STATE/check.json"
   >"$tmproot/r14b.log" 2>&1
 assert R14_recovered "grep -q 'Recovered spooled message' \"$tmproot/r14b.log\""
 assert R14_spool_drained "! grep -q task_other \"$PROJ/.orca/orchestration/inbox-spool.jsonl\" 2>/dev/null"
+
+# --- R15 dispatch attaches workers via worker-start, not dispatch --inject --
+# references/orca-contract-2026-08-13.md S1-b/S1-c: worker-start accepts our
+# pre-created custom-argv terminal and injects the worker's own dispatch
+# identity, so the old `orchestration dispatch --to --inject` call is gone.
+echo "R15 dispatch uses worker-start, not dispatch --inject"
+new_project r15
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r15.boot.log" 2>&1
+: >"$STATE/calls.log"
+export ORCA_RUN_ID="run_r15"
+"$SCRIPTS/orca-dispatch-role.sh" thrifty --spec "do the thing" >"$tmproot/r15.log" 2>&1
+r15_rc=$?
+unset ORCA_RUN_ID
+assert R15_exit0 "[[ $r15_rc -eq 0 ]]"
+assert R15_worker_start_called "[[ \"\$(calls_matching 'orchestration worker-start')\" -eq 1 ]]"
+assert R15_no_dispatch_inject "[[ \"\$(calls_matching 'orchestration dispatch --task')\" -eq 0 ]]"
+r15_task="$(grep -o 'task_id=task_[0-9]*' "$tmproot/r15.log" | head -1 | cut -d= -f2)"
+assert R15_ledger_has_dispatch "python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+r=[x for x in rows if x[\"taskId\"]==sys.argv[2]][0]
+sys.exit(0 if r.get(\"dispatchId\",\"\").startswith(\"ctx_\") else 1)' \"$PROJ/.orca/orchestration/dispatch-ledger.jsonl\" \"$r15_task\""
+# Clean up the background reaper this dispatch started — the fake worker
+# never settles on its own, so it would otherwise poll until REAP_TIMEOUT_MS.
+r15_pid_file="$PROJ/.orca/orchestration/reapers/$r15_task.pid"
+[[ -f "$r15_pid_file" ]] && kill "$(cat "$r15_pid_file")" 2>/dev/null
+
+# --- R16 reaper --dispatch path falls back to close when Orca retains ------
+# the tab — the measured DEFAULT for any pre-created custom-argv terminal
+# (S1-a). worker-release is still called every time; this asserts it is,
+# AND that the fallback close actually fires when release doesn't own it.
+echo "R16 reaper (--dispatch path) falls back to close on a retained tab"
+new_project r16
+printf 'term_r16\trole-grok-thrifty\n' >>"$STATE/terminals"
+seed_ledger_row task_r16 term_r16 thrifty
+mkdir -p "$STATE/workerstate"
+echo succeeded >"$STATE/workerstate/ctx_r16"
+"$SCRIPTS/orca-reap-task.sh" --task task_r16 --handle term_r16 --dispatch ctx_r16 \
+  --poll-ms 100 --timeout-ms 3000 >"$tmproot/r16.log" 2>&1
+r16_rc=$?
+assert R16_exit0 "[[ $r16_rc -eq 0 ]]"
+assert R16_worker_release_called "[[ \"\$(calls_matching 'orchestration worker-release')\" -eq 1 ]]"
+assert R16_fallback_close_called "[[ \"\$(calls_matching 'terminal close')\" -eq 1 ]]"
+assert R16_ledger_closed "[[ \"\$(ledger_status task_r16)\" == closed ]]"
+assert R16_terminal_gone "[[ \"\$(live_titled term_r16)\" -eq 0 ]]"
+
+# --- R17 reaper --dispatch path uses the native release when Orca reports --
+# it — no fallback close call at all.
+echo "R17 reaper (--dispatch path) uses native release when Orca owns the tab"
+new_project r17
+printf 'term_r17\trole-grok-thrifty\n' >>"$STATE/terminals"
+seed_ledger_row task_r17 term_r17 thrifty
+mkdir -p "$STATE/workerstate" "$STATE/releasestate" "$STATE/releasehandle"
+echo succeeded >"$STATE/workerstate/ctx_r17"
+echo released >"$STATE/releasestate/ctx_r17"
+echo term_r17 >"$STATE/releasehandle/ctx_r17"
+"$SCRIPTS/orca-reap-task.sh" --task task_r17 --handle term_r17 --dispatch ctx_r17 \
+  --poll-ms 100 --timeout-ms 3000 >"$tmproot/r17.log" 2>&1
+r17_rc=$?
+assert R17_exit0 "[[ $r17_rc -eq 0 ]]"
+assert R17_worker_release_called "[[ \"\$(calls_matching 'orchestration worker-release')\" -eq 1 ]]"
+assert R17_no_fallback_close "[[ \"\$(calls_matching 'terminal close')\" -eq 0 ]]"
+assert R17_ledger_released "[[ \"\$(ledger_status task_r17)\" == released ]]"
+assert R17_terminal_gone "[[ \"\$(live_titled term_r17)\" -eq 0 ]]"
+
+# --- R18 wait-done acks the batch it processes ------------------------------
+# Real bug (not theoretical): without --ack, `orchestration check` replays
+# the same FIFO batch forever — the root cause behind two known defects in
+# templates/SCRIPTS.md ("a leftover worker_done closes the wrong tab", "only
+# one waiter at a time"). This just asserts the ack call now happens.
+echo "R18 wait-done acks the delivered batch"
+new_project r18
+cat >"$STATE/check.json" <<'JSON'
+{"result":{"count":1,"deliveryId":"delivery_r18","messages":[{"type":"worker_done","from_handle":"term_r18","subject":"done","payload":{"taskId":"task_r18","dispatchId":"ctx_r18"}}]}}
+JSON
+"$SCRIPTS/orca-wait-done.sh" --timeout-ms 300 >"$tmproot/r18.log" 2>&1
+assert R18_acked "grep -q delivery_r18 \"$STATE/acks\" 2>/dev/null"
+
+# --- R19 orca-dispatch-dag.sh wires a full chain but dispatches only step 1 -
+# 2-a: the DAG pattern's later steps are created (task-create --deps) so the
+# graph exists in Orca up front, but only the first (dependency-free) step
+# gets a live worker now — a later step's role may depend on what an earlier
+# step actually produced, so it cannot be pre-dispatched, only pre-wired.
+echo "R19 orca-dispatch-dag.sh wires explore (thrifty->architect->executor)"
+new_project r19
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r19.boot.log" 2>&1
+: >"$STATE/calls.log"
+export ORCA_RUN_ID="run_r19"
+"$SCRIPTS/orca-dispatch-dag.sh" explore "map the auth flow" >"$tmproot/r19.log" 2>&1
+r19_rc=$?
+unset ORCA_RUN_ID
+assert R19_exit0 "[[ $r19_rc -eq 0 ]]"
+assert R19_three_task_creates "[[ \"\$(calls_matching 'orchestration task-create')\" -eq 3 ]]"
+assert R19_one_worker_start "[[ \"\$(calls_matching 'orchestration worker-start')\" -eq 1 ]]"
+assert R19_step1_dispatched "grep -q 'step_1=.*status=dispatched' \"$tmproot/r19.log\""
+assert R19_step2_blocked "grep -q 'step_2=.*status=blocked' \"$tmproot/r19.log\""
+assert R19_step3_blocked "grep -q 'step_3=.*status=blocked' \"$tmproot/r19.log\""
+r19_task1="$(grep -o 'step_1=task_[0-9]*' "$tmproot/r19.log" | head -1 | cut -d= -f2)"
+r19_pid_file="$PROJ/.orca/orchestration/reapers/$r19_task1.pid"
+[[ -f "$r19_pid_file" ]] && kill "$(cat "$r19_pid_file")" 2>/dev/null
+
+# --- R20 orca-dispatch-existing.sh passes --retry-of through to worker-start
+# 2-b (repositioned after the live spike in references/orca-contract-*.md:
+# --retry-of is for same-role crash recovery on an EXISTING task, not a
+# cross-role failover — the spec text can't be reworded on a retry).
+echo "R20 orca-dispatch-existing.sh forwards --retry-of"
+new_project r20
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r20.boot.log" 2>&1
+: >"$STATE/calls.log"
+export ORCA_RUN_ID="run_r20"
+"$SCRIPTS/orca-dispatch-existing.sh" task_r20_existing thrifty --retry-of ctx_r20_old >"$tmproot/r20.log" 2>&1
+r20_rc=$?
+unset ORCA_RUN_ID
+assert R20_exit0 "[[ $r20_rc -eq 0 ]]"
+assert R20_no_task_create "[[ \"\$(calls_matching 'orchestration task-create')\" -eq 0 ]]"
+assert R20_retry_of_forwarded "grep -q -- '--retry-of ctx_r20_old' \"$STATE/calls.log\""
+assert R20_ledger_has_task "grep -q task_r20_existing \"$PROJ/.orca/orchestration/dispatch-ledger.jsonl\""
+r20_pid_file="$PROJ/.orca/orchestration/reapers/task_r20_existing.pid"
+[[ -f "$r20_pid_file" ]] && kill "$(cat "$r20_pid_file")" 2>/dev/null
+
+# --- R21 positional spec + --scope/--done append to the assembled spec -----
+echo "R21 positional spec and --scope/--done"
+new_project r21
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r21.boot.log" 2>&1
+: >"$STATE/calls.log"
+export ORCA_RUN_ID="run_r21"
+"$SCRIPTS/orca-dispatch-role.sh" thrifty "fix the login bug" \
+  --scope src/auth,prisma/schema.prisma --done "pnpm test auth" \
+  >"$tmproot/r21.log" 2>&1
+r21_rc=$?
+unset ORCA_RUN_ID
+assert R21_exit0 "[[ $r21_rc -eq 0 ]]"
+assert R21_spec_has_body "grep -q 'fix the login bug' \"$STATE/calls.log\""
+assert R21_spec_has_scope "grep -q 'Allowed scope: src/auth,prisma/schema.prisma' \"$STATE/calls.log\""
+assert R21_spec_has_done "grep -q 'Done: pnpm test auth' \"$STATE/calls.log\""
+r21_task="$(grep -o 'task_id=task_[0-9]*' "$tmproot/r21.log" | head -1 | cut -d= -f2)"
+r21_pid_file="$PROJ/.orca/orchestration/reapers/$r21_task.pid"
+[[ -f "$r21_pid_file" ]] && kill "$(cat "$r21_pid_file")" 2>/dev/null
+
+# --- R22 `or` is a pure routing alias — same effect as the long form -------
+echo "R22 or router dispatches, checks status, and refuses unknown subcommands"
+new_project r22
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r22.boot.log" 2>&1
+: >"$STATE/calls.log"
+export ORCA_RUN_ID="run_r22"
+"$OR" d thrifty "map the repo" --no-reap >"$tmproot/r22.log" 2>&1
+r22_rc=$?
+assert R22_d_exit0 "[[ $r22_rc -eq 0 ]]"
+assert R22_d_worker_start_called "[[ \"\$(calls_matching 'orchestration worker-start')\" -eq 1 ]]"
+"$OR" s >"$tmproot/r22.s.log" 2>&1
+assert R22_s_reports_roles "grep -q architect \"$tmproot/r22.s.log\""
+unset ORCA_RUN_ID
+"$OR" bogus >"$tmproot/r22.bogus.log" 2>&1
+r22_bogus_rc=$?
+assert R22_unknown_sub_nonzero "[[ $r22_bogus_rc -ne 0 ]]"
+assert R22_unknown_sub_message "grep -q 'Unknown subcommand' \"$tmproot/r22.bogus.log\""
 
 echo
 echo "Results: $pass passed, $fail failed"

@@ -29,11 +29,7 @@ HANDLE=""
 if [[ "$TARGET" == term_* ]]; then
   HANDLE="$TARGET"
 else
-  case "$TARGET" in
-    architect|executor|thrifty|ui|reviewer|fallback) ;;
-    debater_claude|debater_codex|debater_grok|debater_gemini) ;;
-    *) echo "role must be architect|executor|thrifty|ui|reviewer|fallback|debater_{claude,codex,grok,gemini}|term_*" >&2; exit 1 ;;
-  esac
+  validate_role "$TARGET" || exit 1
   if [[ ! -f "$HANDLES_FILE" ]]; then
     echo "No $HANDLES_FILE — nothing to close (ok)"
     exit 0

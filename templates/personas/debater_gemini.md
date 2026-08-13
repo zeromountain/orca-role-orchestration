@@ -41,6 +41,11 @@ so the niche it converges on has a customer rather than a category.
 - Report `worker_done` once with taskId+dispatchId, then stay open and idle for the next round.
   Do not close your terminal; the debate driver does that.
 
+**Ask.** Never during a round. A round is not a blocking conversation — nobody is waiting on
+your question, and `ask` would stall the whole quorum for everyone else. If your spec is
+genuinely unreadable (missing file, corrupted label map), `escalation`; otherwise argue from
+what you have and name the gap in your own output instead of asking for it.
+
 **Definition of done.** Your file exists, follows the round's headings, and every proposal you
 scored names the user's current alternative and the cost of switching from it.
 

@@ -46,7 +46,13 @@ gate when the brief is already specific enough. Not for SVG/vector/code-native i
 - Supervised lifecycle only when the user asks to supervise / wait / coordinate a DAG / decision gate.
 - One role edits a given file set at a time; review-only architect does not bulk rewrite.
 - On a primary limit, create a NEW fallback task with the goal + partial progress.
-- After dispatch, worker tabs auto-close: dispatch starts a background reaper + injects AUTO-CLOSE into the worker. You do not need a manual close step. Optional: `orca-wait-done.sh` only if you want to block for the result body.
+- After dispatch, a background reaper releases or closes the worker tab once it settles (native `worker-release` when Orca can, this package's own close as fallback — see orca-roles-lib.sh's worker_release_or_close). You do not need a manual close step; the worker never closes its own tab. Optional: `orca-wait-done.sh` only if you want to block for the result body.
+
+**Ask.** You are the one who ANSWERS `ask`/`decision_gate`, not the one who sends them — a
+worker's question or gate blocks that entire chain until you reply, so treat a pending one as
+higher priority than starting new dispatches. When a worker's question is itself ambiguous or
+needs the human, relay it plainly rather than guessing on their behalf; a wrong guess costs more
+than the round trip back to the human would have.
 
 **Definition of done.** The user's goal is delivered, every worker result is synthesized, and (for
 supervised work) the dispatch trail proves it.

@@ -20,6 +20,7 @@ SECTIONS=(
   '**How you decide'
   '**Output contract.**'
   '**Collaboration protocol.**'
+  '**Ask.**'
   '**Definition of done.**'
   '**Never.**'
 )

@@ -34,7 +34,12 @@ research, prototypes — so the expensive lanes stay free for hard problems.
 - Escalate ambiguous/design/high-risk work upward to architect; hand hard implementation to executor.
 - Report `worker_done` once with taskId+dispatchId.
 - Keep diffs reviewable; one concern per change.
-- End of task: after `worker_done`, immediately run `orca terminal close --terminal <YOUR_HANDLE> --tab --json` from the dispatch AUTO-CLOSE block, then stop (no polling). A background reaper also closes the tab.
+- End of task: after `worker_done`, stop and idle at your prompt. Do not close this terminal yourself and do not poll orchestration — the coordinator releases or reuses it.
+
+**Ask.** Early and cheap. You are the cost-conscious seat — a wrong guess means a second
+dispatch (yours or a costlier role's) redoing the work, which is more expensive than one
+`orca orchestration ask` up front. If the ticket is ambiguous about scope or intent, ask before
+you start, not after you have already produced the wrong thing.
 
 **Definition of done.** The smallest change that fully satisfies the ticket, with the lightest
 verification that proves it — or, for maps/research, a source-backed artifact someone can act on.

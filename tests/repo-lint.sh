@@ -45,14 +45,17 @@ assert claude_plugin_no_version \
   "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(1 if \"version\" in d else 0)' \"$ROOT/.claude-plugin/plugin.json\""
 
 # --- command / prompt pairing ---
+# Both directories share the SAME filename now (commands/orca-dispatch.md <->
+# prompts/orca-dispatch.md) — Claude commands were renamed to match Codex's
+# prompt naming so a bare `/orca-dispatch` is unambiguous in Claude Code
+# v2.1.216+ even alongside other installed plugins (see CLAUDE.md).
 for c in "$ROOT"/commands/*.md; do
-  base="$(basename "$c" .md)"
-  assert "pair_prompt_exists_$base" "[[ -f \"$ROOT/prompts/orca-$base.md\" ]]"
+  base="$(basename "$c")"
+  assert "pair_prompt_exists_${base%.md}" "[[ -f \"$ROOT/prompts/$base\" ]]"
 done
-for p in "$ROOT"/prompts/orca-*.md; do
-  base="$(basename "$p" .md)"
-  base="${base#orca-}"
-  assert "pair_command_exists_$base" "[[ -f \"$ROOT/commands/$base.md\" ]]"
+for p in "$ROOT"/prompts/*.md; do
+  base="$(basename "$p")"
+  assert "pair_command_exists_${base%.md}" "[[ -f \"$ROOT/commands/$base\" ]]"
 done
 
 # --- personas ---

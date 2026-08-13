@@ -11,11 +11,18 @@
 #   sends/<handle>     concatenated `terminal send --text` bodies (seed assertions)
 #   preview/<handle>   text returned by `terminal show` (limit-pattern tests)
 #   status/<task_id>   dispatch status; default "dispatched"
+#   workerstate/<dispatch_id>  worker-show worker.state; default "running"
+#   releasestate/<dispatch_id> worker-release result; default "retained"
+#                      (matches references/orca-contract-2026-08-13.md S1-a's
+#                      measured default for a pre-created custom-argv
+#                      terminal — set to "released" to test the native path)
+#   acks               one line per `check --ack <id>` call (ack assertions)
 #   check.json         canned `orchestration check --wait` payload
 #   fail/<key>         FAILURE INJECTION. Presence makes that subcommand fail.
 #                      key = subcommand with spaces as dashes: status,
 #                      terminal-list, terminal-close, terminal-create,
-#                      dispatch-show, check
+#                      dispatch-show, check, worker-start, worker-show,
+#                      worker-release
 #                      body = "garbage" (emit non-JSON, exit 0) or anything
 #                      else / empty (exit 1). Default: exit 1.
 set -uo pipefail
@@ -241,8 +248,56 @@ PY
     printf '{"result":{"dispatch":{"id":"disp_x","status":"%s"}}}\n' "$st"
     ;;
 
+  "orchestration worker-start")
+    maybe_fail worker-start
+    mkdir -p "$STATE/workerstate"
+    d="ctx_$(next_id)"
+    printf '{"result":{"dispatchId":"%s","taskId":"%s","state":"ready","stage":"input_accepted","effects":[]}}\n' \
+      "$d" "$(flag_val --task "$@")"
+    ;;
+
+  "orchestration worker-show")
+    maybe_fail worker-show
+    d="$(flag_val --dispatch "$@")"
+    ws="$(cat "$STATE/workerstate/${d:-none}" 2>/dev/null || echo running)"
+    printf '{"result":{"worker":{"state":"%s"},"dispatch":{"status":"dispatched"}}}\n' "$ws"
+    ;;
+
+  "orchestration worker-release")
+    maybe_fail worker-release
+    d="$(flag_val --dispatch "$@")"
+    st="$(cat "$STATE/releasestate/${d:-none}" 2>/dev/null || echo retained)"
+    if [[ "$st" == "released" ]]; then
+      # Realistic: a real native release actually closes the terminal. Find
+      # it by dispatch id via the ledger the caller passed --dispatch for —
+      # simplest is the caller also tells us the handle via the ledger, but
+      # this fake has no ledger access, so tests using "released" pass the
+      # handle to close via $STATE/releasehandle/<dispatch_id> (optional).
+      h="$(cat "$STATE/releasehandle/${d:-none}" 2>/dev/null || echo "")"
+      if [[ -n "$h" ]]; then
+        python3 - "$STATE/terminals" "$h" <<'PY'
+import sys
+path, handle = sys.argv[1:3]
+with open(path) as stream:
+    kept = [ln for ln in stream if ln.partition("\t")[0] != handle]
+with open(path, "w") as stream:
+    stream.writelines(kept)
+PY
+      fi
+      printf '{"result":{"dispatchId":"%s","state":"released","archive":{"status":"ok"}}}\n' "$d"
+    else
+      printf '{"result":{"dispatchId":"%s","state":"%s","reason":"external_terminal","archive":null}}\n' "$d" "$st"
+    fi
+    ;;
+
   "orchestration check")
     maybe_fail check
+    ack="$(flag_val --ack "$@")"
+    if [[ -n "$ack" ]]; then
+      printf '%s\n' "$ack" >>"$STATE/acks"
+      printf '{"result":{"acknowledged":"%s"}}\n' "$ack"
+      exit 0
+    fi
     if [[ -f "$STATE/check.json" ]]; then
       cat "$STATE/check.json"
       # `orchestration check` is destructive against the real inbox — a

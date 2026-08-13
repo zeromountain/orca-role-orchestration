@@ -198,9 +198,14 @@ coordinator runs on your behalf, not something you normally type.
 Korean triggers work the same way (`역할 오케스트레이션`, `모델별 역할 분리`, `이미지 생성`,
 `아이디어 토론`, `니치 찾기`).
 
-Slash commands are the explicit form of the same routes — `/orca-role-orchestration:install`,
-`:bootstrap`, `:dispatch`, `:wait`, `:fallback`, `:debate`, `:close` in Claude Code, and
-`/orca-install`, `/orca-bootstrap`, `/orca-dispatch`, … in Codex.
+Slash commands are the explicit form of the same routes — `/orca-install`, `/orca-bootstrap`,
+`/orca-dispatch`, `/orca-wait`, `/orca-fallback`, `/orca-debate`, `/orca-close`, `/orca-status`
+work bare in both Claude Code (v2.1.216+) and Codex; the namespaced Claude form
+(`/orca-role-orchestration:orca-dispatch`, …) always works as a fallback.
+
+For a fixed role chain, `.orca/orchestration/or dag plan-exec-review "<goal>"` (or the long form
+`orca-dispatch-dag.sh`) wires the whole DAG in one call instead of one dispatch per step — see
+[Plan → implement → review](#plan--implement--review) below.
 
 ### Plan → implement → review
 

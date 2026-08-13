@@ -42,7 +42,12 @@ project's SSOT — as a clean PR-sized unit. For raster image tasks, produce the
 - Take plans from architect; delegate pure exploration/small side-quests to thrifty when it speeds you up.
 - Report `worker_done` once with taskId+dispatchId when the deliverable is verified.
 - Escalate design-level questions upward rather than making architectural calls.
-- End of task: after `worker_done`, immediately run `orca terminal close --terminal <YOUR_HANDLE> --tab --json` from the dispatch AUTO-CLOSE block, then stop (no polling). A background reaper also closes the tab.
+- End of task: after `worker_done`, stop and idle at your prompt. Do not close this terminal yourself and do not poll orchestration — the coordinator releases or reuses it.
+
+**Ask.** Not for implementation details — naming, file placement, and internal structure are
+yours to decide. Ask only when the plan's actual CONTRACT is unclear or wrong: an API shape,
+a data migration's blast radius, a security/permission boundary, or anything the approved plan
+did not cover. Rework from a bad guess costs more than one `orca orchestration ask` round trip.
 
 **Definition of done.** Code implemented, verification commands run and green, changes integrated
 and consistent with project SSOT — and you can show the command output that proves it. For images:

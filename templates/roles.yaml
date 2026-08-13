@@ -377,6 +377,18 @@ routing_table:
     primary: reviewer
     terminal: true
 
+# Design-reference prose only — nothing parses this block (no YAML parser in
+# this package, by design). The patterns below predate, and are richer than,
+# what is actually executable today. For a real, one-shot dispatch of a
+# static role chain, use `.orca/orchestration/scripts/orca-dispatch-dag.sh
+# <pattern> "<goal>"` — its patterns are defined in orca-roles-lib.sh's
+# dag_pattern() under DIFFERENT, shorter names:
+#   plan-exec-review  ~ feature_plan_execute_review below
+#   explore           ~ explore_then_build below
+#   ui                (not represented below)
+# small_fix_fast and high_risk_change below have no orca-dispatch-dag.sh
+# equivalent yet — a single-step or ask-gated chain doesn't need one; use
+# orca-dispatch-role.sh directly.
 dags:
   feature_plan_execute_review:
     description: Standard feature delivery
@@ -588,7 +600,7 @@ lifecycle:
   on_rate_limit: redispatch_to_fallback
   # Supervised role tabs are ephemeral: one live tab per in-flight dispatch,
   # closed on worker_done, recreated on the next dispatch (not long-lived warm pools).
-  close_terminal_after_done: true   # automatic via orca-reap-task.sh + worker AUTO-CLOSE
+  close_terminal_after_done: true   # automatic via orca-reap-task.sh (worker-release, close fallback)
   recreate_terminal_on_dispatch: true  # dispatch rebuilds a dead/missing role tab
   reaper_script: .orca/orchestration/scripts/orca-reap-task.sh
   wait_script: .orca/orchestration/scripts/orca-wait-done.sh  # optional blocking only

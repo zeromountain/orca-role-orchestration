@@ -10,6 +10,12 @@ source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 DISPATCH="$HERE/orca-dispatch-role.sh"
 FALLBACK_MODEL="$(role_meta fallback | cut -f2)"
+# Deliberately NOT using worker-start --retry-of here — spiked live
+# (references/orca-contract-2026-08-13.md, "S2"): it reuses the SAME frozen
+# spec text, so a role-to-fallback pivot's worker would see the ORIGINAL
+# role's framing verbatim ("[ROLE=thrifty | grok-4.5]") on a Gemini Flash
+# seat. --retry-of is wired into orca-dispatch-existing.sh instead, for the
+# case it actually fits: same-role crash recovery.
 FROM=""
 SPEC=""
 SPEC_FILE=""

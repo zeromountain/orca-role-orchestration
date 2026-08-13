@@ -51,7 +51,7 @@ LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
 SPOOL_FILE="$ORCH/inbox-spool.jsonl"
 
 TIMEOUT_MS=900000
-TYPES="worker_done,escalation,decision_gate"
+TYPES="worker_done,escalation,decision_gate,question"
 NO_CLOSE=0
 ROLE_HINT=""
 CLOSE_ON_ESCALATION=0
@@ -233,6 +233,7 @@ count = r.get("count")
 if count is None:
     count = len(msgs) if isinstance(msgs, list) else 0
 print("COUNT=" + shlex.quote(str(count)))
+print("DELIVERY_ID=" + shlex.quote(str(r.get("deliveryId") or "")))
 if not msgs:
     print("MSG_TYPE=")
     print("FROM_HANDLE=")
@@ -261,6 +262,16 @@ print("SUBJECT=" + shlex.quote(str(m.get("subject") or "")))
   if [[ "$COUNT" -eq 0 || -z "${MSG_TYPE:-}" ]]; then
     echo "No matching message (timeout/checkpoint). Worker not closed." >&2
     exit 0
+  fi
+  # Bug fix (real defect, not theoretical): this script never acked before.
+  # `orchestration check` replays the SAME oldest FIFO batch until acked, so
+  # a run that only inspects msgs[0] and exits leaves the whole delivery
+  # unread — the next wait (this task's own re-dispatch, or an unrelated
+  # flow) receives the identical batch again. That is the root cause behind
+  # both known defects in templates/SCRIPTS.md: "a leftover worker_done
+  # closes the wrong tab" and "only one waiter at a time is supported".
+  if [[ -n "${DELIVERY_ID:-}" ]]; then
+    orca orchestration check ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --ack "$DELIVERY_ID" --json >/dev/null 2>&1 || true
   fi
   echo "Received type=$MSG_TYPE subject=$SUBJECT from=$FROM_HANDLE task=$TASK_ID" >&2
 else
@@ -313,6 +324,7 @@ count = r.get("count")
 if count is None:
     count = len(msgs)
 print("COUNT=" + shlex.quote(str(count)))
+print("DELIVERY_ID=" + shlex.quote(str(r.get("deliveryId") or "")))
 
 
 def extract(m):
@@ -378,6 +390,15 @@ for s in skipped:
       echo "No matching message (timeout/checkpoint). Worker not closed." >&2
       exit 0
     fi
+    # Ack this batch now — every message in it has already been either
+    # matched (about to be acted on below) or spooled above, so nothing is
+    # lost by advancing the FIFO. Without this, an unmatched batch replays
+    # forever on the next poll (see the no-filter path's own comment on this
+    # same bug) — that is what made two concurrent task-filtered waiters
+    # unsupported (SCRIPTS.md), not just a documentation caveat.
+    if [[ -n "${DELIVERY_ID:-}" ]]; then
+      orca orchestration check ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} --ack "$DELIVERY_ID" --json >/dev/null 2>&1 || true
+    fi
     if [[ "${MATCHED:-0}" -ne 1 ]]; then
       echo "Received $COUNT message(s), none for task=$TASK_FILTER — continuing to wait." >&2
       continue
@@ -396,12 +417,15 @@ fi
 
 if [[ "$should_close" -ne 1 ]]; then
   if [[ "$MSG_TYPE" == "decision_gate" ]]; then
-    echo "decision_gate — leaving worker open; reply then re-wait." >&2
+    echo "decision_gate — leaving worker open; resolve with 'orca orchestration gate-resolve --id <gate_id> --resolution ...' then re-wait." >&2
     # RC-4: previously this state left no trace anywhere — orca-status.sh had
     # no way to distinguish a worker correctly waiting on the coordinator's
     # reply from one genuinely stuck, and orca-reap-task.sh's idle probe
     # would (wrongly) start counting an unchanging screen against it. Marking
     # the row lets both read the same fact instead of each guessing.
+    mark_ledger_status "$TASK_ID" "awaiting_reply"
+  elif [[ "$MSG_TYPE" == "question" ]]; then
+    echo "question — leaving worker open; reply with 'orca orchestration reply --id <msg_id> --body ...' then re-wait." >&2
     mark_ledger_status "$TASK_ID" "awaiting_reply"
   elif [[ "$MSG_TYPE" == "escalation" ]]; then
     echo "escalation — leaving worker open (use --close-on-escalation to force close)." >&2

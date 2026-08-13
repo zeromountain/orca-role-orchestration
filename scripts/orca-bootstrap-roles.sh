@@ -211,8 +211,8 @@ if [[ "$FAIL_COUNT" -gt 0 ]]; then
 fi
 
 echo "Done. Use PLAYBOOK.md + handles.json for dispatch."
-echo "After dispatch: worker tabs auto-close (background reaper + worker AUTO-CLOSE)."
-echo "  Optional block for results: orca orchestration check --wait --types worker_done,escalation,decision_gate"
+echo "After dispatch: worker tabs auto-release (background reaper calls worker-release, falls back to its own close)."
+echo "  Optional block for results: orca orchestration check --wait --types worker_done,escalation,decision_gate,question"
 echo "Limit failover: .orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec \"...\""
 
 # Run scope check — bootstrap itself needs no Run (it only creates terminals),
