@@ -95,7 +95,7 @@ skill_version() {
 VERSION="$(skill_version)"
 echo "orca-role-orchestration ${VERSION} → ${ROOT} (project=${PROJECT_NAME})"
 
-MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-dispatch-dag.sh orca-dispatch-existing.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh"
+MANAGED_SCRIPTS="orca-bootstrap-roles.sh orca-dispatch-role.sh orca-dispatch-dag.sh orca-dispatch-existing.sh orca-fallback-on-limit.sh orca-roles-lib.sh orca-close-role.sh orca-wait-done.sh orca-reap-task.sh orca-status.sh orca-debate.sh orca-debate-round.sh orca-debate-lib.sh orca-sweep-orphans.sh orca-race.sh orca-review.sh orca-worktrees.sh orca-design-fix.sh"
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   echo "Removing managed scaffold from $ORCH"
@@ -449,7 +449,7 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 GI="$ROOT/.gitignore"
 touch "$GI"
 gi_added=0
-for entry in '.orca/orchestration/handles.json' '.orca/orchestration/dispatch-ledger.jsonl' '.orca/orchestration/*.lock' '.orca/orchestration/reapers/' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/'; do
+for entry in '.orca/orchestration/handles.json' '.orca/orchestration/dispatch-ledger.jsonl' '.orca/orchestration/*.lock' '.orca/orchestration/reapers/' '.orca/orchestration/debates/' '.orca/orchestration/terminal-journal.jsonl' '.orca/orchestration/debate-locks/' '.orca/orchestration/debate-labels/' '.orca/orchestration/debate-manifests/' '.orca/orchestration/race-ledger.jsonl'; do
   if ! grep -qF "$entry" "$GI" 2>/dev/null; then
     if [[ "$gi_added" -eq 0 ]]; then
       printf '\n# Orca local runtime state\n' >> "$GI"
@@ -488,6 +488,7 @@ $MARKER
 - Idea debate: \`.orca/orchestration/scripts/orca-debate.sh --topic "…"\`
 - Limit failover: \`.orca/orchestration/scripts/orca-fallback-on-limit.sh --from <role> --spec "…"\`
 - Doctor: \`.orca/orchestration/scripts/orca-status.sh\`
+- Recipes (short alias): \`.orca/orchestration/or race start "…"\` | \`or review\` | \`or ps\` | \`or gc\` | \`or fix <url>\` — see PLAYBOOK.md "Recipes"
 EOF
   REPORT_REFRESHED+=("AGENTS.md (section appended)")
 fi

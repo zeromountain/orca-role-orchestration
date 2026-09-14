@@ -5,6 +5,7 @@
 #   2 roles      — handles.json entries, live / dead / unknown per handle
 #   3 in-flight  — ledger rows that never reached `closed` (leaks land here)
 #   4 reapers    — background watchers, alive or stale
+#   5 races      — race seats (orca-race.sh) still holding a worktree/tab
 #
 # Run this first whenever a dispatch behaves strangely. Exit 1 if anything in
 # sections 1-3 needs attention, so it doubles as a smoke check.
@@ -16,6 +17,7 @@ ORCH="$(cd "$HERE/.." && pwd)"
 source "$HERE/orca-roles-lib.sh"
 HANDLES_FILE="$ORCH/handles.json"
 LEDGER_FILE="$ORCH/dispatch-ledger.jsonl"
+RACE_LEDGER="$ORCH/race-ledger.jsonl"
 REAPER_DIR="$ORCH/reapers"
 MANIFEST="$ORCH/install-manifest.json"
 ROLES="architect executor thrifty fallback"
@@ -180,6 +182,53 @@ else
     fi
   done
   [[ "$found" -eq 0 ]] && say "  (none)"
+fi
+
+say ""
+
+# --- 5 races ----------------------------------------------------------------
+# Seats live in race-ledger.jsonl, not handles.json (see orca-race.sh). A
+# running/winner seat holds a worktree AND a retained tab by design; the
+# failure statuses are the only place a seat that could not be started,
+# removed or released is ever reported.
+say "[5] races"
+if [[ ! -f "$RACE_LEDGER" ]]; then
+  say "  (none)"
+else
+  RACE_ROWS="$(python3 - "$RACE_LEDGER" <<'PY'
+import json, sys
+rows = []
+with open(sys.argv[1]) as stream:
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("kind") != "seat" or row.get("status") in ("removed", "finished"):
+            continue
+        rows.append(row)
+for row in rows:
+    print("  {status:<13} {race} seat {seat} {role:<10} {path}".format(
+        status=row.get("status") or "?", race=row.get("raceId") or "?", seat=row.get("seat"),
+        role=row.get("role") or "?", path=row.get("path") or "-"))
+print("__COUNT__%d" % len(rows))
+PY
+)"
+  rcount="$(printf '%s' "$RACE_ROWS" | sed -n 's/^__COUNT__//p')"
+  printf '%s\n' "$RACE_ROWS" | grep -v '^__COUNT__' | grep -v '^$' || true
+  if [[ "${rcount:-0}" -gt 0 ]]; then
+    if printf '%s' "$RACE_ROWS" | grep -q 'start_failed\|rm_failed\|close_failed'; then
+      problem "  ${rcount} open seat(s), including FAILED ones — a worktree or tab may be left behind."
+      problem "    clean up: or race abort <race_id>   (or race pick <race_id> <seat> to retry the removals)"
+    else
+      say "  ${rcount} seat(s) open — finish with: or race pick <race_id> <seat>, then or race done <race_id>"
+    fi
+  else
+    say "  (all settled)"
+  fi
 fi
 
 if [[ "$PROBLEMS" -gt 0 ]]; then

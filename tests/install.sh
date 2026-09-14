@@ -252,6 +252,18 @@ assert T18_survives_upgrade "grep -q claude-sonnet-5 \"$OVORCH/roles.local.json\
 assert T18_survives_reset "grep -q claude-sonnet-5 \"$OVORCH/roles.local.json\""
 rm -rf "$ov"
 
+# --- T19 recipe scripts ship executable; race ledger is gitignored ---
+# $ORCH here is T1's install dir (survived every re-run above), so these are
+# also idempotency checks like T12/T13.
+assert T19_script_race "[[ -x \"$ORCH/scripts/orca-race.sh\" ]]"
+assert T19_script_review "[[ -x \"$ORCH/scripts/orca-review.sh\" ]]"
+assert T19_script_worktrees "[[ -x \"$ORCH/scripts/orca-worktrees.sh\" ]]"
+assert T19_script_design_fix "[[ -x \"$ORCH/scripts/orca-design-fix.sh\" ]]"
+assert T19_gitignore_race_ledger "grep -qF '.orca/orchestration/race-ledger.jsonl' \"$tmpdir/.gitignore\""
+gi_race_count=$(grep -cF '.orca/orchestration/race-ledger.jsonl' "$tmpdir/.gitignore" 2>/dev/null || true)
+assert T19_gitignore_race_no_dup "[[ \"$gi_race_count\" -eq 1 ]]"
+assert T19_or_routes_race "grep -q 'orca-race.sh' \"$ORCH/or\""
+
 echo
 echo "Results: $pass passed, $fail failed"
 if [[ "$fail" -gt 0 ]]; then

@@ -18,18 +18,28 @@
 #                      terminal — set to "released" to test the native path)
 #   acks               one line per `check --ack <id>` call (ack assertions)
 #   check.json         canned `orchestration check --wait` payload
+#   wt.tsv             "<path>\t<name>\t<branch>\t<isMain 0|1>" per worktree
+#                      created via `worktree create` (path = $STATE/worktrees/<name>, a real dir)
+#   mainworktree       optional "<path>\t<branch>" for the main-worktree row
+#                      that `worktree list` / `worktree ps` always include
+#   termwt/<handle>    worktree selector a terminal was created in
+#                      (`worktree rm` closes every terminal in that worktree)
+#   wtset.log          one line per `worktree set` call (comment/status asserts)
 #   fail/<key>         FAILURE INJECTION. Presence makes that subcommand fail.
 #                      key = subcommand with spaces as dashes: status,
 #                      terminal-list, terminal-close, terminal-create,
 #                      dispatch-show, check, worker-start, worker-show,
-#                      worker-release
+#                      worker-release, worker-stop, worktree-create,
+#                      worktree-list, worktree-show, worktree-rm, worktree-set,
+#                      worktree-ps, file-open-changed, file-diff, host-list,
+#                      goto, screenshot, terminal-switch
 #                      body = "garbage" (emit non-JSON, exit 0) or anything
 #                      else / empty (exit 1). Default: exit 1.
 set -uo pipefail
 
 STATE="${FAKE_ORCA_STATE:?FAKE_ORCA_STATE must be set}"
-mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli" "$STATE/screen"
-touch "$STATE/calls.log" "$STATE/terminals"
+mkdir -p "$STATE" "$STATE/sends" "$STATE/preview" "$STATE/status" "$STATE/fail" "$STATE/cli" "$STATE/screen" "$STATE/termwt"
+touch "$STATE/calls.log" "$STATE/terminals" "$STATE/wt.tsv"
 
 printf '%s\n' "$*" >>"$STATE/calls.log"
 
@@ -100,6 +110,7 @@ JSON
     # screen shaped correctly for that CLI — first word of the launch command.
     mkdir -p "$STATE/cli"
     printf '%s' "${cmd%% *}" >"$STATE/cli/$handle"
+    printf '%s' "$(flag_val --worktree "$@")" >"$STATE/termwt/$handle"
     printf '{"result":{"handle":"%s","title":"%s"}}\n' "$handle" "$title"
     ;;
 
@@ -125,15 +136,30 @@ JSON
 
   "terminal list")
     maybe_fail terminal-list
-    python3 - "$STATE/terminals" <<'PY'
-import json, sys
+    # --worktree filters by the selector recorded at `terminal create` time
+    # (termwt/<handle>); without it, every live terminal is listed.
+    # No $(flag_val …) subshell here: this arm is on the reaper's hot path
+    # (terminal_is_live polls it, R5 runs 8 reapers against a 3s budget), so
+    # the flag is pulled out of the raw argv inside the one python process.
+    python3 - "$STATE/terminals" "$STATE/termwt" "$@" <<'PY'
+import json, os, sys
+path, termwt_dir = sys.argv[1:3]
+argv = sys.argv[3:]
+want = argv[argv.index("--worktree") + 1] if "--worktree" in argv and argv.index("--worktree") + 1 < len(argv) else ""
 terminals = []
-with open(sys.argv[1]) as stream:
+with open(path) as stream:
     for line in stream:
         line = line.rstrip("\n")
         if not line:
             continue
         handle, _, title = line.partition("\t")
+        if want:
+            try:
+                sel = open(os.path.join(termwt_dir, handle)).read().strip()
+            except Exception:
+                sel = ""
+            if sel != want:
+                continue
         terminals.append({"handle": handle, "title": title, "connected": True})
 print(json.dumps({"result": {"terminals": terminals}}))
 PY
@@ -310,6 +336,167 @@ PY
     else
       printf '{"result":{"count":0,"messages":[]}}\n'
     fi
+    ;;
+
+  "terminal switch")
+    maybe_fail terminal-switch
+    printf '{"ok":true,"result":{"switched":"%s"}}\n' "$(flag_val --terminal "$@")"
+    ;;
+
+  "orchestration worker-stop")
+    maybe_fail worker-stop
+    printf '{"ok":true,"result":{"dispatchId":"%s","state":"failed","alreadySettled":false,"processAction":"none"}}\n' "$(flag_val --dispatch "$@")"
+    ;;
+
+  # --- worktrees (shapes measured in references/orca-recipes-spike-2026-09-14.md)
+  "worktree create")
+    maybe_fail worktree-create
+    name="$(flag_val --name "$@")"
+    base="$(flag_val --base-branch "$@")"
+    wpath="$STATE/worktrees/${name:-unnamed}"
+    mkdir -p "$wpath"
+    printf '%s\t%s\t%s\t0\n' "$wpath" "$name" "refs/heads/fake/$name" >>"$STATE/wt.tsv"
+    python3 - "$wpath" "$name" "${base:-main}" <<'PY'
+import json, sys
+path, name, base = sys.argv[1:4]
+print(json.dumps({"ok": True, "result": {"worktree": {
+    "id": "repo_fake::" + path, "path": path, "branch": "refs/heads/fake/" + name,
+    "baseRef": base, "isMainWorktree": False, "displayName": name, "comment": ""},
+    "warnings": []}}))
+PY
+    ;;
+
+  "worktree list"|"worktree ps")
+    maybe_fail "worktree-$SUB2"
+    python3 - "$STATE/wt.tsv" "$STATE/mainworktree" "$STATE/terminals" "$STATE/termwt" "$SUB2" <<'PY'
+import json, os, sys
+wt_path, main_path, terms_path, termwt_dir, sub = sys.argv[1:6]
+rows = []
+main = ("/fake/main", "refs/heads/main")
+if os.path.exists(main_path):
+    p, _, b = open(main_path).read().strip().partition("\t")
+    main = (p, b or "refs/heads/main")
+rows.append((main[0], "main", main[1], True))
+with open(wt_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        p, n, b, m = (line.split("\t") + ["", "", "0"])[:4]
+        rows.append((p, n, b, m == "1"))
+live = {}
+handles = [ln.partition("\t")[0] for ln in open(terms_path) if ln.strip()]
+for h in handles:
+    try:
+        sel = open(os.path.join(termwt_dir, h)).read().strip()
+    except Exception:
+        sel = ""
+    live[sel] = live.get(sel, 0) + 1
+out = []
+for p, n, b, m in rows:
+    row = {"path": p, "displayName": n, "branch": b, "isMainWorktree": m,
+           "repoId": "repo_fake", "comment": "", "workspaceStatus": "in-progress"}
+    if sub == "ps":
+        row.update({"worktreeId": "repo_fake::" + p, "liveTerminalCount": live.get("path:" + p, 0),
+                    "status": "active", "agents": []})
+    else:
+        row["id"] = "repo_fake::" + p
+    out.append(row)
+print(json.dumps({"ok": True, "result": {"worktrees": out, "totalCount": len(out), "truncated": False}}))
+PY
+    ;;
+
+  "worktree show")
+    maybe_fail worktree-show
+    sel="$(flag_val --worktree "$@")"
+    python3 - "$STATE/wt.tsv" "$STATE/mainworktree" "$sel" <<'PY'
+import json, os, sys
+wt_path, main_path, sel = sys.argv[1:4]
+want = sel[len("path:"):] if sel.startswith("path:") else sel
+main = "/fake/main"
+if os.path.exists(main_path):
+    main = open(main_path).read().strip().partition("\t")[0]
+if want in ("active", "current") or want == main:
+    print(json.dumps({"ok": True, "result": {"worktree": {"path": main, "isMainWorktree": True}}}))
+    sys.exit(0)
+with open(wt_path) as f:
+    for line in f:
+        p, n, b, m = (line.rstrip("\n").split("\t") + ["", "", "0"])[:4]
+        if p == want or n == want:
+            print(json.dumps({"ok": True, "result": {"worktree": {
+                "id": "repo_fake::" + p, "path": p, "branch": b, "isMainWorktree": m == "1"}}}))
+            sys.exit(0)
+print(json.dumps({"ok": False, "error": {"code": "worktree_not_found", "message": want}}))
+sys.exit(1)
+PY
+    ;;
+
+  "worktree rm")
+    maybe_fail worktree-rm
+    sel="$(flag_val --worktree "$@")"
+    python3 - "$STATE/wt.tsv" "$STATE/terminals" "$STATE/termwt" "$sel" <<'PY'
+import os, sys
+wt_path, terms_path, termwt_dir, sel = sys.argv[1:5]
+want = sel[len("path:"):] if sel.startswith("path:") else sel
+kept = []
+removed = False
+with open(wt_path) as f:
+    for line in f:
+        if not line.strip():
+            continue
+        if line.split("\t")[0] == want:
+            removed = True
+            continue
+        kept.append(line)
+with open(wt_path, "w") as f:
+    f.writelines(kept)
+# Measured live: rm --force closes every terminal in the worktree.
+kept_t = []
+with open(terms_path) as f:
+    for line in f:
+        h = line.partition("\t")[0]
+        try:
+            sel_h = open(os.path.join(termwt_dir, h)).read().strip()
+        except Exception:
+            sel_h = ""
+        if sel_h == "path:" + want:
+            continue
+        kept_t.append(line)
+with open(terms_path, "w") as f:
+    f.writelines(kept_t)
+print('{"ok":true,"result":{"removed":%s}}' % ("true" if removed else "false"))
+PY
+    ;;
+
+  "worktree set")
+    maybe_fail worktree-set
+    printf '%s\n' "$*" >>"$STATE/wtset.log"
+    printf '{"ok":true,"result":{"updated":true}}\n'
+    ;;
+
+  "worktree current")
+    maybe_fail worktree-current
+    printf '{"ok":true,"result":{"worktree":{"path":"/fake/main","isMainWorktree":true}}}\n'
+    ;;
+
+  "file open-changed"|"file diff"|"file open")
+    maybe_fail "file-$SUB2"
+    printf '{"ok":true,"result":{"opened":true}}\n'
+    ;;
+
+  "host list")
+    maybe_fail host-list
+    printf '{"ok":true,"result":{"hosts":[{"kind":"local","name":"this machine","id":"local","selector":"--host local","platform":"darwin"}]}}\n'
+    ;;
+
+  "goto "*)
+    maybe_fail goto
+    printf '{"ok":true,"result":{"url":"%s"}}\n' "$(flag_val --url "$@")"
+    ;;
+
+  "screenshot "*)
+    maybe_fail screenshot
+    printf '{"ok":true,"result":{"path":"/fake/screenshot.png"}}\n'
     ;;
 
   *)

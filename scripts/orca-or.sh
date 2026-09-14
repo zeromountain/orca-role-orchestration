@@ -42,6 +42,15 @@ Usage: or <subcommand> [args...]
   read  <dispatch_id> [flags]     orca orchestration worker-read --dispatch <id>
   reply <msg_id> <body> [flags]   orca orchestration reply --id <id> --body <body>
 
+Recipes (see PLAYBOOK.md "Recipes"):
+  race  start|status|pick|finish|abort|list   orca-race.sh — N roles, one worktree each
+  review [sel] [flags]            orca-review.sh — open the diff viewer + review keys
+  ps                              orca-worktrees.sh ps — worktrees, agents, who needs input
+  gc    [--base ref] [--close]    orca-worktrees.sh gc — merged worktrees (report-only by default)
+  fix   <url> [flags]             orca-design-fix.sh — Design Mode bug-fix loop
+  note  "<text>" [flags]          orca worktree set --worktree active --comment <text> [flags]
+  hosts                           orca host list --json
+
 Every subcommand accepts every flag its target script accepts — `or` does not
 reinterpret or validate them, it only decides which script/command to run.
 EOF
@@ -101,6 +110,32 @@ case "$SUB" in
     if [[ $# -lt 2 ]]; then echo "Usage: or reply <msg_id> <body> [flags]" >&2; exit 1; fi
     MSG_ID="$1"; BODY="$2"; shift 2
     exec orca orchestration reply --id "$MSG_ID" --body "$BODY" "$@"
+    ;;
+  # --- recipes (scripts/orca-race.sh & co.; see PLAYBOOK.md "Recipes") ---
+  race)
+    exec "$SCRIPTS_DIR/orca-race.sh" "$@"
+    ;;
+  review)
+    exec "$SCRIPTS_DIR/orca-review.sh" "$@"
+    ;;
+  ps)
+    exec "$SCRIPTS_DIR/orca-worktrees.sh" ps "$@"
+    ;;
+  gc)
+    exec "$SCRIPTS_DIR/orca-worktrees.sh" gc "$@"
+    ;;
+  fix)
+    exec "$SCRIPTS_DIR/orca-design-fix.sh" "$@"
+    ;;
+  note)
+    # One `orca` call (worktree checkpoint): comment on the active worktree.
+    # Extra flags pass straight through (e.g. --workspace-status in-review).
+    if [[ $# -lt 1 ]]; then echo "Usage: or note \"<text>\" [--workspace-status <id>]" >&2; exit 1; fi
+    NOTE="$1"; shift
+    exec orca worktree set --worktree active --comment "$NOTE" "$@" --json
+    ;;
+  hosts)
+    exec orca host list --json "$@"
     ;;
   -h|--help)
     usage; exit 0 ;;

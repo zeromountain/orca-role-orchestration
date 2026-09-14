@@ -264,6 +264,28 @@ if os.path.exists(handles_path):
     except Exception:
         handles_unreadable = True
 
+# Race seats (orca-race.sh) are created through create_role too, so they are
+# in the journal under a "race-<id>-<role>" title but deliberately NOT in
+# handles.json (one handle per role could not hold N seats). Their ledger is
+# race-ledger.jsonl: a seat whose row says running/winner is alive by design
+# (its tab is retained until `or race pick/done/abort`) and is tracked here;
+# any other race-titled journal entry is a candidate like a role tab would be.
+race_ledger = os.path.join(os.path.dirname(handles_path), "race-ledger.jsonl")
+try:
+    with open(race_ledger) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("kind") == "seat" and row.get("handle") and row.get("status") in ("running", "winner"):
+                tracked.add(row["handle"])
+except FileNotFoundError:
+    pass
+
 if handles_unreadable:
     print("ABORT\t(handles-unreadable)\t%s\t%s\t%s exists but could not be parsed as JSON, refusing to sweep rather than treat everything in it as untracked" % (handles_path, field(""), handles_path))
     sys.exit(0)
@@ -359,7 +381,7 @@ try:
             if not handle:
                 print("SKIP\t(no-handle)\t%s\t%s\tunclosable, no handle recorded" % (field(title), field(role)))
                 continue
-            if title not in known_titles:
+            if title not in known_titles and not title.startswith("race-"):
                 print("SKIP\t%s\t%s\t%s\tunrelated title, not ours" % (handle, field(title), field(role)))
                 continue
             if handle in tracked:

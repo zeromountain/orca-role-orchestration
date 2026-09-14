@@ -16,6 +16,11 @@
 | `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
 | `.orca/orchestration/scripts/orca-debate-lib.sh` | Debate helpers + round prompts (sourced) |
 | `.orca/orchestration/scripts/orca-sweep-orphans.sh` | Report/close untracked role terminals; also the `--persist` dead-man watchdog |
+| `.orca/orchestration/scripts/orca-race.sh` | Recipe: race N roles on one goal, one worktree each (`start`/`status`/`pick`/`finish`/`abort`/`list`); seats in `race-ledger.jsonl`, tabs retained until `pick` |
+| `.orca/orchestration/scripts/orca-review.sh` | Recipe: open the diff viewer (`file open-changed` / `file diff`) and print the review keys; `--race <id> <seat>` |
+| `.orca/orchestration/scripts/orca-worktrees.sh` | Recipe: `ps` (worktrees, agents, race seats, needs-input) / `gc [--close]` (merged worktrees; report-only by default, never `--force`) |
+| `.orca/orchestration/scripts/orca-design-fix.sh` | Recipe: make the `ui` tab active + open the page in the worktree browser for Design Mode; `--verify` screenshots |
+| `.orca/orchestration/or` | Short alias router: `or d/dag/x/w/s/f/sweep/debate/close/read/reply` + recipes `or race/review/ps/gc/fix/note/hosts` |
 
 Personas: `.orca/orchestration/personas/<role>.md` are seeded by bootstrap and quoted
 (one `STANCE` line) by dispatch. In the skill repo, `scripts/check-personas.sh` lints them.
@@ -32,6 +37,11 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 .orca/orchestration/scripts/orca-dispatch-existing.sh task_xxx executor          # dispatch a ready later step
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
 .orca/orchestration/scripts/orca-debate.sh --topic "…"   # 3-round idea debate
+.orca/orchestration/or race start "Fix the login bug"      # 3 seats (Opus/Sol/Grok), one worktree each
+.orca/orchestration/or race pick <race_id> 2               # keep seat 2, delete the others' worktrees
+.orca/orchestration/or review --race <race_id> 2           # open its diff; j/k/c + Send to agent in the UI
+.orca/orchestration/or ps; .orca/orchestration/or gc       # worktree overview; merged-worktree report
+.orca/orchestration/or fix http://localhost:3000/page      # Design Mode loop: ui tab active, page open
 # close is automatic after dispatch; optional block — always pass --task (the
 # task_id printed by dispatch): bare --role can act on a leftover worker_done
 # message from an unrelated flow (e.g. a debate, which never drains its own
@@ -57,5 +67,5 @@ look). `awaiting_reply` rows are not a problem: the worker is correctly idle,
 waiting on your reply to a `decision_gate`/`question` or `escalation`. Exit
 code 1 means something needs attention.
 
-`handles.json`, `dispatch-ledger.jsonl`, and `reapers/` are local-only; do not
-commit them. See `handles.example.json`.
+`handles.json`, `dispatch-ledger.jsonl`, `race-ledger.jsonl`, and `reapers/` are
+local-only; do not commit them. See `handles.example.json`.

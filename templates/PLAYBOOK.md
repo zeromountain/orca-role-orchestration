@@ -135,6 +135,39 @@ tabs on its own if the driver is killed or crashes mid-debate, so a lost driver 
 permission-bypassed session running unattended. Run `orca-sweep-orphans.sh` any time to report (or,
 with `--close`, close) any other untracked role/debate terminal.
 
+## Recipes
+
+The CLI half of Orca's own recipes (`onorca.dev/docs/recipes`), via the `or` alias.
+Steps with no CLI are left to the human and named as such.
+
+```bash
+.orca/orchestration/or race start "Fix the login bug" [--roles architect,executor,thrifty] [--base-branch main]
+.orca/orchestration/or race status <race_id>          # worker state + change counts per seat
+.orca/orchestration/or race pick <race_id> <seat>     # DELETES the other seats' worktrees/branches; opens the winner's diff
+.orca/orchestration/or race finish <race_id>          # release the winner's tab; worktree stays for commit/push
+.orca/orchestration/or race abort <race_id>           # remove every non-winner seat
+.orca/orchestration/or review [sel] [--mode diff|both] [--path f [--staged]] [--race <id> <seat>]
+.orca/orchestration/or ps                             # worktrees, live terminals, agents, race seats, needs-input
+.orca/orchestration/or gc [--base main] [--close]     # merged worktrees; report-only until --close, never --force
+.orca/orchestration/or note "reproduced; testing fix" --workspace-status in-progress   # worktree checkpoint
+.orca/orchestration/or fix http://localhost:3000/page # ui tab active + browser on the page, then click in Design Mode
+.orca/orchestration/or hosts                          # what --host / --environment selectors exist
+```
+
+- **Race** — each seat is a normal supervised dispatch (`task-create` + `worker-start
+  --terminal … --worktree path:<seat>`) in its own worktree from `--base-branch`, so it
+  shows in `or s`/`or w` like any dispatch. Seats live in `race-ledger.jsonl`, not
+  `handles.json`. Tabs are retained until `pick`/`finish`/`abort` because the diff viewer's
+  **Send to agent** needs a live agent in that worktree (`--reap` opts back into the reaper).
+  Fewer than two seats started → exit 2, run `abort`. Failed seats show in `or s` section [5].
+- **Review** — only opening the diff has a CLI; `j`/`k`/`c` and **Send to agent** are UI.
+- **Worktrees** — Cmd-J palette, Restart chip and the notification bell are UI; `ps` is the
+  coordinator's palette, `gc` is the recipe's "delete merged worktrees aggressively" with a
+  report-first default and Orca's own merged-branch guard intact.
+- **Design Mode** — the click is UI; `fix` makes sure the attachment lands in the `ui` tab.
+- **Remote** — SSH hosts are registered in Settings → SSH; `race start --project <id>
+  --host ssh:<id>` passes through to `worktree create` but is untested in this package.
+
 ## Routing cheat sheet
 
 | Request | Primary | Secondary |

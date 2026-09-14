@@ -48,6 +48,51 @@ fixes on top rather than duplicating either.
   in the ledger and (for the separate case of an unreadable dispatch status)
   exits non-zero instead of polling silently to its 1-hour timeout.
 
+### Added — Orca recipes (`or race` / `review` / `ps` / `gc` / `fix` / `note` / `hosts`)
+
+- **`scripts/orca-race.sh` (`or race start|status|pick|finish|abort|list`).** The
+  "Race three agents on the same task" recipe from the coordinator: one
+  `orca worktree create --base-branch <ref>` per role, a role tab created *in that
+  worktree* (`create_role` with `WORKTREE=path:<seat>`), then the usual
+  `task-create` + `worker-start --terminal … --worktree path:<seat>`. Seats are
+  recorded in a new local file, `.orca/orchestration/race-ledger.jsonl`
+  (gitignored by the installer), never in `handles.json` — one handle per role
+  cannot hold N seats. Every seat also gets a `dispatch-ledger.jsonl` row, so
+  `or s` / `or w` see it like any dispatch. **Seat tabs are retained after they
+  settle** until `pick`/`finish`/`abort` (the diff viewer's "Send to agent" needs a
+  live agent in the worktree); `--reap` opts back into the auto-reaper. `pick`
+  removes the losers with `worker-stop` → `worker-release` → `worktree rm --force`
+  (measured: the rm closes the tabs and deletes the branch — see
+  `references/orca-recipes-spike-2026-09-14.md`), opens the winner's diff and marks
+  it in-review; only ledger-known, non-main worktrees are ever removed. Fewer than
+  two seats started → exit 2. `start_failed` / `rm_failed` / `close_failed` seats
+  are reported in a new `orca-status.sh` section [5].
+- **`scripts/orca-review.sh` (`or review`).** Opens the diff viewer
+  (`orca file open-changed --mode diff` or `orca file diff <path> [--staged]`) for a
+  worktree or a race seat and prints the review keys; annotating and "Send to
+  agent" have no CLI and are left to the human.
+- **`scripts/orca-worktrees.sh` (`or ps`, `or gc`).** `ps` merges
+  `orca worktree ps --json` with race seats and `worker-show`'s `agentWait`
+  ("needs-input"). `gc` lists worktrees whose branch is merged into the main
+  worktree's branch; report-only until `--close`, never passes `--force`, and skips
+  the main worktree, the current directory's worktree and anything with live
+  terminals — the same polarity as `orca-sweep-orphans.sh`.
+- **`scripts/orca-design-fix.sh` (`or fix <url>`, `or fix --verify`).** Ensures the
+  `ui` role tab, makes it the active terminal (Design Mode attaches the clicked
+  element to the active agent), navigates the worktree browser with `orca goto`,
+  prints the click-and-describe steps; `--verify` runs `orca screenshot`.
+- **`or note "<text>" [--workspace-status <id>]` and `or hosts`** — single `orca` calls
+  (`worktree set --comment [--workspace-status]`, `host list`) routed by `or`.
+- Slash commands `/orca-race`, `/orca-review`, `/orca-worktrees`, `/orca-design-fix`
+  (Claude `commands/` + Codex `prompts/` pairs). `orca-sweep-orphans.sh` now
+  recognises `race-<id>-<role>` titles and protects seats whose ledger row is
+  `running`/`winner`. Fake `orca` gained `worktree create|list|show|ps|set|rm`,
+  `file open-changed|diff|open`, `host list`, `goto`, `screenshot`,
+  `terminal switch`, `worker-stop`; `terminal list` honours `--worktree`.
+  Runtime cases R23–R30 and installer case T19 cover all of the above.
+- Design note: `docs/superpowers/specs/2026-09-14-orca-recipes-design.md`; measured
+  CLI shapes: `references/orca-recipes-spike-2026-09-14.md`.
+
 ### Added
 
 - **`orca-status.sh`** (`/…:status`, `/orca-status`) — doctor in one command:

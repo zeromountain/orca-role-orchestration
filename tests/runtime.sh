@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runtime script tests (R1–R6). Exit 0 only if all assert.
+# Runtime script tests (R1–R30). Exit 0 only if all assert.
 #
 # Uses tests/fake-orca/orca as a PATH shim — no real Orca runtime needed.
 # Every case installs the scaffold into a tmp project first and runs the
@@ -619,6 +619,222 @@ unset ORCA_RUN_ID
 r22_bogus_rc=$?
 assert R22_unknown_sub_nonzero "[[ $r22_bogus_rc -ne 0 ]]"
 assert R22_unknown_sub_message "grep -q 'Unknown subcommand' \"$tmproot/r22.bogus.log\""
+
+# ---------------------------------------------------------------------------
+# Recipes (orca-race.sh, orca-review.sh, orca-worktrees.sh, orca-design-fix.sh)
+# ---------------------------------------------------------------------------
+race_seat_status() {
+  # $1=race_id $2=seat → status from race-ledger.jsonl
+  python3 - "$PROJ/.orca/orchestration/race-ledger.jsonl" "$1" "$2" <<'PY' 2>/dev/null || echo "__none__"
+import json, sys
+path, rid, seat = sys.argv[1:4]
+out = "__none__"
+with open(path) as stream:
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("kind") == "seat" and row.get("raceId") == rid and str(row.get("seat")) == seat:
+            out = row.get("status") or ""
+print(out)
+PY
+}
+race_seat_rows() {
+  grep -c '"kind": "seat"' "$PROJ/.orca/orchestration/race-ledger.jsonl" 2>/dev/null | tr -d ' '
+}
+
+# --- R23 race start: one worktree + one tab + one dispatch per role ---------
+echo "R23 race start creates a worktree, a role tab and a supervised dispatch per seat"
+new_project r23
+export ORCA_RUN_ID="run_r23"
+"$OR" race start "fix the login bug" >"$tmproot/r23.log" 2>&1
+r23_rc=$?
+R23_ID="$(sed -n 's/^race_id=\([^ ]*\).*/\1/p' "$tmproot/r23.log")"
+assert R23_exit0 "[[ $r23_rc -eq 0 ]]"
+assert R23_race_id "[[ -n \"$R23_ID\" ]]"
+assert R23_three_worktree_creates "[[ \"\$(calls_matching 'worktree create --name fix-the-login-bug-')\" -eq 3 ]]"
+assert R23_base_branch_passed "[[ \"\$(calls_matching 'worktree create .*--base-branch ')\" -eq 3 ]]"
+assert R23_tabs_in_seat_worktrees "[[ \"\$(calls_matching 'terminal create --worktree path:.*/worktrees/fix-the-login-bug-')\" -eq 3 ]]"
+assert R23_worker_start_scoped "[[ \"\$(calls_matching 'worker-start .*--terminal term_.* --worktree path:')\" -eq 3 ]]"
+assert R23_seat_rows "[[ \"\$(race_seat_rows)\" -eq 3 ]]"
+assert R23_seat_running "[[ \"\$(race_seat_status \"$R23_ID\" 2)\" == running ]]"
+assert R23_dispatch_ledger_rows "[[ \"\$(ledger_rows)\" -eq 3 ]]"
+assert R23_no_reaper_by_default "[[ ! -d \"$PROJ/.orca/orchestration/reapers\" || -z \"\$(ls -A \"$PROJ/.orca/orchestration/reapers\" 2>/dev/null)\" ]]"
+assert R23_checkpoint_comment "grep -q -- '--comment race .* seat 1/3: architect' \"$STATE/wtset.log\""
+# handles.json is untouched: race seats never go through ensure_terminal.
+assert R23_handles_untouched "! grep -q 'term_' \"$PROJ/.orca/orchestration/handles.json\" 2>/dev/null"
+unset ORCA_RUN_ID
+
+# --- R24 race start survives one failed seat, refuses below quorum ----------
+echo "R24 race start records a failed seat and enforces the 2-seat quorum"
+new_project r24
+export ORCA_RUN_ID="run_r24"
+# Make ONLY the second worktree create fail: the fake has no per-call failure
+# hook, so use a tiny wrapper that fails once and then steps aside.
+mkdir -p "$tmproot/r24-bin"
+cat >"$tmproot/r24-bin/orca" <<WRAP
+#!/usr/bin/env bash
+if [[ "\$1 \$2" == "worktree create" && ! -f "$STATE/r24.failed-once" ]]; then
+  if [[ -f "$STATE/r24.seen-one" ]]; then
+    touch "$STATE/r24.failed-once"
+    echo "injected create failure" >&2
+    exit 1
+  fi
+  touch "$STATE/r24.seen-one"
+fi
+exec "$FAKE_DIR/orca" "\$@"
+WRAP
+chmod +x "$tmproot/r24-bin/orca"
+PATH="$tmproot/r24-bin:$PATH" "$OR" race start "quorum test" --roles architect,executor,thrifty >"$tmproot/r24.log" 2>&1
+r24_rc=$?
+R24_ID="$(sed -n 's/^race_id=\([^ ]*\).*/\1/p' "$tmproot/r24.log")"
+assert R24_exit0_with_quorum "[[ $r24_rc -eq 0 ]]"
+assert R24_seat2_start_failed "[[ \"\$(race_seat_status \"$R24_ID\" 2)\" == start_failed ]]"
+assert R24_seat3_running "[[ \"\$(race_seat_status \"$R24_ID\" 3)\" == running ]]"
+assert R24_started_two "grep -q 'started=2/3' \"$tmproot/r24.log\""
+# Every create failing → fewer than 2 seats → exit 2, nothing dispatched.
+: >"$STATE/calls.log"
+touch "$STATE/fail/worktree-create"
+"$OR" race start "no quorum" --roles architect,executor >"$tmproot/r24b.log" 2>&1
+r24b_rc=$?
+assert R24_below_quorum_exit2 "[[ $r24b_rc -eq 2 ]]"
+assert R24_below_quorum_no_worker "[[ \"\$(calls_matching 'worker-start')\" -eq 0 ]]"
+rm -f "$STATE/fail/worktree-create"
+unset ORCA_RUN_ID
+
+# --- R25 race pick removes the losers, keeps the winner, opens its diff -----
+echo "R25 race pick removes losers (stop → release → rm --force) and opens the winner's diff"
+new_project r25
+export ORCA_RUN_ID="run_r25"
+"$OR" race start "pick test" >"$tmproot/r25.log" 2>&1
+R25_ID="$(sed -n 's/^race_id=\([^ ]*\).*/\1/p' "$tmproot/r25.log")"
+: >"$STATE/calls.log"
+"$OR" race pick "$R25_ID" 2 >"$tmproot/r25.pick.log" 2>&1
+r25_rc=$?
+assert R25_pick_exit0 "[[ $r25_rc -eq 0 ]]"
+assert R25_two_rms "[[ \"\$(calls_matching 'worktree rm --worktree path:.*--force')\" -eq 2 ]]"
+assert R25_winner_not_removed "! grep -q 'worktree rm --worktree path:.*pick-test-2 ' \"$STATE/calls.log\""
+assert R25_stop_and_release_each_loser "[[ \"\$(calls_matching 'worker-stop')\" -eq 2 && \"\$(calls_matching 'worker-release')\" -eq 2 ]]"
+assert R25_winner_diff_opened "[[ \"\$(calls_matching 'file open-changed --mode diff --worktree path:.*pick-test-2')\" -eq 1 ]]"
+assert R25_winner_in_review "grep -q -- 'pick-test-2 --workspace-status in-review' \"$STATE/wtset.log\""
+assert R25_seat1_removed "[[ \"\$(race_seat_status \"$R25_ID\" 1)\" == removed ]]"
+assert R25_seat2_winner "[[ \"\$(race_seat_status \"$R25_ID\" 2)\" == winner ]]"
+# The losers' tabs went with their worktrees; the winner's tab is still live.
+assert R25_loser_tabs_gone "[[ \"\$(live_titled \"$R25_ID-architect\")\" -eq 0 && \"\$(live_titled \"$R25_ID-thrifty\")\" -eq 0 ]]"
+assert R25_winner_tab_live "[[ \"\$(live_titled \"$R25_ID-executor\")\" -eq 1 ]]"
+# finish releases the winner's tab (retained → fallback close) and keeps the worktree.
+"$OR" race finish "$R25_ID" >"$tmproot/r25.done.log" 2>&1
+r25d_rc=$?
+assert R25_done_exit0 "[[ $r25d_rc -eq 0 ]]"
+assert R25_done_tab_closed "[[ \"\$(live_titled \"$R25_ID-executor\")\" -eq 0 ]]"
+assert R25_done_no_rm "[[ \"\$(calls_matching 'worktree rm --worktree path:.*pick-test-2')\" -eq 0 ]]"
+unset ORCA_RUN_ID
+
+# --- R26 a failed worktree rm is recorded and surfaces in orca-status.sh -----
+echo "R26 race pick exits non-zero on a failed rm, marks rm_failed, and status reports it"
+new_project r26
+export ORCA_RUN_ID="run_r26"
+"$OR" race start "rm fail" --roles architect,executor >"$tmproot/r26.log" 2>&1
+R26_ID="$(sed -n 's/^race_id=\([^ ]*\).*/\1/p' "$tmproot/r26.log")"
+touch "$STATE/fail/worktree-rm"
+"$OR" race pick "$R26_ID" 1 >"$tmproot/r26.pick.log" 2>&1
+r26_rc=$?
+rm -f "$STATE/fail/worktree-rm"
+assert R26_pick_nonzero "[[ $r26_rc -ne 0 ]]"
+assert R26_seat2_rm_failed "[[ \"\$(race_seat_status \"$R26_ID\" 2)\" == rm_failed ]]"
+"$SCRIPTS/orca-status.sh" >"$tmproot/r26.status.log" 2>&1
+assert R26_status_reports "grep -q 'rm_failed' \"$tmproot/r26.status.log\""
+assert R26_status_problem "grep -q 'FAILED' \"$tmproot/r26.status.log\""
+# Retrying the pick removes the seat once rm works again.
+"$OR" race pick "$R26_ID" 1 >"$tmproot/r26.pick2.log" 2>&1
+r26b_rc=$?
+assert R26_retry_exit0 "[[ $r26b_rc -eq 0 ]]"
+assert R26_retry_removed "[[ \"\$(race_seat_status \"$R26_ID\" 2)\" == removed ]]"
+unset ORCA_RUN_ID
+
+# --- R27 gc is report-only by default, --close removes merged only ----------
+echo "R27 gc reports merged worktrees, removes them only with --close and never with --force"
+new_project r27
+# A real git repo as the "main worktree" so `git branch --merged` is honest.
+R27_MAIN="$tmproot/r27-main"
+git init -q "$R27_MAIN" && git -C "$R27_MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$R27_MAIN" branch -q fake/merged-one
+git -C "$R27_MAIN" checkout -q -b fake/unmerged-one && git -C "$R27_MAIN" -c user.email=t@t -c user.name=t commit -q --allow-empty -m wip && git -C "$R27_MAIN" checkout -q -
+main_branch="$(git -C "$R27_MAIN" rev-parse --abbrev-ref HEAD)"
+printf '%s\trefs/heads/%s\n' "$R27_MAIN" "$main_branch" >"$STATE/mainworktree"
+orca worktree create --name merged-one --base-branch "$main_branch" --json >/dev/null
+orca worktree create --name unmerged-one --base-branch "$main_branch" --json >/dev/null
+orca worktree create --name merged-busy --base-branch "$main_branch" --json >/dev/null
+git -C "$R27_MAIN" branch -q fake/merged-busy
+orca terminal create --worktree "path:$STATE/worktrees/merged-busy" --title busy --command bash --json >/dev/null
+: >"$STATE/calls.log"
+"$OR" gc >"$tmproot/r27.log" 2>&1
+r27_rc=$?
+assert R27_report_exit0 "[[ $r27_rc -eq 0 ]]"
+assert R27_report_lists_merged "grep -q 'MERGED .*merged-one' \"$tmproot/r27.log\""
+assert R27_report_skips_unmerged "! grep -q 'unmerged-one' \"$tmproot/r27.log\""
+assert R27_report_skips_busy "grep -q 'SKIP .*merged-busy .*live terminal' \"$tmproot/r27.log\""
+assert R27_report_no_rm "[[ \"\$(calls_matching 'worktree rm')\" -eq 0 ]]"
+"$OR" gc --close >"$tmproot/r27.close.log" 2>&1
+r27c_rc=$?
+assert R27_close_exit0 "[[ $r27c_rc -eq 0 ]]"
+assert R27_close_removed_merged "[[ \"\$(calls_matching 'worktree rm --worktree path:.*merged-one --json')\" -eq 1 ]]"
+assert R27_close_no_force "[[ \"\$(calls_matching 'worktree rm .*--force')\" -eq 0 ]]"
+assert R27_close_kept_busy "[[ \"\$(calls_matching 'worktree rm --worktree path:.*merged-busy')\" -eq 0 ]]"
+assert R27_close_kept_unmerged "[[ \"\$(calls_matching 'worktree rm --worktree path:.*unmerged-one')\" -eq 0 ]]"
+assert R27_main_never_rm "[[ \"\$(calls_matching \"worktree rm --worktree path:$R27_MAIN\")\" -eq 0 ]]"
+
+# --- R28 review opens the diff view (open-changed or file diff) ------------
+echo "R28 review opens changed files by default and one file with --path"
+new_project r28
+"$OR" review >"$tmproot/r28.log" 2>&1
+r28_rc=$?
+assert R28_default_exit0 "[[ $r28_rc -eq 0 ]]"
+assert R28_open_changed_diff "[[ \"\$(calls_matching 'file open-changed --mode diff --worktree active')\" -eq 1 ]]"
+assert R28_prints_keys "grep -q 'Send to agent' \"$tmproot/r28.log\""
+"$OR" review --path src/app.ts --staged branch:feature >"$tmproot/r28b.log" 2>&1
+assert R28_file_diff "[[ \"\$(calls_matching 'file diff src/app.ts --staged --worktree branch:feature')\" -eq 1 ]]"
+
+# --- R29 fix activates the ui tab, then navigates the browser ---------------
+echo "R29 fix ensures the ui tab, switches to it, then opens the URL"
+new_project r29
+# Bootstrap pre-warms only the four primary roles; the ui tab is created
+# lazily by ensure_terminal on the first `fix`, and reused on the second.
+"$SCRIPTS/orca-bootstrap-roles.sh" --worktree active >"$tmproot/r29.boot.log" 2>&1
+: >"$STATE/calls.log"
+"$OR" fix http://localhost:3000/settings >"$tmproot/r29.log" 2>&1
+r29_rc=$?
+assert R29_exit0 "[[ $r29_rc -eq 0 ]]"
+assert R29_ui_tab_created "[[ \"\$(calls_matching 'terminal create --worktree active --title role-agy-ui')\" -eq 1 ]]"
+assert R29_switch_called "[[ \"\$(calls_matching 'terminal switch --terminal term_')\" -eq 1 ]]"
+assert R29_goto_called "[[ \"\$(calls_matching 'goto --url http://localhost:3000/settings --worktree active')\" -eq 1 ]]"
+assert R29_switch_before_goto "[[ \"\$(grep -n 'terminal switch' \"$STATE/calls.log\" | head -1 | cut -d: -f1)\" -lt \"\$(grep -n '^goto ' \"$STATE/calls.log\" | head -1 | cut -d: -f1)\" ]]"
+: >"$STATE/calls.log"
+"$OR" fix http://localhost:3000/settings >"$tmproot/r29b.log" 2>&1
+assert R29_second_run_reuses_tab "[[ \"\$(calls_matching 'terminal create')\" -eq 0 && \"\$(calls_matching 'terminal switch')\" -eq 1 ]]"
+"$OR" fix --verify >"$tmproot/r29v.log" 2>&1
+assert R29_verify_screenshot "[[ \"\$(calls_matching 'screenshot --worktree active')\" -eq 1 ]]"
+
+# --- R30 note/hosts route to single orca calls; race refuses without a Run --
+echo "R30 note and hosts are single orca calls; race start refuses with no Run bound"
+new_project r30
+"$OR" note "reproduced the bug" --workspace-status in-progress >"$tmproot/r30.note.log" 2>&1
+r30n_rc=$?
+assert R30_note_exit0 "[[ $r30n_rc -eq 0 ]]"
+assert R30_note_call "[[ \"\$(calls_matching 'worktree set --worktree active --comment reproduced the bug --workspace-status in-progress --json')\" -eq 1 ]]"
+"$OR" hosts >"$tmproot/r30.hosts.log" 2>&1
+assert R30_hosts_call "[[ \"\$(calls_matching 'host list --json')\" -eq 1 ]]"
+unset ORCA_RUN_ID
+: >"$STATE/calls.log"
+"$OR" race start "unscoped" >"$tmproot/r30.race.log" 2>&1
+r30_rc=$?
+assert R30_race_refuses_unscoped "[[ $r30_rc -ne 0 ]]"
+assert R30_race_no_worktree "[[ \"\$(calls_matching 'worktree create')\" -eq 0 ]]"
+assert R30_race_hint "grep -q 'no Run bound' \"$tmproot/r30.race.log\""
 
 echo
 echo "Results: $pass passed, $fail failed"

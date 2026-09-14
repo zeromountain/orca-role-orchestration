@@ -26,3 +26,6 @@
 
 # Orca local runtime state
 .orca/orchestration/*.lock
+
+# Orca local runtime state
+.orca/orchestration/race-ledger.jsonl

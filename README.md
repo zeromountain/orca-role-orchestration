@@ -296,6 +296,31 @@ terminals are reused per-role globally and two concurrent debates would otherwis
 same four sessions (a same-slug collision would also reset the live debate's tracked handles,
 leaving its tabs unprotected from the new driver's own cleanup).
 
+## Orca recipes from the coordinator
+
+Orca's documented recipes (`onorca.dev/docs/recipes`) are written as GUI steps. The scaffold
+ships the CLI half of each as one `or` subcommand (`.orca/orchestration/or`), and leaves the
+steps that have no CLI — annotating a diff, clicking in Design Mode, the Cmd-J palette,
+registering an SSH host — to the human, saying so in its output:
+
+```bash
+.orca/orchestration/or race start "Fix the login bug"    # Opus vs Sol vs Grok, one worktree each, same base branch
+.orca/orchestration/or race status <race_id>
+.orca/orchestration/or race pick <race_id> 2             # keep seat 2 (opens its diff), delete the losers' worktrees
+.orca/orchestration/or race finish <race_id>             # release the winner's tab; the worktree stays
+.orca/orchestration/or review [--race <race_id> 2]       # open the diff viewer, then j/k/c + Send to agent in Orca
+.orca/orchestration/or ps                                # every worktree: agents, notes, who needs input
+.orca/orchestration/or gc [--close]                      # merged worktrees — report-only until --close
+.orca/orchestration/or note "reproduced" --workspace-status in-progress
+.orca/orchestration/or fix http://localhost:3000/page    # Design Mode loop: ui tab active, page open
+```
+
+Slash commands: `/orca-race`, `/orca-review`, `/orca-worktrees`, `/orca-design-fix`. A race
+seat is an ordinary supervised dispatch in its own worktree; its tab is retained until you
+pick, because the diff viewer's **Send to agent** needs a live agent there. `pick` and
+`gc --close` delete checkouts and branches — both scripts only ever touch worktrees they
+can prove are theirs (race ledger) or merged (Orca's own guard, no `--force`).
+
 ## Security
 
 The default launch commands disable or bypass agent permission checks. Use them only in trusted repositories and review the commands before running `orca-bootstrap-roles.sh`. Remove the bypass flags if you want each provider's normal approval boundaries.

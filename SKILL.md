@@ -126,12 +126,14 @@ orca-role-orchestration/
   commands/                    # Claude Code slash commands (auto-discovered)
     orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
     orca-fallback.md orca-debate.md orca-close.md orca-status.md
+    orca-race.md orca-review.md orca-worktrees.md orca-design-fix.md   # Orca recipes
     # same filenames as prompts/ below — a bare /orca-dispatch resolves
     # without the plugin namespace prefix (Claude Code v2.1.216+) as long as
     # no other installed plugin claims the same name
   prompts/                     # Codex slash commands (symlinked into $CODEX_HOME/prompts)
     orca-install.md orca-bootstrap.md orca-dispatch.md orca-wait.md
     orca-fallback.md orca-debate.md orca-close.md orca-status.md
+    orca-race.md orca-review.md orca-worktrees.md orca-design-fix.md
   scripts/
     install-to-project.sh      # project scaffold install/update (idempotent)
     install-skill.sh           # global skill clone-or-pull + multi-agent symlinks
@@ -147,6 +149,10 @@ orca-role-orchestration/
     orca-debate-round.sh        # one debate round: fan out, poll, collect, lint
     orca-debate-lib.sh          # debate helpers + round prompts (sourced)
     orca-sweep-orphans.sh       # report/close untracked terminals; --persist dead-man watchdog
+    orca-race.sh                # recipe: race N roles, one worktree each (start/status/pick/finish/abort)
+    orca-review.sh              # recipe: open the diff viewer + print the review keys
+    orca-worktrees.sh           # recipe: `ps` (worktrees + agents) / `gc` (merged worktrees)
+    orca-design-fix.sh          # recipe: Design Mode fix loop (ui tab active, browser on page)
     check-personas.sh          # lint persona skeleton + STANCE (dev/CI)
   templates/                   # copied into project by install
     roles.yaml                 # managed routing (always refreshed)
@@ -159,6 +165,7 @@ orca-role-orchestration/
     repo-lint.sh                # manifests, command/prompt pairs, personas
     debate.sh
   references/model-roles.md references/installation.md
+  references/orca-recipes-spike-2026-09-14.md   # measured `orca worktree` / worker-start shapes
 ```
 
 Resolve the skill root from this file’s directory. A conventional installation is:
@@ -188,6 +195,10 @@ plugin claims the same bare name:
 | `/orca-debate <topic>` | `/orca-role-orchestration:orca-debate` | `orca-debate.sh` |
 | `/orca-close <role>` | `/orca-role-orchestration:orca-close` | `orca-close-role.sh` (emergency) |
 | `/orca-status` | `/orca-role-orchestration:orca-status` | `orca-status.sh` |
+| `/orca-race start "<goal>"` | `/orca-role-orchestration:orca-race` | `orca-race.sh` (recipe) |
+| `/orca-review [sel]` | `/orca-role-orchestration:orca-review` | `orca-review.sh` (recipe) |
+| `/orca-worktrees ps\|gc` | `/orca-role-orchestration:orca-worktrees` | `orca-worktrees.sh` (recipe) |
+| `/orca-design-fix <url>` | `/orca-role-orchestration:orca-design-fix` | `orca-design-fix.sh` (recipe) |
 
 Claude Code auto-discovers `commands/` from the plugin root. Codex plugin manifests carry
 no prompt field, so `install-skill.sh` symlinks `prompts/*.md` into `$CODEX_HOME/prompts/`
@@ -372,6 +383,32 @@ debate is still live is refused (`ensure_terminal` reuses each role's terminal g
 concurrent debates would otherwise dispatch into the SAME four agent sessions; a same-slug
 collision would also reset the live debate's tracked handles out from under it).
 
+### F) Recipes (Orca docs → one `or` subcommand each)
+
+Orca's own recipes (`onorca.dev/docs/recipes/*`) are written as GUI steps. This mode is the
+CLI half of each, driven from the coordinator via the short `or` alias
+(`.orca/orchestration/or`). What has no CLI stays with the human and is said so:
+
+| Recipe | `or …` | UI-only remainder |
+|---|---|---|
+| Race three agents on the same task | `race start "<goal>" [--roles a,b,c]` → `race status` → `race pick <id> <seat>` → `race finish <id>` | reading the diffs, Annotate AI Diff, commit/push/PR |
+| Review an AI diff line-by-line | `review [sel] [--mode diff\|both] [--path f]` | `j`/`k`/`c`, **Send to agent** |
+| Jump between 10 worktrees | `ps`, `gc [--close]`, `note "<text>" [--workspace-status id]` | Cmd-J palette, Restart chip, notification bell |
+| Fix a UI bug with Design Mode | `fix <url>` → (click) → `fix --verify` | Design Mode toggle + element click |
+| Work on a remote machine over SSH | `hosts`; `race start --project <id> --host ssh:<id>` (untested) | Settings → SSH host registration |
+
+**Race rules.** Every seat is a normal supervised dispatch (task-create + `worker-start
+--terminal … --worktree path:<seat>`), so it shows in `or s` / `or w`. Seats bypass
+`handles.json` (one handle per role cannot hold N seats) and live in `race-ledger.jsonl`.
+Seat tabs are **retained after they settle** — the diff viewer's "Send to agent" needs a live
+agent in that worktree — until `pick`/`finish`/`abort`; `--reap` opts back into the reaper.
+`pick` deletes the losers' worktrees, tabs and branches (`worktree rm --force`): confirm the
+seat with the user first. Only ledger-known, non-main worktrees are ever removed. Failed
+seats (`start_failed`, `rm_failed`, `close_failed`) show in `or s` section [5].
+
+**gc rules.** Report-only until `--close`; never `--force`; skips the main worktree, the
+current directory's worktree and any worktree with live terminals. Same polarity as `sweep`.
+
 ## Routing cheat sheet
 
 | User need | Role |
@@ -442,6 +479,8 @@ Edit ownership: one role edits a file set at a time; review-only architect does 
 - Claim orchestration without `task-list` / `dispatch-show` proof after supervised work
 - Generate images without a clear brief (ask first) or with non-Codex image tools when `$imagegen` is the path
 - Pass `--no-reap` unless you intentionally want tabs to linger
+- Run `or race pick` / `or gc --close` without the user confirming which worktrees go — both delete checkouts and branches
+- Delete race worktrees by hand (`orca worktree rm`) — the race ledger is what makes `pick`/`abort` safe
 
 ## Exit-on-done (automatic)
 
