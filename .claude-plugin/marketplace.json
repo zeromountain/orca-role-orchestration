@@ -8,7 +8,7 @@
     {
       "name": "orca-role-orchestration",
       "source": "./",
-      "description": "Four-role Orca multi-model role orchestration: Opus architect, Sol executor, Grok thrifty, Gemini Flash fallback",
+      "description": "Four-role Orca multi-model role orchestration: Fable architect, Astra executor, Grok thrifty, Gemini Flash fallback",
       "author": {
         "name": "zeromountain"
       },

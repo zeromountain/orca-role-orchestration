@@ -119,17 +119,17 @@ r1_rc=$?
 H="$PROJ/.orca/orchestration/handles.json"
 assert R1_exit0 "[[ $r1_rc -eq 0 ]]"
 assert R1_four_creates "[[ \"\$(calls_matching 'terminal create')\" -eq 4 ]]"
-assert R1_title_architect "grep -q role-opus-architect \"$STATE/calls.log\""
-assert R1_title_executor "grep -q role-sol-executor \"$STATE/calls.log\""
+assert R1_title_architect "grep -q role-fable-architect \"$STATE/calls.log\""
+assert R1_title_executor "grep -q role-astra-executor \"$STATE/calls.log\""
 assert R1_title_thrifty "grep -q role-grok-thrifty \"$STATE/calls.log\""
 assert R1_title_fallback "grep -q role-agy-fallback \"$STATE/calls.log\""
 assert R1_handles_parse "python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \"$H\""
-assert R1_architect_model "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-5\" else 1)' \"$H\""
+assert R1_architect_model "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-fable-5-1\" else 1)' \"$H\""
 assert R1_four_live "[[ \"\$(live_titled role-)\" -eq 4 ]]"
 # A bootstrapped worker and a dispatch-recreated one must be told the same
 # model string — both paths route through ensure_terminal/role_meta now.
 arch_handle="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["roles"]["architect"]["handle"])' "$H" 2>/dev/null || echo none)"
-assert R1_seed_model_id "grep -q 'claude-opus-5' \"$STATE/sends/$arch_handle\""
+assert R1_seed_model_id "grep -q 'claude-fable-5-1' \"$STATE/sends/$arch_handle\""
 
 # --- R2 reaper closes on completed (expected GREEN) ---
 echo "R2 reaper closes on completed"
@@ -170,7 +170,7 @@ assert R3_no_false_close "[[ \"\$(ledger_status task_r3)\" != closed ]]"
 # close call itself succeeds), the script just cannot prove it.
 echo "R4 close when liveness probe is unreadable  [regression: bug B]"
 new_project r4
-printf 'term_97\trole-sol-executor\n' >>"$STATE/terminals"
+printf 'term_97\trole-astra-executor\n' >>"$STATE/terminals"
 seed_ledger_row task_r4 term_97 executor
 echo completed >"$STATE/status/task_r4"
 : >"$STATE/fail/terminal-list"   # daemon hiccup: `terminal list` exits 1
@@ -191,7 +191,7 @@ assert R4_ledger_undetermined "[[ \"\$(ledger_status task_r4)\" == close_undeter
 # later failure mode where the reap CYCLE completed but the close did not.
 echo "R4b close genuinely fails  [regression]"
 new_project r4b
-printf 'term_96\trole-sol-executor\n' >>"$STATE/terminals"
+printf 'term_96\trole-astra-executor\n' >>"$STATE/terminals"
 seed_ledger_row task_r4b term_96 executor
 echo completed >"$STATE/status/task_r4b"
 : >"$STATE/fail/terminal-close"  # every close attempt exits 1
@@ -330,8 +330,8 @@ H8="$PROJ/.orca/orchestration/handles.json"
 assert R8_exit0 "[[ $r8_rc -eq 0 ]]"
 assert R8_launch_overridden "grep -q 'claude --model claude-sonnet-5' \"$STATE/calls.log\""
 assert R8_model_recorded "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"thrifty\"][\"model\"]==\"claude-sonnet-5\" else 1)' \"$H8\""
-assert R8_default_role_intact "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-opus-5\" else 1)' \"$H8\""
-assert R8_no_grok_launch "! grep -q 'grok --model grok-4.5' \"$STATE/calls.log\""
+assert R8_default_role_intact "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"roles\"][\"architect\"][\"model\"]==\"claude-fable-5-1\" else 1)' \"$H8\""
+assert R8_no_grok_launch "! grep -q 'grok --model grok-4.6' \"$STATE/calls.log\""
 # The installer must never clobber this user-owned file.
 "$INSTALL" --project-root "$PROJ" --project-name r8 >"$tmproot/r8.reinstall.log" 2>&1
 assert R8_survives_upgrade "grep -q claude-sonnet-5 \"$PROJ/.orca/orchestration/roles.local.json\""

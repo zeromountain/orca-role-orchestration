@@ -472,12 +472,12 @@ $MARKER
 
 | Role | Model | CLI |
 |------|-------|-----|
-| architect | Claude Opus 5 | \`claude\` |
-| executor | GPT-5.6 Sol | \`codex\` |
-| thrifty | Grok 4.5 | \`grok\` |
-| ui | Gemini 3.6 Flash (Medium) | \`agy\` |
+| architect | Claude Fable 5.1 | \`claude\` |
+| executor | GPT-6 Astra | \`codex\` |
+| thrifty | Grok 4.6 | \`grok\` |
+| ui | Gemini 3.7 Flash (Medium) | \`agy\` |
 | reviewer | Claude Opus 5 | \`claude\` |
-| fallback | Gemini 3.6 Flash (Medium) | \`agy\` |
+| fallback | Gemini 3.7 Flash (Medium) | \`agy\` |
 | debater_* | one seat per provider | debate only, read-only |
 
 - Managed routing: \`.orca/orchestration/roles.yaml\`

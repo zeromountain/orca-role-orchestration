@@ -168,9 +168,16 @@ rm -rf "$agentsdir"
 #   - CHANGELOG.md  same treatment as docs/superpowers/ below: it records a
 #     bug's OLD behavior (the model string a fix corrected away from), and
 #     rewriting that description would falsify the history it exists to keep.
-STALE_RE='claude-opus-4-8|Opus 4[.]8|Gemini 3[.]5'
+#   - references/orca-contract-2026-08-13.md and references/orca-recipes-spike-*
+#     record live measurements against the CLI of that day, launch commands
+#     included; they are evidence, not current configuration.
+# 2026-09-15: gpt-5.6-sol / Grok 4.5 / Gemini 3.6 retired in favour of
+# gpt-6-astra / Grok 4.6 / Gemini 3.7 (architect moved to claude-fable-5-1;
+# claude-opus-5 is still current for reviewer/debater_claude, so it is not here).
+STALE_RE='claude-opus-4-8|Opus 4[.]8|Gemini 3[.]5|Gemini 3[.]6|gpt-5[.]6-sol|GPT-5[.]6|grok-4[.]5|Grok 4[.]5'
 stale_hits="$(git -C "$ROOT" grep -InE "$STALE_RE" -- \
-  ':(exclude)docs/superpowers' ':(exclude)tests/install.sh' ':(exclude)CHANGELOG.md' 2>/dev/null || true)"
+  ':(exclude)docs/superpowers' ':(exclude)tests/install.sh' ':(exclude)CHANGELOG.md' \
+  ':(exclude)references/orca-contract-2026-08-13.md' ':(exclude)references/orca-recipes-spike-2026-09-14.md' 2>/dev/null || true)"
 if [[ -n "$stale_hits" ]]; then
   echo "  stale model strings found outside the excluded paths:" >&2
   echo "$stale_hits" | sed 's/^/    /' >&2

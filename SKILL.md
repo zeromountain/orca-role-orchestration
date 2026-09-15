@@ -1,9 +1,9 @@
 ---
 name: orca-role-orchestration
 description: >
-  Install and run Orca multi-model role orchestration: Claude Opus 5 (architect,
-  reviewer), GPT-5.6 Sol via Codex (executor), Grok 4.5 (thrifty), Antigravity
-  Gemini 3.6 Flash Medium (ui, fallback on rate/session limits). Raster image
+  Install and run Orca multi-model role orchestration: Claude Fable 5.1 (architect),
+  Claude Opus 5 (reviewer), GPT-6 Astra via Codex (executor), Grok 4.6 (thrifty), Antigravity
+  Gemini 3.7 Flash Medium (ui, fallback on rate/session limits). Raster image
   generation/edit routes to executor with Codex $imagegen; if the image brief is
   ambiguous, ask the user first. Also runs a four-model idea debate (Claude, Codex,
   Grok, Gemini propose, critique anonymously, and converge on a niche) for
@@ -11,7 +11,7 @@ description: >
   separation in Orca Agent IDE, multi-model routing, role workers, bootstrap roles,
   dispatch by role, plan-execute-review DAGs, image generation / imagegen /
   이미지 생성, limit failover to agy/Gemini Flash, multi-model debate, idea debate,
-  or mentions Opus/Sol/Grok role split, orca-role-orchestration, /orca-role-orchestration,
+  or mentions Fable/Astra/Grok role split, orca-role-orchestration, /orca-role-orchestration,
   "역할 오케스트레이션", "모델별 역할 분리", "architect executor thrifty",
   "fallback Gemini Flash", "아이디어 토론", "브레인스토밍", "아이디어 구체화", or
   "니치 찾기". Prefer this skill over ad-hoc multi-agent setup when work should be
@@ -27,18 +27,18 @@ Portable six-role setup for Orca Agent IDE, plus a four-model idea-debate mode. 
 
 | Role | Model | Launch |
 |------|-------|--------|
-| **architect** | Claude Opus 5 | `claude --model claude-opus-5 --dangerously-skip-permissions` |
-| **executor** | GPT-5.6 Sol | `codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox` |
-| **thrifty** | Grok 4.5 | `grok --model grok-4.5 --permission-mode bypassPermissions` |
-| **ui** | Gemini 3.6 Flash (Medium) | `agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions` |
+| **architect** | Claude Fable 5.1 | `claude --model claude-fable-5-1 --dangerously-skip-permissions` |
+| **executor** | GPT-6 Astra | `codex --model gpt-6-astra -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox` |
+| **thrifty** | Grok 4.6 | `grok --model grok-4.6 --permission-mode bypassPermissions` |
+| **ui** | Gemini 3.7 Flash (Medium) | `agy --model "Gemini 3.7 Flash (Medium)" --dangerously-skip-permissions` |
 | **reviewer** | Claude Opus 5 | `claude --model claude-opus-5 --dangerously-skip-permissions` |
-| **fallback** | Gemini 3.6 Flash (Medium) | `agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions` |
+| **fallback** | Gemini 3.7 Flash (Medium) | `agy --model "Gemini 3.7 Flash (Medium)" --dangerously-skip-permissions` |
 | **debater_{claude,codex,grok,gemini}** | one seat per provider | debate only — read-only, never implements |
 
 Bootstrap starts the four primaries (architect/executor/thrifty/fallback); `ui`, `reviewer`,
 and the `debater_*` seats are created lazily on their first dispatch.
 
-Principle: **Opus deepens, Sol closes, Grok widens. Limit → agy Flash Medium.**
+Principle: **Fable deepens, Astra closes, Grok widens. Limit → agy Flash Medium.**
 
 A consumer without one of these CLIs can repoint a role without forking any
 script: `.orca/orchestration/roles.local.json` (user-owned, never overwritten)

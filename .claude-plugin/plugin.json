@@ -1,6 +1,6 @@
 {
   "name": "orca-role-orchestration",
-  "description": "Four-role Orca Agent IDE orchestration: Claude Opus architect, GPT Sol executor, Grok thrifty, Gemini Flash fallback. Project scaffold, playbook, and supervised dispatch.",
+  "description": "Four-role Orca Agent IDE orchestration: Claude Fable architect, GPT Astra executor, Grok thrifty, Gemini Flash fallback. Project scaffold, playbook, and supervised dispatch.",
   "author": {
     "name": "zeromountain"
   },

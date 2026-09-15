@@ -6,15 +6,15 @@ Scripts: [`SCRIPTS.md`](./SCRIPTS.md)
 
 | Role | Model | CLI | Own |
 |------|-------|-----|-----|
-| **architect** | Claude Opus 5 | `claude` | Design, judgment, high-risk review |
-| **executor** | GPT-5.6 Sol | `codex` | Hard implement, terminal loops, verify, close work, raster images via `$imagegen` |
-| **thrifty** | Grok 4.5 | `grok` | Small tickets, explore, research, prototypes |
-| **ui** | Gemini 3.6 Flash (Medium) | `agy` | User-visible surface, cheap drafts — every draft returns to architect for approval |
+| **architect** | Claude Fable 5.1 | `claude` | Design, judgment, high-risk review |
+| **executor** | GPT-6 Astra | `codex` | Hard implement, terminal loops, verify, close work, raster images via `$imagegen` |
+| **thrifty** | Grok 4.6 | `grok` | Small tickets, explore, research, prototypes |
+| **ui** | Gemini 3.7 Flash (Medium) | `agy` | User-visible surface, cheap drafts — every draft returns to architect for approval |
 | **reviewer** | Claude Opus 5 | `claude` | Final pre-merge gate only — APPROVE/BLOCK, never implements |
-| **fallback** | Gemini 3.6 Flash (Medium) | `agy` | **Rate/session limit only** |
+| **fallback** | Gemini 3.7 Flash (Medium) | `agy` | **Rate/session limit only** |
 | **debater_*** | one seat per provider | claude/codex/grok/agy | Idea debate only — read-only, never implements |
 
-Principle: **Opus deepens, Sol closes, Grok widens.** Limit → agy Flash Medium.
+Principle: **Fable deepens, Astra closes, Grok widens.** Limit → agy Flash Medium.
 
 ## Personas
 
@@ -52,7 +52,7 @@ Same-checkout work: `orca terminal create --worktree active` (do not invent work
 Idempotent and resumable: a role whose tab is already live is reused, so re-running
 after a partial failure finishes the job instead of rebuilding.
 
-Tabs: `role-opus-architect` · `role-sol-executor` · `role-grok-thrifty` · `role-agy-fallback`
+Tabs: `role-fable-architect` · `role-astra-executor` · `role-grok-thrifty` · `role-agy-fallback`
 (`ui`, `reviewer`, and the `debater_*` seats are created lazily on their first dispatch —
 bootstrap only starts the four primaries above.)
 Handles: `.orca/orchestration/handles.json` (gitignore).

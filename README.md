@@ -4,12 +4,12 @@ An installable Agent Skill and project scaffold for routing Orca Agent IDE work 
 
 | Role | Default model | Best for |
 |---|---|---|
-| `architect` | Claude Opus 5 | Architecture, planning, high-risk review |
-| `executor` | GPT-5.6 Sol via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
-| `thrifty` | Grok 4.5 | Exploration, research, small low-risk changes |
-| `ui` | Gemini 3.6 Flash (Medium) via `agy` | User-visible surface drafts, always routed back to architect for approval |
+| `architect` | Claude Fable 5.1 | Architecture, planning, high-risk review |
+| `executor` | GPT-6 Astra via Codex | Implementation, debugging, verification, raster images via `$imagegen` |
+| `thrifty` | Grok 4.6 | Exploration, research, small low-risk changes |
+| `ui` | Gemini 3.7 Flash (Medium) via `agy` | User-visible surface drafts, always routed back to architect for approval |
 | `reviewer` | Claude Opus 5 | Final pre-merge gate only — APPROVE/BLOCK, never implements |
-| `fallback` | Gemini 3.6 Flash (Medium) via `agy` | Continuity after rate or session limits |
+| `fallback` | Gemini 3.7 Flash (Medium) via `agy` | Continuity after rate or session limits |
 
 Bootstrap starts the four primaries (`architect`/`executor`/`thrifty`/`fallback`); `ui` and
 `reviewer` tabs are created on their first dispatch. The idea-debate mode below adds four more
@@ -220,7 +220,7 @@ D=.orca/orchestration/scripts/orca-dispatch-role.sh
 Constraints: follow AGENTS.md; no schema migration in this pass.
 Scope: src/auth/**. Done: numbered plan + risk list, zero file edits."
 
-# 2. Sol implements the approved plan and blocks until it reports back.
+# 2. Astra implements the approved plan and blocks until it reports back.
 "$D" executor --wait --spec "Implement the approved plan (rotation + revoke-on-reuse).
 Scope: src/auth/**, tests/auth/**. Done: pnpm typecheck && pnpm test:auth both green."
 
@@ -304,7 +304,7 @@ steps that have no CLI — annotating a diff, clicking in Design Mode, the Cmd-J
 registering an SSH host — to the human, saying so in its output:
 
 ```bash
-.orca/orchestration/or race start "Fix the login bug"    # Opus vs Sol vs Grok, one worktree each, same base branch
+.orca/orchestration/or race start "Fix the login bug"    # Fable vs Astra vs Grok, one worktree each, same base branch
 .orca/orchestration/or race status <race_id>
 .orca/orchestration/or race pick <race_id> 2             # keep seat 2 (opens its diff), delete the losers' worktrees
 .orca/orchestration/or race finish <race_id>             # release the winner's tab; the worktree stays

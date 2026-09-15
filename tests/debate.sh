@@ -76,10 +76,10 @@ source "$ROOT/scripts/orca-roles-lib.sh"
 # --- R1 debater metadata ---
 assert R1_claude_title  "[[ \"\$(role_meta debater_claude | cut -f1)\" == 'debate-opus' ]]"
 assert R1_claude_model  "[[ \"\$(role_meta debater_claude | cut -f2)\" == 'claude-opus-5' ]]"
-assert R1_codex_title   "[[ \"\$(role_meta debater_codex | cut -f1)\" == 'debate-sol' ]]"
+assert R1_codex_title   "[[ \"\$(role_meta debater_codex | cut -f1)\" == 'debate-astra' ]]"
 assert R1_grok_agent    "[[ \"\$(role_meta debater_grok | cut -f3)\" == 'grok' ]]"
 assert R1_gemini_agent  "[[ \"\$(role_meta debater_gemini | cut -f3)\" == 'antigravity' ]]"
-assert R1_launch_gemini "role_launch_cmd debater_gemini | grep -q 'Gemini 3.6 Flash'"
+assert R1_launch_gemini "role_launch_cmd debater_gemini | grep -q 'Gemini 3.7 Flash'"
 assert R1_body_codex    "role_fallback_body debater_codex | grep -qi 'feasibility'"
 
 # --- R2 is_debater ---
@@ -96,11 +96,11 @@ assert R2_no  "! is_debater architect"
 # --- R4 seed_text: neither role type gets a self-close COMMAND anymore —
 # only a "never close it yourself" instruction, since Orca's contract
 # forbids a worker closing its own terminal either way.
-assert R4_debater_no_close_cmd "! seed_text debater_grok grok-4.5 'body' | grep -q 'orca terminal close'"
-assert R4_debater_never_self_close "seed_text debater_grok grok-4.5 'body' | grep -q 'Never close this terminal yourself'"
-assert R4_normal_no_close_cmd "! seed_text architect claude-opus-5 'body' | grep -q 'orca terminal close'"
-assert R4_normal_never_self_close "seed_text architect claude-opus-5 'body' | grep -q 'Do not close this terminal yourself'"
-assert R4_body_included    "seed_text architect claude-opus-5 'MARKER_BODY' | grep -q 'MARKER_BODY'"
+assert R4_debater_no_close_cmd "! seed_text debater_grok grok-4.6 'body' | grep -q 'orca terminal close'"
+assert R4_debater_never_self_close "seed_text debater_grok grok-4.6 'body' | grep -q 'Never close this terminal yourself'"
+assert R4_normal_no_close_cmd "! seed_text architect claude-fable-5-1 'body' | grep -q 'orca terminal close'"
+assert R4_normal_never_self_close "seed_text architect claude-fable-5-1 'body' | grep -q 'Do not close this terminal yourself'"
+assert R4_body_included    "seed_text architect claude-fable-5-1 'MARKER_BODY' | grep -q 'MARKER_BODY'"
 
 # --- R5 dispatch/close role whitelists ---
 DISPATCH="$ROOT/scripts/orca-dispatch-role.sh"
@@ -821,9 +821,9 @@ cx7_run() {
     create_role "cx7-$1" "$2" "$1" >/dev/null 2>&1
   )
 }
-cx7_run codex 'codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+cx7_run codex 'codex --model gpt-6-astra -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
 cx7_run claude 'claude --model claude-opus-5 --dangerously-skip-permissions'
-cx7_run grok 'grok --model grok-4.5 --permission-mode bypassPermissions'
+cx7_run grok 'grok --model grok-4.6 --permission-mode bypassPermissions'
 
 assert CX7_codex_seat_registers_trust "[[ -f \"$cx7_dir/home-codex/config.toml\" ]]"
 assert CX7_codex_trust_names_project_root \
@@ -1057,7 +1057,7 @@ chmod +x "$h6_dir/bin/orca"
 if h6_err="$(
   export PATH="$h6_dir/bin:$PATH"
   export ORCA_H6_MARKER_DIR="$h6_dir"
-  seed "not-a-term-handle" architect claude-opus-5 "fallback body" 2>&1
+  seed "not-a-term-handle" architect claude-fable-5-1 "fallback body" 2>&1
 )"; then
   h6_rc=0
 else
@@ -1088,7 +1088,7 @@ ORCASTUB
 chmod +x "$h7_dir/bin/orca"
 if h7a_err="$(
   export PATH="$h7_dir/bin:$PATH"
-  seed "term_h7" architect claude-opus-5 "body" 2>&1
+  seed "term_h7" architect claude-fable-5-1 "body" 2>&1
 )"; then h7a_rc=0; else h7a_rc=$?; fi
 assert H7_not_accepted_fails "[[ \"$h7a_rc\" -ne 0 ]]"
 assert H7_not_accepted_message "printf '%s' \"\$h7a_err\" | grep -qi 'not accepted'"
@@ -1123,7 +1123,7 @@ ORCASTUB
 chmod +x "$h7_dir/bin/orca"
 if h7b_err="$(
   export PATH="$h7_dir/bin:$PATH"
-  seed "term_h7b" architect claude-opus-5 "body" 2>&1
+  seed "term_h7b" architect claude-fable-5-1 "body" 2>&1
 )"; then h7b_rc=0; else h7b_rc=$?; fi
 assert H7_readback_failure_fails "[[ \"$h7b_rc\" -ne 0 ]]"
 assert H7_readback_message "printf '%s' \"\$h7b_err\" | grep -qi 'could not confirm'"
@@ -1177,7 +1177,7 @@ assert H8_returns_handle "grep -qx term_h8happy \"$h8_dir/stdout.log\""
 assert H8_handles_json_has_handle "grep -q term_h8happy \"$h8_dir/orch/handles.json\""
 assert H8_journal_has_handle \
   "python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])[\"handle\"])' \"$h8_dir/orch/terminal-journal.jsonl\" | grep -qx term_h8happy"
-EXPECTED_H8_TEXT="$(unset PROJECT_NAME CONSTRAINTS; seed_text architect claude-opus-5 "$(role_fallback_body architect)")"
+EXPECTED_H8_TEXT="$(unset PROJECT_NAME CONSTRAINTS; seed_text architect claude-fable-5-1 "$(role_fallback_body architect)")"
 assert H8_sent_text_byte_exact \
   "diff -q <(printf '%s' \"\$EXPECTED_H8_TEXT\") \"$h8_dir/sent-text.txt\" >/dev/null"
 
@@ -1612,8 +1612,8 @@ rows = [
     # role=None here on purpose: this fixture's four tracked-debater role
     # slots are already used below (claude/codex/grok/gemini), and this
     # row's own test (O3, too-young) does not depend on role at all.
-    {"role": None, "title": "debate-sol", "raw": {}, "handle": "term_too_young", "createdAt": young},
-    {"role": "architect", "title": "role-opus-architect", "raw": {}, "handle": "term_tracked", "createdAt": old},
+    {"role": None, "title": "debate-astra", "raw": {}, "handle": "term_too_young", "createdAt": young},
+    {"role": "architect", "title": "role-fable-architect", "raw": {}, "handle": "term_tracked", "createdAt": old},
     {"role": "debater_grok", "title": "debate-grok", "raw": {}, "handle": None, "createdAt": old},
     # role=None: same reasoning as term_too_young above — O5 only needs
     # "claimed by a fresh lock", not "also currently tracked".
@@ -1628,7 +1628,7 @@ rows = [
     # claimed-via-sidecar-only) is meant to test — none of them are
     # reachable via the tracked-check-gated journal-orphan path at all.
     {"role": "debater_claude", "title": "debate-opus", "raw": {}, "handle": "term_stale_candidate", "createdAt": old},
-    {"role": "debater_codex", "title": "debate-sol", "raw": {}, "handle": "term_owner_still_alive", "createdAt": old},
+    {"role": "debater_codex", "title": "debate-astra", "raw": {}, "handle": "term_owner_still_alive", "createdAt": old},
     {"role": "debater_grok", "title": "debate-grok", "raw": {}, "handle": "term_stale_and_crosslocked", "createdAt": old},
     {"role": "debater_gemini", "title": "debate-agy", "raw": {}, "handle": "term_sidecar_only_protected", "createdAt": old},
 ]
@@ -1926,7 +1926,7 @@ rows = [
         "createdAt": (now - datetime.timedelta(seconds=5000)).isoformat(),
     },
     {
-        "role": None, "title": "debate-sol", "raw": {},
+        "role": None, "title": "debate-astra", "raw": {},
         "handle": "term_role_null_too_young",
         "createdAt": now.isoformat(),
     },
@@ -2527,7 +2527,7 @@ mkdir -p "$q_bin"
 #                      "terminal list"/"terminal close" below), and the
 #                      closed-handles marker.
 #   Q_UNREADY_TITLE    (optional) a role's title (role_meta's first field,
-#                      e.g. "debate-sol") whose terminal never shows a
+#                      e.g. "debate-astra") whose terminal never shows a
 #                      ready screen — for the preflight-abort tests.
 #   Q_STUCK_TITLE      (optional) a role's title whose handle, once
 #                      "closed", is NEVER actually removed from "terminal
@@ -2720,7 +2720,7 @@ assert Q8_dispatch_lock_file_matches "grep -q \"lockfile=$Q_LOCKS_DIR/qwiring.js
 # --dir-root and --slug change per sub-test, to keep debate OUTPUT isolated.
 # ----------------------------------------------------------------------------
 
-# --- PF1 (Step 1): one seat (debater_codex, title "debate-sol") stubbed via
+# --- PF1 (Step 1): one seat (debater_codex, title "debate-astra") stubbed via
 # Q_UNREADY_TITLE to NEVER show a ready screen. The driver must abort BEFORE
 # any task-create — proven by never printing orca-debate.sh's own "=== ROUND
 # 1" marker (round 1 is what actually calls the dispatcher that would
@@ -2734,7 +2734,7 @@ pf1_root="$tmpdir/pf1-debates"
 export PATH="$q_bin:$PATH"
 export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
 export ORCA_TEST_STATUS_STUB=completed
-export Q_UNREADY_TITLE="debate-sol"
+export Q_UNREADY_TITLE="debate-astra"
 pf1_rc=0
 pf1_out="$("$Q_DRIVER" --topic "preflight should catch a broken seat" --slug pf1slug --rounds 1 \
   --dir-root "$pf1_root" --lock-ttl-seconds 1800 2>&1)" || pf1_rc=$?
@@ -2788,7 +2788,7 @@ pf3_root="$tmpdir/pf3-debates"
 export PATH="$q_bin:$PATH"
 export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
 export ORCA_TEST_STATUS_STUB=completed
-export Q_UNREADY_TITLE="debate-sol"
+export Q_UNREADY_TITLE="debate-astra"
 pf3_rc=0
 pf3_out="$("$Q_DRIVER" --topic "preflight should not oversell --debaters when quorum cannot survive it" \
   --slug pf3slug --rounds 1 --debaters claude,codex,grok \
@@ -2817,7 +2817,7 @@ bc1_root="$tmpdir/bc1-debates"
 export PATH="$q_bin:$PATH"
 export ORCA_TEST_DISPATCH="$q_stub_dir/orca-dispatch-role.sh"
 export ORCA_TEST_STATUS_STUB=completed
-export Q_STUCK_TITLE="debate-sol"
+export Q_STUCK_TITLE="debate-astra"
 bc1_rc=0
 bc1_out="$("$Q_DRIVER" --topic "cleanup must verify its closes" --slug bc1slug --rounds 1 \
   --dir-root "$bc1_root" --lock-ttl-seconds 1800 2>&1)" || bc1_rc=$?
@@ -2833,7 +2833,7 @@ bc1_lock_file="$Q_LOCKS_DIR/bc1slug.json"
 # The lock's own "handles" array carries all 4 debaters (round 1 registers
 # every one), so grep the stub's OWN handle-by-title log for the actual
 # handle string BC1 itself created for the stuck title — the most recent
-# creation for "debate-sol" at this point in the suite's run is exactly the
+# creation for "debate-astra" at this point in the suite's run is exactly the
 # one this run got stuck on (any earlier PF1/PF2/Q1 handle for the same
 # title was already closed by ITS OWN cleanup, forcing ensure_terminal to
 # recreate here) — rather than a looser "some handle, some candidate" check
@@ -2845,7 +2845,7 @@ bc1_lock_file="$Q_LOCKS_DIR/bc1slug.json"
 # preflight so nothing ever calls "terminal create"), which would abort the
 # WHOLE suite here rather than just this assertion. BC1_stuck_handle_captured
 # right below is what actually verifies this resolved to something real.
-bc1_stuck_handle="$(grep '^debate-sol ' "$Q_STATE_DIR/handle-by-title.log" 2>/dev/null | tail -1 | awk '{print $2}')" || true
+bc1_stuck_handle="$(grep '^debate-astra ' "$Q_STATE_DIR/handle-by-title.log" 2>/dev/null | tail -1 | awk '{print $2}')" || true
 
 assert BC1_driver_still_exits_ok "[[ \"$bc1_rc\" -eq 0 ]]"
 assert BC1_round_still_completed "[[ -d \"$bc1_root/bc1slug/round-1\" ]]"
@@ -2866,7 +2866,7 @@ assert BC1_lock_is_forced_stale \
 # the stale-lock candidate path needs neither.
 bc1_sweep_out="$(
   export PATH="$q_bin:$PATH"
-  export Q_STUCK_TITLE="debate-sol"
+  export Q_STUCK_TITLE="debate-astra"
   "$SWEEP" --locks-dir "$Q_LOCKS_DIR" --orch-dir "$q_root" \
     --journal "$q_root/no-such-journal-for-bc1.jsonl" --handles-file "$q_root/handles.json" 2>&1
 )"
@@ -4447,14 +4447,14 @@ ORCASTUB
   chmod +x "$dir/orca"
 }
 
-# TG4: seed fails for role-sol-executor (the 2nd of the 4 roles bootstrap
+# TG4: seed fails for role-astra-executor (the 2nd of the 4 roles bootstrap
 # creates — architect, executor, thrifty, fallback, in that order). Every
 # role's terminal is still created; the failure must not strand roles 1's
 # already-durable handle, and roles 3/4 must still be attempted.
 tg4_dir="$tmpdir/tg4"
 mkdir -p "$tg4_dir/orch/scripts" "$tg4_dir/orch/bin"
 cp "$ROOT/scripts/orca-bootstrap-roles.sh" "$ROOT/scripts/orca-roles-lib.sh" "$tg4_dir/orch/scripts/"
-tg_bootstrap_stub "$tg4_dir/orch/bin" "" "role-sol-executor"
+tg_bootstrap_stub "$tg4_dir/orch/bin" "" "role-astra-executor"
 tg4_send_log="$tg4_dir/send.log"
 : > "$tg4_send_log"
 tg4_rc=0
@@ -4470,7 +4470,7 @@ assert TG4_names_failed_role "grep -q 'executor' \"$tg4_dir/out.log\" \"$tg4_dir
 # The real, handles.json-independent proof that failure isolation (not a
 # lucky partial abort) is what happened: the seed step was actually REACHED
 # for the failing role itself, and for both roles after it.
-assert TG4_executor_seed_reached "grep -qx term_role-sol-executor \"$tg4_send_log\""
+assert TG4_executor_seed_reached "grep -qx term_role-astra-executor \"$tg4_send_log\""
 assert TG4_thrifty_seed_attempted \
   "grep -qx term_role-grok-thrifty \"$tg4_send_log\""
 assert TG4_fallback_seed_attempted \
@@ -4490,8 +4490,8 @@ tg5_rc=0
 ) >"$tg5_dir/out.log" 2>"$tg5_dir/err.log" || tg5_rc=$?
 assert TG5_create_failure_exits_nonzero "[[ \"$tg5_rc\" -ne 0 ]]"
 assert TG5_names_failed_role "grep -q 'thrifty' \"$tg5_dir/out.log\" \"$tg5_dir/err.log\""
-assert TG5_architect_recorded "grep -q term_role-opus-architect \"$tg5_dir/orch/handles.json\""
-assert TG5_executor_recorded "grep -q term_role-sol-executor \"$tg5_dir/orch/handles.json\""
+assert TG5_architect_recorded "grep -q term_role-fable-architect \"$tg5_dir/orch/handles.json\""
+assert TG5_executor_recorded "grep -q term_role-astra-executor \"$tg5_dir/orch/handles.json\""
 assert TG5_fallback_recorded "grep -q term_role-agy-fallback \"$tg5_dir/orch/handles.json\""
 assert TG5_thrifty_has_no_handle \
   "python3 -c \"import json; d=json.load(open('$tg5_dir/orch/handles.json')); v=d['roles'].get('thrifty',{}).get('handle'); assert not v, v\""
@@ -4546,7 +4546,7 @@ assert TG7_all_four_handles_recorded \
 assert TG7_thrifty_never_seeded \
   "! grep -qx term_role-grok-thrifty \"$tg7_send_log\""
 assert TG7_other_three_still_seeded \
-  "grep -qx term_role-opus-architect \"$tg7_send_log\" && grep -qx term_role-sol-executor \"$tg7_send_log\" && grep -qx term_role-agy-fallback \"$tg7_send_log\""
+  "grep -qx term_role-fable-architect \"$tg7_send_log\" && grep -qx term_role-astra-executor \"$tg7_send_log\" && grep -qx term_role-agy-fallback \"$tg7_send_log\""
 
 # ----------------------------------------------------------------------------
 # TR (terminal-readiness-gate Task 2): the actual fix. terminal_wait_ready /
@@ -4861,7 +4861,7 @@ assert TR7a_debater_retried "[[ \"\$(wc -l < \"$tr7_read_calls\" | tr -d ' ')\" 
 tr7b_rc=0
 tr7b_err="$(
   export PATH="$tr7_dir/bin:$PATH"
-  seed term_tr7 architect claude-opus-5 "fallback body" 2>&1
+  seed term_tr7 architect claude-fable-5-1 "fallback body" 2>&1
 )" || tr7b_rc=$?
 assert TR7b_nondebater_soft_succeeds "[[ \"$tr7b_rc\" -eq 0 ]]"
 assert TR7b_nondebater_info_only "printf '%s' \"\$tr7b_err\" | grep -q '(info)'"
@@ -4982,7 +4982,7 @@ tr9_rc=0
   export ROLE_READY_POLL_INTERVAL_SECONDS=1
   WORKTREE=active
   handle="$(create_role "role-tr9-test" "irrelevant command" architect)"
-  seed "$handle" architect claude-opus-5 "fallback body"
+  seed "$handle" architect claude-fable-5-1 "fallback body"
 ) >"$tr9_dir/out.log" 2>"$tr9_dir/err.log" || tr9_rc=$?
 tr9_end=$(date +%s)
 tr9_elapsed=$((tr9_end - tr9_start))
@@ -5310,7 +5310,7 @@ cat > "$tr19_dir/screen.txt" <<'TR19SCREEN'
 aggedDone signal: worker_done once per dispatch (taskId + dispatchId), then idl
 next round──────────────────────────────────────────────────────────────────────
 ──Sh No dispatch received yet. Standing by for the first round preamble.
-    #1 You are ROLE=debater_grok on model grok-4.5 in an Orca multi-agent setup
+    #1 You are ROLE=debater_grok on model grok-4.6 in an Orca multi-agent setup
 for ⠧ Waiting for respons … 0.0s
     ⠼Worked for 7.1s             │t Ctrl+x:shortcuts                           s
 top  [hooks: 2]g… 1.6s                                                         1
@@ -5589,7 +5589,7 @@ tr30_choices='› 1. Yes, continue2.No,quitPress enter to continue'
 tr30_line="$tr30_head$tr30_mid$tr30_choices"
 cat > "$tr30_dir/bin/orca" <<ORCASTUB
 #!/usr/bin/env bash
-echo '{"ok":true,"result":{"terminal":{"handle":"term_tr30","status":"running","tail":["codex --model gpt-5.6-sol","","$tr30_line"]}}}'
+echo '{"ok":true,"result":{"terminal":{"handle":"term_tr30","status":"running","tail":["codex --model gpt-6-astra","","$tr30_line"]}}}'
 exit 0
 ORCASTUB
 chmod +x "$tr30_dir/bin/orca"

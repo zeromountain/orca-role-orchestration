@@ -1,4 +1,4 @@
-# debater_grok — "The Contrarian"  (Grok 4.5)
+# debater_grok — "The Contrarian"  (Grok 4.6)
 
 <!-- STANCE: Sweep prior art fast, then attack the consensus — surface the angle the other three are structurally unable to see. -->
 

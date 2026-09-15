@@ -38,16 +38,16 @@ role_meta() {
   # $1=role → title<TAB>model<TAB>agent
   local title model agent o_title o_model o_agent o_cmd
   case "$1" in
-    architect) title="role-opus-architect"; model="claude-opus-5"; agent="claude" ;;
-    executor)  title="role-sol-executor";   model="gpt-5.6-sol";   agent="codex" ;;
-    thrifty)   title="role-grok-thrifty";   model="grok-4.5";      agent="grok" ;;
-    ui)        title="role-agy-ui";         model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
+    architect) title="role-fable-architect"; model="claude-fable-5-1"; agent="claude" ;;
+    executor)  title="role-astra-executor";   model="gpt-6-astra";   agent="codex" ;;
+    thrifty)   title="role-grok-thrifty";   model="grok-4.6";      agent="grok" ;;
+    ui)        title="role-agy-ui";         model="Gemini 3.7 Flash (Medium)"; agent="antigravity" ;;
     reviewer)  title="role-opus-reviewer";  model="claude-opus-5"; agent="claude" ;;
-    fallback)  title="role-agy-fallback";   model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
+    fallback)  title="role-agy-fallback";   model="Gemini 3.7 Flash (Medium)"; agent="antigravity" ;;
     debater_claude) title="debate-opus"; model="claude-opus-5"; agent="claude" ;;
-    debater_codex)  title="debate-sol";  model="gpt-5.6-sol";   agent="codex" ;;
-    debater_grok)   title="debate-grok"; model="grok-4.5";      agent="grok" ;;
-    debater_gemini) title="debate-agy";  model="Gemini 3.6 Flash (Medium)"; agent="antigravity" ;;
+    debater_codex)  title="debate-astra";  model="gpt-6-astra";   agent="codex" ;;
+    debater_grok)   title="debate-grok"; model="grok-4.6";      agent="grok" ;;
+    debater_gemini) title="debate-agy";  model="Gemini 3.7 Flash (Medium)"; agent="antigravity" ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac
   IFS=$'\037' read -r o_title o_model o_agent o_cmd < <(role_overrides "$1")
@@ -62,34 +62,34 @@ role_launch_cmd() {
   local cmd o_title o_model o_agent o_cmd
   case "$1" in
     architect)
-      cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
+      cmd='claude --model claude-fable-5-1 --dangerously-skip-permissions'
       ;;
     executor)
-      cmd='codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+      cmd='codex --model gpt-6-astra -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
       ;;
     thrifty)
-      cmd='grok --model grok-4.5 --permission-mode bypassPermissions'
+      cmd='grok --model grok-4.6 --permission-mode bypassPermissions'
       ;;
     ui)
-      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.7 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     reviewer)
       cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     fallback)
-      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.7 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     debater_claude)
       cmd='claude --model claude-opus-5 --dangerously-skip-permissions'
       ;;
     debater_codex)
-      cmd='codex --model gpt-5.6-sol -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
+      cmd='codex --model gpt-6-astra -c model_reasoning_effort="high" --dangerously-bypass-approvals-and-sandbox'
       ;;
     debater_grok)
-      cmd='grok --model grok-4.5 --permission-mode bypassPermissions'
+      cmd='grok --model grok-4.6 --permission-mode bypassPermissions'
       ;;
     debater_gemini)
-      cmd='agy --model "Gemini 3.6 Flash (Medium)" --dangerously-skip-permissions'
+      cmd='agy --model "Gemini 3.7 Flash (Medium)" --dangerously-skip-permissions'
       ;;
     *) echo "unknown role: $1" >&2; return 1 ;;
   esac

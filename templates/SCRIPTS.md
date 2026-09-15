@@ -10,7 +10,7 @@
 | `.orca/orchestration/scripts/orca-wait-done.sh` | Optional blocking wait (+ close if reaper/worker missed); acks every batch it fully processes. `--task ID` ignores any message for a different task instead of acting on it — pass it whenever you know the task id (`orca-dispatch-role.sh --wait` always does). Only one waiter at a time is supported: two concurrent `orca-wait-done.sh` processes race for the same `orca orchestration check` messages. |
 | `.orca/orchestration/scripts/orca-close-role.sh` | Manual close of role tab (`--tab`) |
 | `.orca/orchestration/scripts/orca-roles-lib.sh` | Shared role meta / dag patterns / dispatch primitives / seed (sourced) |
-| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.6 Flash (Medium) — new task, `[FAILOVER from …]` wrapper spec |
+| `.orca/orchestration/scripts/orca-fallback-on-limit.sh` | Failover to agy Gemini 3.7 Flash (Medium) — new task, `[FAILOVER from …]` wrapper spec |
 | `.orca/orchestration/scripts/orca-status.sh` | Doctor: preflight, role liveness, unclosed dispatches, reapers |
 | `.orca/orchestration/scripts/orca-debate.sh` | Drive a 3-round four-model idea debate |
 | `.orca/orchestration/scripts/orca-debate-round.sh` | One debate round: fan out, poll, collect, lint |
@@ -37,7 +37,7 @@ chmod +x .orca/orchestration/scripts/orca-*.sh
 .orca/orchestration/scripts/orca-dispatch-existing.sh task_xxx executor          # dispatch a ready later step
 .orca/orchestration/scripts/orca-fallback-on-limit.sh --from architect --spec "Continue…"
 .orca/orchestration/scripts/orca-debate.sh --topic "…"   # 3-round idea debate
-.orca/orchestration/or race start "Fix the login bug"      # 3 seats (Opus/Sol/Grok), one worktree each
+.orca/orchestration/or race start "Fix the login bug"      # 3 seats (Fable/Astra/Grok), one worktree each
 .orca/orchestration/or race pick <race_id> 2               # keep seat 2, delete the others' worktrees
 .orca/orchestration/or review --race <race_id> 2           # open its diff; j/k/c + Send to agent in the UI
 .orca/orchestration/or ps; .orca/orchestration/or gc       # worktree overview; merged-worktree report

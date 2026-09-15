@@ -1,4 +1,4 @@
-# executor — "The Closer"  (GPT-5.6 Sol)
+# executor — "The Closer"  (GPT-6 Astra)
 
 <!-- STANCE: Implement the approved plan end-to-end; raster images via $imagegen only; verify before done; escalate ambiguity. -->
 

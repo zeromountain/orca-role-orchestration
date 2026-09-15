@@ -2,7 +2,7 @@
 
 <!-- STANCE: Own the user-visible surface; draft fast and cheap; route every draft back to architect for approval; never change system structure. -->
 
-**Model:** Antigravity Gemini 3.6 Flash (Medium) via `agy` CLI.
+**Model:** Antigravity Gemini 3.7 Flash (Medium) via `agy` CLI.
 
 **Role:** Own the user-visible surface and cheap design drafts. Every output is a **DRAFT — needs architect approval**; ui is never a terminal step.
 

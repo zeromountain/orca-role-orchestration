@@ -28,9 +28,9 @@ roles:
       - bulk ticket grind (delegate)
 
   architect:
-    handle_title: role-opus-architect
+    handle_title: role-fable-architect
     agent: claude
-    model: claude-opus-5
+    model: claude-fable-5-1
     effort: high
     persona_file: personas/architect.md
     persona_summary: >-
@@ -56,9 +56,9 @@ roles:
       - decision
 
   executor:
-    handle_title: role-sol-executor
+    handle_title: role-astra-executor
     agent: codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     effort: high
     persona_file: personas/executor.md
     persona_summary: >-
@@ -102,7 +102,7 @@ roles:
   thrifty:
     handle_title: role-grok-thrifty
     agent: grok
-    model: grok-4.5
+    model: grok-4.6
     effort: default
     persona_file: personas/thrifty.md
     persona_summary: >-
@@ -131,7 +131,7 @@ roles:
     handle_title: role-agy-ui
     agent: antigravity
     cli: agy
-    model: "Gemini 3.6 Flash (Medium)"
+    model: "Gemini 3.7 Flash (Medium)"
     effort: medium
     persona_file: personas/ui.md
     persona_summary: >-
@@ -166,7 +166,7 @@ roles:
       - responsive
       - contrast
     notes: |
-      Shares the agy CLI and the Gemini 3.6 Flash (Medium) quota with `fallback`.
+      Shares the agy CLI and the Gemini 3.7 Flash (Medium) quota with `fallback`.
       Never fail ui over to fallback (same provider, same limit) — use thrifty instead.
 
   reviewer:
@@ -199,9 +199,10 @@ roles:
       verification green, architect's in-flight findings resolved. Otherwise
       reviewer returns BLOCK "not gate-ready" without reviewing.
     notes: |
-      Shares the claude CLI and the claude-opus-5 quota with `architect`. If
-      architect is session-limited, reviewer very likely is too — defer the gate
-      rather than downgrade it to a weaker model.
+      Shares the claude CLI with `architect` (reviewer stays on claude-opus-5;
+      architect runs claude-fable-5-1, so their quotas are separate). If the
+      claude CLI itself is session-limited, defer the gate rather than
+      downgrade it to a weaker model.
 
   debater_claude:
     handle_title: debate-opus
@@ -219,9 +220,9 @@ roles:
       - implementation of any kind
 
   debater_codex:
-    handle_title: debate-sol
+    handle_title: debate-astra
     agent: codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     effort: high
     persona_file: personas/debater_codex.md
     persona_summary: >-
@@ -236,7 +237,7 @@ roles:
   debater_grok:
     handle_title: debate-grok
     agent: grok
-    model: grok-4.5
+    model: grok-4.6
     effort: default
     persona_file: personas/debater_grok.md
     persona_summary: >-
@@ -252,7 +253,7 @@ roles:
     handle_title: debate-agy
     agent: antigravity
     cli: agy
-    model: "Gemini 3.6 Flash (Medium)"
+    model: "Gemini 3.7 Flash (Medium)"
     effort: medium
     persona_file: personas/debater_gemini.md
     persona_summary: >-
@@ -272,7 +273,7 @@ roles:
     handle_title: role-agy-fallback
     agent: antigravity
     cli: agy
-    model: "Gemini 3.6 Flash (Medium)"
+    model: "Gemini 3.7 Flash (Medium)"
     effort: medium
     persona_file: personas/fallback.md
     persona_summary: >-
@@ -562,7 +563,7 @@ limit_failover:
   enabled: true
   target_role: fallback
   agent: antigravity
-  model: "Gemini 3.6 Flash (Medium)"
+  model: "Gemini 3.7 Flash (Medium)"
   # Detection patterns live ONLY in scripts/orca-fallback-on-limit.sh (LIMIT_RE).
   # A copy here has no consumer — nothing parses this file — and the two had
   # already drifted, so the copy is deleted rather than re-synced.

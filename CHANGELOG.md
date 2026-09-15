@@ -48,6 +48,32 @@ fixes on top rather than duplicating either.
   in the ledger and (for the separate case of an unreadable dispatch status)
   exits non-zero instead of polling silently to its 1-hour timeout.
 
+### Changed — role models (2026-09-15)
+
+- **architect → `claude-fable-5-1`** (was `claude-opus-5`; terminal title
+  `role-fable-architect`, was `role-opus-architect`). `reviewer` and
+  `debater_claude` stay on `claude-opus-5` — the two claude roles no longer share
+  a model quota, and `roles.yaml`'s reviewer note says so.
+- **executor / debater_codex → `gpt-6-astra`** (was `gpt-5.6-sol`; titles
+  `role-astra-executor` / `debate-astra`, were `role-sol-executor` / `debate-sol`).
+  Confirmed against the local Codex CLI 0.154.0 model list.
+- **thrifty / debater_grok → `grok-4.6`** (was `grok-4.5`).
+- **ui / fallback / debater_gemini → `Gemini 3.7 Flash (Medium)`** (was 3.6).
+  The `agy` string follows the same display-name form as before but could not
+  be verified on this machine (no `agy` installed) — check `agy models` if a
+  ui/fallback tab fails to launch, and pin the right string in
+  `roles.local.json`.
+- Every restatement (`roles.yaml`, `handles.example.json`, persona H1 lines,
+  SKILL/README/PLAYBOOK/SCRIPTS tables, the AGENTS.md snippet, plugin
+  manifests) updated; T11's `STALE_RE` now fails CI on the retired strings, and
+  excludes the two live-measurement references
+  (`orca-contract-2026-08-13.md`, `orca-recipes-spike-2026-09-14.md`) as history.
+  Persona files changed, so a project whose personas still match the previous
+  shipped hash gets them refreshed; forked ones are preserved as usual.
+- Existing installs: role tabs created under the old titles are no longer
+  matched by `orca-sweep-orphans.sh`'s known-title set — close them with
+  `orca-close-role.sh <handle>` or `orca terminal close` before re-bootstrapping.
+
 ### Added — Orca recipes (`or race` / `review` / `ps` / `gc` / `fix` / `note` / `hosts`)
 
 - **`scripts/orca-race.sh` (`or race start|status|pick|finish|abort|list`).** The

@@ -4,12 +4,12 @@ Research snapshot used to design the six Orca roles and the four-model idea-deba
 
 | Role | Model | CLI | Strengths | Weaknesses |
 |------|-------|-----|-----------|------------|
-| architect | Claude Opus 5 | `claude` | Judgment, honesty, long-horizon agents, high-stakes review, enterprise workflows | Higher token use; not ideal for bulk low-risk grind |
-| executor | GPT-5.6 Sol | `codex` | Collaborative execution, persistence, terminal/tool loops, knowledge work, close the loop, Codex `$imagegen` raster assets | Can over-engineer open-ended architecture; weaker pure taste/judgment vs Opus |
-| thrifty | Grok 4.5 | `grok` | Speed, cost, codebase navigation, multi-file engineering, prototypes, Office artifacts | Less “taste” for full-delegation design/writing |
-| ui | Gemini 3.6 Flash (Medium) | `agy` | Fast, cheap visual drafts; UI/UX surface iteration | Not for system structure — every draft needs architect approval |
+| architect | Claude Fable 5.1 | `claude` | Judgment, honesty, long-horizon agents, high-stakes review, enterprise workflows | Higher token use; not ideal for bulk low-risk grind |
+| executor | GPT-6 Astra | `codex` | Collaborative execution, persistence, terminal/tool loops, knowledge work, close the loop, Codex `$imagegen` raster assets | Can over-engineer open-ended architecture; weaker pure taste/judgment vs Opus |
+| thrifty | Grok 4.6 | `grok` | Speed, cost, codebase navigation, multi-file engineering, prototypes, Office artifacts | Less “taste” for full-delegation design/writing |
+| ui | Gemini 3.7 Flash (Medium) | `agy` | Fast, cheap visual drafts; UI/UX surface iteration | Not for system structure — every draft needs architect approval |
 | reviewer | Claude Opus 5 | `claude` | Same judgment as architect, held in reserve for a single final gate | Idle between gates; never the day-to-day reviewer |
-| fallback | Gemini 3.6 Flash (Medium) | `agy` | Cheap/fast continuity when primaries hit rate/session limits | Not the default quality tier — finish interrupted work only |
+| fallback | Gemini 3.7 Flash (Medium) | `agy` | Cheap/fast continuity when primaries hit rate/session limits | Not the default quality tier — finish interrupted work only |
 
 ## Default routing
 
@@ -43,14 +43,15 @@ image brief ambiguous → ask user → executor ($imagegen)
 thrifty → (blocked) → executor → (design risk) → architect
 ui(draft) → architect(approve) → ui(implement) → architect(review)
 idea debate: propose → critique (anonymized) → converge → decide
-any primary limit → fallback (agy Gemini 3.6 Flash Medium)
+any primary limit → fallback (agy Gemini 3.7 Flash Medium)
 ```
 
 ## Pricing notes (order of magnitude)
 
 | Model | Typical use |
 |-------|-------------|
-| Opus 5 | Expensive quality lane (architect, reviewer) |
-| GPT-5.6 Sol | Daily driver execution |
-| Grok 4.5 | High throughput / cost efficiency |
-| Gemini 3.6 Flash Medium | Cheap surface drafts (ui) and limit safety net (fallback) |
+| Fable 5.1 | Top quality lane (architect) |
+| Opus 5 | Final-gate lane (reviewer) |
+| GPT-6 Astra | Daily driver execution |
+| Grok 4.6 | High throughput / cost efficiency |
+| Gemini 3.7 Flash Medium | Cheap surface drafts (ui) and limit safety net (fallback) |

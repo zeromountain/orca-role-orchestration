@@ -1,6 +1,6 @@
 {
   "name": "orca-role-orchestration",
-  "description": "Four-role Orca Agent IDE orchestration: Claude Opus architect, GPT Sol executor, Grok thrifty, Gemini Flash fallback. Project scaffold, playbook, and supervised dispatch.",
+  "description": "Four-role Orca Agent IDE orchestration: Claude Fable architect, GPT Astra executor, Grok thrifty, Gemini Flash fallback. Project scaffold, playbook, and supervised dispatch.",
   "author": {
     "name": "zeromountain",
     "url": "https://github.com/zeromountain"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Orca Role Orchestration",
     "shortDescription": "Multi-model role routing for Orca: architect, executor, thrifty, fallback",
-    "longDescription": "Use Orca role orchestration to route work by model strength: Claude Opus for architecture and review, GPT Sol (Codex) for hard implementation, Grok for cheap exploration, and Gemini Flash only as rate-limit fallback. Includes installable project scaffold, personas, and supervised dispatch scripts.",
+    "longDescription": "Use Orca role orchestration to route work by model strength: Claude Fable 5.1 for architecture, Claude Opus 5 for review, GPT Astra (Codex) for hard implementation, Grok for cheap exploration, and Gemini Flash only as rate-limit fallback. Includes installable project scaffold, personas, and supervised dispatch scripts.",
     "developerName": "zeromountain",
     "category": "Developer Tools",
     "capabilities": [
